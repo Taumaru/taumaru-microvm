@@ -124,16 +124,16 @@ This keeps the CLI thin and ensures future SDK consumers receive exactly the sam
 
 ### 7. Execute in a deterministic dependency order
 
-Decision: after confirmation, run the selected runtime package first, then each unique kernel in
+Decision: after confirmation, run every selected runtime package first, then each unique kernel in
 ascending registry ID order, then selected distributions in ascending distribution ID order. The
 SDK retains registry order for files inside a package or distribution.
 
-The runtime package is a prerequisite for all dependent preparation, so its failure stops the
-remaining artifact operations. After the runtime stage, a kernel is a prerequisite for its
-associated distribution image group: a kernel failure skips only that image group. Unrelated
-kernels and distributions are attempted sequentially. The final outcome is non-success whenever
-any required group fails or is skipped, while verified work remains available for a later retry
-through the SDK inventory.
+The complete runtime stage is a prerequisite for all dependent preparation, so any runtime package
+failure stops the remaining artifact operations. After the runtime stage, a kernel is a
+prerequisite for its associated distribution image group: a kernel failure skips only that image
+group. Unrelated kernels and distributions are attempted sequentially. The final outcome is
+non-success whenever any required group fails or is skipped, while verified work remains available
+for a later retry through the SDK inventory.
 
 ### 8. Use two explicit CLI input modes
 
@@ -167,7 +167,7 @@ The interaction has four visible stages:
 
 1. Discovery status while the three SDK lists are loaded.
 2. Selection prompts with visible focus, selection marks, and a default-kernel marker.
-3. A compact review containing distribution/kernel pairs, runtime package, image count, and total
+3. A compact review containing distribution/kernel pairs, runtime packages, image count, and total
    expected bytes, followed by one specific `Download` confirmation action.
 4. A progress/result view with explicit labels such as `Downloading`, `Verifying`, `Downloaded`,
    `Adopted`, `Already available`, and `Failed`.

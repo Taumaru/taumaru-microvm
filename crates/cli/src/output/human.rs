@@ -196,34 +196,36 @@ pub(crate) fn format_review(plan: &DownloadPlan, capabilities: TerminalCapabilit
         "{}\n",
         paint("Runtime", ANSI_BOLD, capabilities.color)
     ));
-    if capabilities.width.is_some_and(|width| width < 72) {
-        output.push_str(&format!(
-            "  {}  {} {} · {} files · {}\n",
-            paint("•", ANSI_BLUE, capabilities.color),
-            plan.runtime.package.display_name,
-            plan.runtime.package.version,
-            plan.runtime.files.len(),
-            architecture_label(&plan.runtime.package.architecture),
-        ));
-    } else {
-        output.push_str(&format!(
-            "  {}  {} {} ({}) · {} files · {}\n",
-            paint("•", ANSI_BLUE, capabilities.color),
-            plan.runtime.package.display_name,
-            plan.runtime.package.version,
-            paint(
-                plan.runtime.package.id.as_str(),
-                ANSI_DIM,
-                capabilities.color
-            ),
-            plan.runtime.files.len(),
-            architecture_label(&plan.runtime.package.architecture),
-        ));
+    for package in &plan.runtime.packages {
+        if capabilities.width.is_some_and(|width| width < 72) {
+            output.push_str(&format!(
+                "  {}  {} {} · {} files · {}\n",
+                paint("•", ANSI_BLUE, capabilities.color),
+                package.display_name,
+                package.version,
+                package.files.len(),
+                architecture_label(&package.architecture),
+            ));
+        } else {
+            output.push_str(&format!(
+                "  {}  {} {} ({}) · {} files · {}\n",
+                paint("•", ANSI_BLUE, capabilities.color),
+                package.display_name,
+                package.version,
+                paint(package.id.as_str(), ANSI_DIM, capabilities.color),
+                package.files.len(),
+                architecture_label(&package.architecture),
+            ));
+        }
     }
     output.push_str(&format!(
         "     {}\n\n",
         paint(
-            format!("{} expected", format_bytes(plan.runtime.expected_bytes)),
+            format!(
+                "{} files · {} expected",
+                plan.runtime.file_count,
+                format_bytes(plan.runtime.expected_bytes)
+            ),
             ANSI_DIM,
             capabilities.color,
         )

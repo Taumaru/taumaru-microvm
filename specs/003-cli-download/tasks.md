@@ -47,7 +47,7 @@ contract, and the foundation owns no feature-specific artifact state.
 ## Phase 3: User Story 1 - Build a Download Plan (Priority: P1) 🎯 MVP
 
 **Goal**: Let an operator select one or more host-compatible distributions, choose exactly one
-compatible kernel for each, review the automatically selected runtime package, and confirm a
+compatible kernel for each, review the automatically selected runtime packages, and confirm a
 complete plan before any artifact transfer.
 
 **Independent Test**: Against a deterministic catalog, use keyboard input to select at least two
@@ -59,15 +59,15 @@ download calls.
 
 - [X] T008 [US1] Write failing unit tests for catalog assembly, host-architecture filtering, and rejection of empty or duplicate registry identifiers in `crates/cli/src/commands/download.rs`.
 - [X] T009 [US1] Write failing unit tests for explicit `distribution-id=kernel-id` parsing and validation in `crates/cli/src/commands/download.rs`, covering exactly one mapping per selected distribution, no mapping for an unselected distribution, unavailable kernels, incompatible kernels, and duplicate mappings.
-- [X] T010 [US1] Write failing unit tests for runtime package selection and plan construction in `crates/cli/src/commands/download.rs`, covering the highest valid semantic version, required `firecracker` and `firectl` components, host architecture, deterministic ties, checked byte totals, unique kernel IDs, and deterministic member order.
+- [X] T010 [US1] Write failing unit tests for runtime package selection and plan construction in `crates/cli/src/commands/download.rs`, covering the highest valid semantic version per required component, split and combined `firecracker`/`firectl` packages, host architecture, deterministic ties, checked byte totals, unique kernel IDs, and deterministic member order.
 - [X] T011 [P] [US1] Extend command-surface tests in `crates/cli/tests/command_surface.rs` for `microvm download`, repeatable `--distribution` and `--kernel` options, `--non-interactive`, help text, and the no-TTY incomplete-selection guard.
 
 ### Implementation for User Story 1
 
 - [X] T012 [US1] Define the Clap root, `Download` subcommand, repeatable distribution/kernel options, and `--non-interactive` flag in `crates/cli/src/cli.rs` and register the command in `crates/cli/src/commands/mod.rs` while retaining the existing top-level command behavior.
-- [X] T013 [US1] Implement `RegistryCatalog`, `DistributionSelection`, `RuntimeBinarySelection`, `DownloadPlan`, and `PlanMember` in `crates/cli/src/commands/download.rs`, including host architecture mapping, supported-kernel intersection, default-kernel marking, runtime package filtering, semantic version ordering, required component checks, checked size totals, unique-kernel deduplication, and deterministic distribution/kernel ordering.
+- [X] T013 [US1] Implement `RegistryCatalog`, `DistributionSelection`, `RuntimeBinarySelection`, `DownloadPlan`, and `PlanMember` in `crates/cli/src/commands/download.rs`, including host architecture mapping, supported-kernel intersection, default-kernel marking, per-component runtime package filtering, semantic version ordering, required component checks, checked size totals, unique-kernel deduplication, and deterministic distribution/kernel ordering.
 - [X] T014 [US1] Implement explicit selection parsing and non-interactive validation in `crates/cli/src/commands/download.rs`, rejecting empty selections, duplicate IDs, malformed mappings, incomplete mappings, unselected distribution mappings, unknown IDs, incompatible architectures, and kernels absent from a distribution's supported-kernel set before confirmation or transfer.
-- [X] T015 [US1] Implement the interactive `inquire::MultiSelect`, per-distribution `inquire::Select`, review, and `inquire::Confirm` flow in `crates/cli/src/commands/download.rs` and `crates/cli/src/output/human.rs`, showing focus/selection markers, default-kernel text, distribution/kernel pairs, runtime package, image count, estimated size, and cancellation before transfer.
+- [X] T015 [US1] Implement the interactive `inquire::MultiSelect`, per-distribution `inquire::Select`, review, and `inquire::Confirm` flow in `crates/cli/src/commands/download.rs` and `crates/cli/src/output/human.rs`, showing focus/selection markers, default-kernel text, distribution/kernel pairs, runtime packages, image count, estimated size, and cancellation before transfer.
 - [X] T016 [US1] Wire catalog loading, explicit-versus-interactive selection, plan validation, review, and confirmation into `crates/cli/src/main.rs`, `crates/cli/src/context.rs`, `crates/cli/src/commands/mod.rs`, and `crates/cli/src/commands/download.rs`, guaranteeing that no SDK download operation is called before confirmation and that pre-transfer cancellation maps to exit code `130`.
 
 **Checkpoint**: User Story 1 is independently usable as a safe plan-building flow; it can list,
@@ -82,17 +82,17 @@ distribution-image order, downloading each required artifact group exactly as re
 plan.
 
 **Independent Test**: Execute a confirmed fake-client plan with multiple distributions sharing a
-kernel and with a multi-image distribution; verify one runtime call first, one call per unique
-kernel, one call per distribution, and success only after every SDK result is verified.
+kernel and with a multi-image distribution; verify every runtime package call first, one call per
+unique kernel, one call per distribution, and success only after every SDK result is verified.
 
 ### Tests for User Story 2
 
-- [X] T017 [US2] Write failing executor tests with an SDK-shaped fake in `crates/cli/src/commands/download.rs` that record calls and assert runtime binary first, unique kernels once, deterministic kernel/distribution order, and no lifecycle or direct Firecracker invocation.
-- [X] T018 [US2] Write failing success-path tests in `crates/cli/src/commands/download.rs` for multi-image distributions and the invariant that the command reports success only after the runtime package, every unique kernel, and every selected distribution image group returns a verified SDK result.
+- [X] T017 [US2] Write failing executor tests with an SDK-shaped fake in `crates/cli/src/commands/download.rs` that record calls and assert every runtime binary package first, unique kernels once, deterministic kernel/distribution order, and no lifecycle or direct Firecracker invocation.
+- [X] T018 [US2] Write failing success-path tests in `crates/cli/src/commands/download.rs` for multi-image distributions and the invariant that the command reports success only after every runtime package, every unique kernel, and every selected distribution image group returns a verified SDK result.
 
 ### Implementation for User Story 2
 
-- [X] T019 [US2] Implement the generic confirmed-plan executor in `crates/cli/src/commands/download.rs`, executing the runtime binary member first, then each unique kernel, then each selected distribution image group in deterministic order and collecting verified `DownloadedBinary`, `DownloadedKernel`, and `DownloadedDistribution` results.
+- [X] T019 [US2] Implement the generic confirmed-plan executor in `crates/cli/src/commands/download.rs`, executing every runtime binary member first, then each unique kernel, then each selected distribution image group in deterministic order and collecting verified `DownloadedBinary`, `DownloadedKernel`, and `DownloadedDistribution` results.
 - [X] T020 [US2] Implement the production SDK artifact client adapter in `crates/cli/src/commands/download.rs`, forwarding IDs and callbacks to the SDK's cancellation-aware download methods without inspecting paths, hashes, file existence, SQLite, or cache state in the CLI.
 - [X] T021 [US2] Connect the confirmed plan to the executor and final success result in `crates/cli/src/main.rs`, `crates/cli/src/commands/mod.rs`, and `crates/cli/src/commands/download.rs`, returning success only when all planned groups are verified and retaining the runtime prerequisite short-circuit for later failure handling.
 
@@ -140,7 +140,7 @@ successful, failed, skipped, and cancelled groups.
 
 ### Tests for User Story 4
 
-- [X] T028 [US4] Write failing tests in `crates/cli/src/commands/download.rs` proving that a runtime-bundle failure produces a nonzero outcome and makes zero kernel or distribution calls.
+- [X] T028 [US4] Write failing tests in `crates/cli/src/commands/download.rs` proving that a runtime-package failure produces a nonzero outcome and makes zero kernel or distribution calls.
 - [X] T029 [US4] Write failing tests in `crates/cli/src/commands/download.rs` proving that a selected kernel failure skips only the associated distribution image group, continues unrelated groups, preserves earlier verified results, and separates successful and failed groups in the summary.
 - [X] T030 [US4] Write failing partial-failure tests in `crates/cli/src/commands/download.rs` and `crates/cli/src/output/human.rs` for a multi-image distribution failure, retained successful members, actionable what/why/next text, and exit code `1`.
 - [X] T031 [P] [US4] Write failing cancellation tests in `crates/sdk/tests/download_flow.rs` and `crates/cli/src/commands/download.rs` proving that `Ctrl-C` signals the SDK token, waits for cleanup, publishes no partial artifact, preserves verified groups, starts no subsequent group, reports cancellation, and returns exit code `130`.

@@ -59,14 +59,14 @@ operations.
 and verified locally.
 
 **Independent Test**: Confirm a fixture plan containing multiple distributions, including two that
-share a kernel, and verify that the runtime bundle is handled first, each unique kernel is handled
-once, and every selected distribution image is acquired before success is reported.
+share a kernel, and verify that all selected runtime packages are handled first, each unique kernel
+is handled once, and every selected distribution image is acquired before success is reported.
 
 **Acceptance Scenarios**:
 
-1. **Given** a confirmed plan and a compatible runtime binary bundle containing Firecracker and
-   firectl, **When** downloading starts, **Then** the command acquires that bundle first and only
-   proceeds to distribution and kernel artifacts after the runtime bundle succeeds.
+1. **Given** a confirmed plan and compatible runtime packages that collectively provide Firecracker
+   and firectl, **When** downloading starts, **Then** the command acquires every required runtime
+   package first and only proceeds to distribution and kernel artifacts after they all succeed.
 2. **Given** two selected distributions use the same kernel, **When** the plan is executed, **Then**
    that kernel is requested once and is reused for both distribution selections.
 3. **Given** a selected distribution has multiple published images, **When** its download runs,
@@ -120,9 +120,9 @@ then verify the exit status, failure summary, retained successful artifacts, and
 
 **Acceptance Scenarios**:
 
-1. **Given** the required runtime binary bundle cannot be acquired, **When** the command starts the
-   transfer phase, **Then** it reports the failure and stops before starting distribution or kernel
-   downloads.
+1. **Given** any required runtime binary package cannot be acquired, **When** the command starts
+   the transfer phase, **Then** it reports the failure and stops before starting distribution or
+   kernel downloads.
 2. **Given** one selected distribution or its kernel fails after another selection succeeds,
    **When** the command finishes, **Then** it skips only the affected distribution's remaining
    image downloads, continues independent selections, reports a non-success result listing the
@@ -162,7 +162,7 @@ same download plan, and returns a deterministic success or failure status.
 ### Edge Cases
 
 - The registry returns no host-compatible distributions, no compatible kernels for a selected
-  distribution, or no compatible binary bundle containing the required runtime components.
+  distribution, or no host-compatible binary packages for one of the required runtime components.
 - The registry returns duplicate identifiers, incomplete metadata, an unavailable response, or an
   unsupported schema; the command must fail before presenting or downloading unsafe selections.
 - The operator selects no distributions, selects a distribution twice, presses escape during a
@@ -203,14 +203,16 @@ same download plan, and returns a deterministic success or failure status.
   that distribution's published compatible-kernel set, mark the registry default, and reject an
   incompatible or unavailable explicit choice before transfer.
 - **FR-007**: The review step MUST show the selected distribution/kernel pairs, the automatically
-  chosen host-compatible runtime binary bundle, the number of distribution images, and the
+  chosen host-compatible runtime binary packages, the number of distribution images, and the
   estimated total size before confirmation.
-- **FR-008**: The command MUST automatically choose the highest published binary-package version
-  for the host architecture that contains the required Firecracker and firectl components; if no
-  such package exists, it MUST fail before downloading any distribution or kernel artifact.
-- **FR-009**: After confirmation, the command MUST acquire the runtime binary bundle first, then
-  acquire each unique selected kernel and every image belonging to each selected distribution whose
-  selected kernel was verified, in a deterministic order; if a selected kernel fails, FR-014
+- **FR-008**: The command MUST automatically choose the highest published semantic-version binary
+  package for each required runtime component on the host architecture. A package containing both
+  components MUST be reused for both requirements; otherwise, one package per component MUST be
+  selected. If the registry cannot provide every required component, it MUST fail before
+  downloading any distribution or kernel artifact.
+- **FR-009**: After confirmation, the command MUST acquire all selected runtime packages first,
+  then acquire each unique selected kernel and every image belonging to each selected distribution
+  whose selected kernel was verified, in a deterministic order; if a selected kernel fails, FR-014
   governs the associated distribution's image group.
 - **FR-010**: The command MUST call the existing artifact-management operations for all acquisition,
   integrity, cache, persistence, and compatibility behavior; it MUST NOT duplicate registry,
@@ -220,13 +222,13 @@ same download plan, and returns a deterministic success or failure status.
   and whether a member was downloaded, adopted, or skipped.
 - **FR-012**: Progress MUST be truthful and readable in color and non-color terminals; operational
   state MUST also be communicated with text labels or symbols and MUST NOT rely on color alone.
-- **FR-013**: The command MUST report success only after every required runtime binary, selected
+- **FR-013**: The command MUST report success only after every required runtime package, selected
   kernel, and selected distribution image has returned a verified result from the artifact
   capability.
 - **FR-014**: If a selected kernel fails, the command MUST skip image downloads for the associated
-  distribution, continue other independent selections when the runtime bundle succeeded, retain
+  distribution, continue other independent selections when all runtime packages succeeded, retain
   successful verified members for safe retry, and report successful and failed groups separately;
-  a runtime-bundle failure MUST stop all dependent downloads.
+  a runtime-package failure MUST stop all dependent downloads.
 - **FR-015**: Expected failures MUST explain what happened, why the requested preparation is
   incomplete, and what the operator can do next; the command MUST use nonzero exit status for an
   incomplete plan and MUST NOT expose an unexplained panic or stack trace.
@@ -246,14 +248,15 @@ same download plan, and returns a deterministic success or failure status.
 
 ### Key Entities *(include if feature involves data)*
 
-- **Download Plan**: The confirmed set of runtime binary bundle, unique kernels, and distribution
+- **Download Plan**: The confirmed set of runtime binary packages, unique kernels, and distribution
   image groups to acquire, including total expected size and deterministic execution order.
 - **Distribution Selection**: A published distribution chosen by the operator, including its
   selected compatible kernel and all images that belong to the distribution.
 - **Kernel Selection**: The one published kernel associated with a distribution selection; the same
   kernel may be shared by multiple distribution selections and downloaded once per plan.
-- **Runtime Binary Bundle**: The host-compatible published package containing the Firecracker and
-  firectl components required by the host-local MicroVM workflow.
+- **Runtime Binary Packages**: The host-compatible published packages that provide the Firecracker
+  and firectl components required by the host-local MicroVM workflow. The registry may publish one
+  package for both components or separate packages for each component.
 - **Progress Event**: The current member, stage, byte counters, expected total, and cache/download
   disposition displayed while the plan executes.
 - **Download Outcome**: The final success, cancellation, partial failure, or validation failure

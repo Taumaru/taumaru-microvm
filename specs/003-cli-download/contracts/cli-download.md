@@ -43,8 +43,8 @@ When no explicit selection options are supplied and the terminal supports intera
 3. For each selected distribution, show a separate kernel selector containing only host-compatible
    IDs listed in that distribution's supported-kernel set. The published default is marked with
    text such as `(default)`.
-4. Show a review containing every distribution/kernel pair, the selected runtime package and
-   version, distribution image count, and estimated total bytes.
+4. Show a review containing every distribution/kernel pair, all selected runtime packages and
+   versions, distribution image count, and estimated total bytes.
 5. Offer one specific `Download` confirmation action. Escape or a negative confirmation starts no
    transfer and returns cancellation.
 
@@ -79,13 +79,14 @@ rejected with the required option form and an example.
 ## Planning and execution
 
 The command builds one immutable plan from the SDK listing results. It filters distributions and
-kernels to the host architecture and selects the highest semantic-version binary package that
-contains both `firecracker` and `firectl` components. If no package qualifies, it fails before
-confirmation and before any artifact download.
+kernels to the host architecture and selects the highest semantic-version binary package for each
+required `firecracker` and `firectl` file component. A package containing both components is
+selected once. If the catalog cannot provide every required component, it fails before confirmation
+and before any artifact download.
 
 After confirmation, calls are made through the SDK in this order:
 
-1. `download_binary(runtime_package_id, callback)`;
+1. `download_binary(runtime_package_id, callback)` once for each selected runtime package;
 2. `download_kernel(kernel_id, callback)` once for each unique selected kernel;
 3. `download_distribution(distribution_id, callback)` once for each selected distribution.
 
@@ -97,11 +98,11 @@ The CLI forwards SDK callbacks to the renderer. It does not calculate checksums,
 decide cache reuse, update SQLite, or resolve binary paths. The SDK's returned dispositions are
 rendered as `Downloaded`, `Adopted`, or `Already available`.
 
-If the runtime call fails, kernel and distribution calls are not started. After a successful
-runtime call, a kernel failure skips only the associated distribution image group; unrelated
-groups are reported and attempted in deterministic order. Verified successful work remains
-available for a later retry through the SDK. If the operator presses `Ctrl-C` during any SDK
-download, the CLI signals the shared cancellation token and waits for the current operation to
+If any runtime package call fails, kernel and distribution calls are not started. After all runtime
+package calls succeed, a kernel failure skips only the associated distribution image group;
+unrelated groups are reported and attempted in deterministic order. Verified successful work
+remains available for a later retry through the SDK. If the operator presses `Ctrl-C` during any
+SDK download, the CLI signals the shared cancellation token and waits for the current operation to
 clean up; subsequent groups are not started, the SDK removes the partial temporary artifact, and
 the command returns cancellation with previously verified work preserved.
 

@@ -207,8 +207,8 @@ pub(crate) struct DistributionSelection {
 
 #[derive(Clone, Debug)]
 pub(crate) struct RuntimeBinarySelection {
-    pub(crate) package: BinaryPackage,
-    pub(crate) files: Vec<taumaru_microvm::BinaryFile>,
+    pub(crate) packages: Vec<BinaryPackage>,
+    pub(crate) file_count: usize,
     pub(crate) expected_bytes: u64,
 }
 
@@ -318,14 +318,11 @@ impl RegistryCatalog {
         Ok(kernels)
     }
 
-    fn select_runtime_package(&self) -> Result<RuntimeBinarySelection, CliError> {
+    fn select_runtime_packages(&self) -> Result<RuntimeBinarySelection, CliError> {
         let mut candidates = self
             .binaries
             .iter()
-            .filter(|package| {
-                same_architecture(&package.architecture, &self.host_architecture)
-                    && has_required_runtime_components(package)
-            })
+            .filter(|package| same_architecture(&package.architecture, &self.host_architecture))
             .filter_map(|package| {
                 Version::parse(&package.version)
                     .ok()
@@ -339,25 +336,42 @@ impl RegistryCatalog {
                     .then_with(|| left_package.id.cmp(&right_package.id))
             },
         );
-        let (_, package) = candidates.first().ok_or_else(|| {
-            CliError::Validation(format!(
-                "no valid runtime package contains firecracker and firectl for host architecture {}",
-                architecture_label(&self.host_architecture)
-            ))
-        })?;
-        let mut files = package.files.clone();
-        files.sort_by(|left, right| left.name.cmp(&right.name));
-        let expected_bytes = files.iter().try_fold(0_u64, |total, file| {
-            total.checked_add(file.size_bytes).ok_or_else(|| {
-                CliError::Validation(format!(
-                    "runtime package {} exceeds the supported size range",
-                    package.id
-                ))
-            })
-        })?;
+
+        let required_components = ["firecracker", "firectl"];
+        let mut packages = Vec::new();
+        let mut selected_ids = HashSet::new();
+        for required_component in required_components {
+            let package = candidates
+                .iter()
+                .find(|(_, package)| has_runtime_component(package, required_component))
+                .map(|(_, package)| *package)
+                .ok_or_else(|| {
+                    CliError::Validation(format!(
+                        "no valid runtime package provides {required_component} for host architecture {}",
+                        architecture_label(&self.host_architecture)
+                    ))
+                })?;
+            if selected_ids.insert(package.id.as_str()) {
+                packages.push((*package).clone());
+            }
+        }
+        packages.sort_by(|left, right| left.id.cmp(&right.id));
+
+        let mut file_count = 0_usize;
+        let mut expected_bytes = 0_u64;
+        for package in &packages {
+            file_count = file_count.checked_add(package.files.len()).ok_or_else(|| {
+                CliError::Validation("runtime file count exceeded the supported range".to_owned())
+            })?;
+            expected_bytes = checked_size_add(
+                expected_bytes,
+                binary_package_size(package)?,
+                "runtime package",
+            )?;
+        }
         Ok(RuntimeBinarySelection {
-            package: (*package).clone(),
-            files,
+            packages,
+            file_count,
             expected_bytes,
         })
     }
@@ -436,10 +450,22 @@ fn host_architecture() -> Result<Architecture, CliError> {
     }
 }
 
-fn has_required_runtime_components(package: &BinaryPackage) -> bool {
-    ["firecracker", "firectl"]
+fn has_runtime_component(package: &BinaryPackage, required_component: &str) -> bool {
+    package
+        .files
         .iter()
-        .all(|required| package.files.iter().any(|file| file.name == *required))
+        .any(|file| file.name == required_component)
+}
+
+fn binary_package_size(package: &BinaryPackage) -> Result<u64, CliError> {
+    package.files.iter().try_fold(0_u64, |total, file| {
+        total.checked_add(file.size_bytes).ok_or_else(|| {
+            CliError::Validation(format!(
+                "runtime package {} exceeds the supported size range",
+                package.id
+            ))
+        })
+    })
 }
 
 fn parse_kernel_mappings(values: &[String]) -> Result<HashMap<String, String>, CliError> {
@@ -522,7 +548,7 @@ fn build_plan(
         });
     }
 
-    let runtime = catalog.select_runtime_package()?;
+    let runtime = catalog.select_runtime_packages()?;
     let mut unique_kernels = BTreeMap::new();
     for selection in &selections {
         unique_kernels
@@ -530,11 +556,22 @@ fn build_plan(
             .or_insert_with(|| selection.kernel.clone());
     }
 
-    let mut members = vec![PlanMember::RuntimeBinary {
-        package_id: runtime.package.id.clone(),
-        expected_bytes: runtime.expected_bytes,
-    }];
-    let mut expected_bytes = runtime.expected_bytes;
+    let mut members = Vec::with_capacity(
+        runtime
+            .packages
+            .len()
+            .saturating_add(unique_kernels.len())
+            .saturating_add(selections.len()),
+    );
+    let mut expected_bytes = 0_u64;
+    for package in &runtime.packages {
+        let package_bytes = binary_package_size(package)?;
+        expected_bytes = checked_size_add(expected_bytes, package_bytes, "runtime package")?;
+        members.push(PlanMember::RuntimeBinary {
+            package_id: package.id.clone(),
+            expected_bytes: package_bytes,
+        });
+    }
     for kernel in unique_kernels.values() {
         expected_bytes = checked_size_add(expected_bytes, kernel.size_bytes, "kernel")?;
         members.push(PlanMember::Kernel {
@@ -714,51 +751,56 @@ where
 
     if cancellation.is_cancelled() {
         outcome.cancelled = true;
-        append_cancelled_after_runtime(plan, &mut outcome);
+        append_cancelled_after_runtime(plan, &mut outcome, 0);
         return Ok(outcome);
     }
 
-    let runtime_id = plan.runtime.package.id.clone();
-    let mut runtime_progress =
-        ProgressForwarder::new(sink, completed_plan_bytes, plan.expected_bytes);
-    let runtime_call = client.download_binary(&runtime_id, cancellation, |progress| {
-        runtime_progress.forward(progress)
-    });
-    let runtime_result = call_with_signal(runtime_call, cancellation, signal_factory()).await?;
-    if let Some(error) = runtime_progress.take_error() {
-        return Err(error);
-    }
-    match runtime_result {
-        OperationResult::Finished(Ok(result)) => {
-            let availability = availability_for_files(&result.files);
-            outcome.add_available_bytes(plan.runtime.expected_bytes)?;
-            completed_plan_bytes = checked_size_add(
-                completed_plan_bytes,
-                plan.runtime.expected_bytes,
-                "completed runtime",
-            )?;
-            outcome
-                .verified
-                .push(VerifiedArtifact::Binary(Box::new(result)));
-            outcome.groups.push(MemberOutcome::Verified {
-                label: format!("runtime/{runtime_id}"),
-                availability,
-            });
-        }
-        OperationResult::Finished(Err(error)) => {
-            outcome.groups.push(MemberOutcome::Failed {
-                label: format!("runtime/{runtime_id}"),
-                reason: error.to_string(),
-            });
-            return Ok(outcome);
-        }
-        OperationResult::Cancelled => {
+    for (runtime_index, package) in plan.runtime.packages.iter().enumerate() {
+        if cancellation.is_cancelled() {
             outcome.cancelled = true;
-            outcome.groups.push(MemberOutcome::Cancelled {
-                label: format!("runtime/{runtime_id}"),
-            });
-            append_cancelled_after_runtime(plan, &mut outcome);
+            append_cancelled_after_runtime(plan, &mut outcome, runtime_index);
             return Ok(outcome);
+        }
+        let runtime_id = package.id.clone();
+        let runtime_bytes = binary_package_size(package)?;
+        let mut runtime_progress =
+            ProgressForwarder::new(sink, completed_plan_bytes, plan.expected_bytes);
+        let runtime_call = client.download_binary(&runtime_id, cancellation, |progress| {
+            runtime_progress.forward(progress)
+        });
+        let runtime_result = call_with_signal(runtime_call, cancellation, signal_factory()).await?;
+        if let Some(error) = runtime_progress.take_error() {
+            return Err(error);
+        }
+        match runtime_result {
+            OperationResult::Finished(Ok(result)) => {
+                let availability = availability_for_files(&result.files);
+                outcome.add_available_bytes(runtime_bytes)?;
+                completed_plan_bytes =
+                    checked_size_add(completed_plan_bytes, runtime_bytes, "completed runtime")?;
+                outcome
+                    .verified
+                    .push(VerifiedArtifact::Binary(Box::new(result)));
+                outcome.groups.push(MemberOutcome::Verified {
+                    label: format!("runtime/{runtime_id}"),
+                    availability,
+                });
+            }
+            OperationResult::Finished(Err(error)) => {
+                outcome.groups.push(MemberOutcome::Failed {
+                    label: format!("runtime/{runtime_id}"),
+                    reason: error.to_string(),
+                });
+                return Ok(outcome);
+            }
+            OperationResult::Cancelled => {
+                outcome.cancelled = true;
+                outcome.groups.push(MemberOutcome::Cancelled {
+                    label: format!("runtime/{runtime_id}"),
+                });
+                append_cancelled_after_runtime(plan, &mut outcome, runtime_index + 1);
+                return Ok(outcome);
+            }
         }
     }
 
@@ -930,9 +972,18 @@ fn availability_for_files(files: &[taumaru_microvm::DownloadedFile]) -> Availabi
     }
 }
 
-fn append_cancelled_after_runtime(plan: &DownloadPlan, outcome: &mut DownloadOutcome) {
-    for member in plan.members.iter().skip(1) {
+fn append_cancelled_after_runtime(
+    plan: &DownloadPlan,
+    outcome: &mut DownloadOutcome,
+    runtime_start: usize,
+) {
+    for member in plan.members.iter().skip(runtime_start) {
         match member {
+            PlanMember::RuntimeBinary { package_id, .. } => {
+                outcome.groups.push(MemberOutcome::Cancelled {
+                    label: format!("runtime/{package_id}"),
+                })
+            }
             PlanMember::Kernel { kernel_id, .. } => outcome.groups.push(MemberOutcome::Cancelled {
                 label: format!("kernel/{kernel_id}"),
             }),
@@ -941,7 +992,6 @@ fn append_cancelled_after_runtime(plan: &DownloadPlan, outcome: &mut DownloadOut
             } => outcome.groups.push(MemberOutcome::Cancelled {
                 label: format!("distribution/{distribution_id}"),
             }),
-            PlanMember::RuntimeBinary { .. } => {}
         }
     }
 }
@@ -1436,9 +1486,18 @@ mod tests {
     }
 
     fn binary(id: &str, version: &str, files: Vec<BinaryFile>) -> BinaryPackage {
+        binary_with_name(id, "firecracker", version, files)
+    }
+
+    fn binary_with_name(
+        id: &str,
+        name: &str,
+        version: &str,
+        files: Vec<BinaryFile>,
+    ) -> BinaryPackage {
         BinaryPackage {
             id: id.to_owned(),
-            name: "firecracker".to_owned(),
+            name: name.to_owned(),
             display_name: id.to_owned(),
             description: None,
             version: version.to_owned(),
@@ -1529,7 +1588,7 @@ mod tests {
                 binary(
                     "runtime-incomplete",
                     "9.0.0",
-                    vec![binary_file("firecracker", 29)],
+                    vec![binary_file("jailer", 29)],
                 ),
             ],
             vec![
@@ -1558,6 +1617,24 @@ mod tests {
             Architecture::X86_64,
         )
         .expect("test catalog should be valid")
+    }
+
+    fn split_runtime_catalog() -> RegistryCatalog {
+        let mut catalog = catalog();
+        catalog.binaries = vec![
+            binary(
+                "firecracker-1.17.0-x86_64",
+                "1.17.0",
+                vec![binary_file("firecracker", 19), binary_file("jailer", 23)],
+            ),
+            binary_with_name(
+                "firectl-0.2.0-x86_64",
+                "firectl",
+                "0.2.0",
+                vec![binary_file("firectl", 17)],
+            ),
+        ];
+        catalog
     }
 
     #[test]
@@ -1673,7 +1750,8 @@ mod tests {
         )
         .expect("plan should be valid");
 
-        assert_eq!(plan.runtime.package.id, "runtime-new");
+        assert_eq!(plan.runtime.packages[0].id, "runtime-new");
+        assert_eq!(plan.runtime.file_count, 2);
         assert_eq!(plan.runtime.expected_bytes, 42);
         assert_eq!(plan.expected_bytes, 42 + 13 + 31 + 37 + 41);
         assert_eq!(
@@ -1699,6 +1777,45 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn runtime_selection_accepts_registry_packages_split_by_component() {
+        let catalog = split_runtime_catalog();
+
+        let runtime = catalog
+            .select_runtime_packages()
+            .expect("separate firecracker and firectl packages should form a runtime");
+
+        assert_eq!(
+            runtime
+                .packages
+                .iter()
+                .map(|package| package.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["firecracker-1.17.0-x86_64", "firectl-0.2.0-x86_64"]
+        );
+        assert_eq!(runtime.file_count, 3);
+        assert_eq!(runtime.expected_bytes, 59);
+    }
+
+    #[test]
+    fn runtime_selection_rejects_catalog_missing_a_required_component() {
+        let mut catalog = catalog();
+        catalog.binaries = vec![binary(
+            "firecracker-only",
+            "1.0.0",
+            vec![binary_file("firecracker", 19)],
+        )];
+
+        let error = catalog
+            .select_runtime_packages()
+            .expect_err("a runtime without firectl must be rejected");
+
+        match error {
+            super::CliError::Validation(message) => assert!(message.contains("firectl")),
+            other => panic!("expected a validation error, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1804,6 +1921,64 @@ mod tests {
         );
         assert!(outcome.is_success());
         assert_eq!(outcome.verified.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn executor_downloads_split_runtime_packages_before_kernels() {
+        let catalog = split_runtime_catalog();
+        let mappings =
+            parse_kernel_mappings(&["distro-a=kernel-a".to_owned()]).expect("valid mapping");
+        let plan = build_plan(&catalog, &["distro-a".to_owned()], &mappings)
+            .expect("plan should be valid");
+        let client = RecordingClient::new();
+        let cancellation = taumaru_microvm::DownloadCancellation::new();
+        let mut sink = NoopSink;
+
+        let outcome = execute_plan_with_signals(&client, &plan, &cancellation, &mut sink, || {
+            pending::<Result<(), std::io::Error>>()
+        })
+        .await
+        .expect("executor should complete");
+
+        assert_eq!(
+            client.calls(),
+            vec![
+                "binary:firecracker-1.17.0-x86_64",
+                "binary:firectl-0.2.0-x86_64",
+                "kernel:kernel-a",
+                "distribution:distro-a",
+            ]
+        );
+        assert!(outcome.is_success());
+        assert_eq!(outcome.verified.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn split_runtime_package_failure_stops_kernel_and_distribution_downloads() {
+        let catalog = split_runtime_catalog();
+        let mappings =
+            parse_kernel_mappings(&["distro-a=kernel-a".to_owned()]).expect("valid mapping");
+        let plan = build_plan(&catalog, &["distro-a".to_owned()], &mappings)
+            .expect("plan should be valid");
+        let client = RecordingClient::with_failure("binary:firectl-0.2.0-x86_64");
+        let cancellation = taumaru_microvm::DownloadCancellation::new();
+        let mut sink = NoopSink;
+
+        let outcome = execute_plan_with_signals(&client, &plan, &cancellation, &mut sink, || {
+            pending::<Result<(), std::io::Error>>()
+        })
+        .await
+        .expect("executor should return an outcome");
+
+        assert_eq!(
+            client.calls(),
+            vec![
+                "binary:firecracker-1.17.0-x86_64",
+                "binary:firectl-0.2.0-x86_64",
+            ]
+        );
+        assert_eq!(outcome.verified.len(), 1);
+        assert!(!outcome.is_success());
     }
 
     #[tokio::test]

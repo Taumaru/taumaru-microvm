@@ -52,17 +52,20 @@ deduplicated in the execution members.
 
 ### `RuntimeBinarySelection`
 
-The automatically selected host runtime package.
+The automatically selected host runtime packages. Each required component is resolved separately;
+one package is reused when it provides both components, while split registry packages are retained
+as separate runtime selections.
 
 | Field | Type | Meaning |
 |---|---|---|
-| `package` | `BinaryPackage` | Highest valid host-compatible package |
+| `packages` | `Vec<BinaryPackage>` | Highest valid host-compatible package for each required component, deduplicated by package ID |
 | `required_components` | `Vec<String>` | `firecracker` and `firectl` |
-| `file_count` | `usize` | All files the SDK will acquire from the package |
-| `bytes` | `u64` | Checked sum of all package file sizes |
+| `file_count` | `usize` | All files the SDK will acquire from all selected packages |
+| `expected_bytes` | `u64` | Checked sum of all selected package file sizes |
 
 Additional package files are included in the count and byte estimate because
-`download_binary` operates on the complete package.
+`download_binary` operates on complete packages. Runtime package IDs are sorted before they are
+added to the execution plan.
 
 ### `DownloadPlan`
 
@@ -136,10 +139,10 @@ FailedBeforeTransfer { reason }
 Cancelled { stage }
 ```
 
-`Succeeded` is possible only when the runtime package, every unique kernel, and every selected
+`Succeeded` is possible only when every runtime package, every unique kernel, and every selected
 distribution image group return verified SDK results. Any failed required member produces a
 non-success outcome. `FailedBeforeTransfer` covers invalid input, unavailable registry data, no
-compatible runtime package, and empty or incomplete selection. `Cancelled` covers prompt or
+compatible package for a required runtime component, and empty or incomplete selection. `Cancelled` covers prompt or
 confirmation cancellation before transfer or controlled `Ctrl-C` cancellation during transfer.
 Transfer cancellation stops subsequent plan members, preserves previously verified groups, and
 must leave no partial published artifact.
@@ -170,8 +173,8 @@ Transition rules:
 3. `SelectingKernels` must produce exactly one compatible kernel for every selected distribution.
 4. `Reviewing` computes all counts and checked byte totals before confirmation is offered.
 5. No `Downloading*` state is reachable until confirmation succeeds.
-6. A runtime failure is terminal for the transfer phase because all later work depends on the
-   runtime bundle.
+6. A runtime package failure is terminal for the transfer phase because all later work depends on
+   the complete runtime stage.
 7. Kernel and distribution groups after a successful runtime stage are attempted in plan order;
    a kernel failure skips only the associated distribution image group, while unrelated groups
    continue and verified work is not erased.
@@ -187,7 +190,8 @@ Transition rules:
 - Every selected kernel matches the host architecture and appears in the distribution's published
   supported-kernel IDs.
 - A selected kernel mapping cannot name an unselected distribution or appear more than once.
-- The runtime package matches the host architecture and contains both required components.
+- The runtime packages match the host architecture and collectively provide both required
+  components; a package containing both is selected only once.
 - Every registry ID is displayed and executed as data; it is never turned into a filesystem path by
   the CLI.
 - Shared kernels are deduplicated by registry ID only within the current plan; the SDK still

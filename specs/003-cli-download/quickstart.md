@@ -22,7 +22,7 @@ The command loads the current registry collections, then:
 
 1. select one or more distributions with the keyboard;
 2. choose one compatible kernel for each distribution;
-3. review the runtime package, distribution/kernel pairs, image count, and estimated size;
+3. review the runtime packages, distribution/kernel pairs, image count, and estimated size;
 4. confirm `Start download`;
 5. observe runtime, kernel, and distribution progress until the verified result.
 
@@ -55,37 +55,40 @@ The exact progress refresh is terminal-dependent, but the semantic content remai
 
 ```text
 ·  Checking artifact registry
-✓  Registry ready · 3 distributions · 4 kernels · 1 runtime packages
+✓  Registry ready · 3 distributions · 4 kernels · 3 runtime packages
 
 ◆ Download plan
 ────────────────────────────────────────────────
 
 Runtime
   •  Firecracker 1.14.1 (firecracker-1.14.1-x86_64) · 2 files · x86_64
-     8.0 MiB expected
+  •  firectl 0.2.0 (firectl-0.2.0-x86_64) · 1 file · x86_64
+     3 files · 8.0 MiB expected
 
 Targets
   •  alpine-3.20 (Alpine 3.20)
      ↳  linux-6.8-x86_64 (Linux 6.8) · default · 1 image · 120 MiB
 
 Transfer
-  128 MiB · 3 planned groups · 1 images
+  129 MiB · 4 planned groups · 1 images
 
 Review the plan above. The download starts after confirmation.
 
-↓  runtime/firecracker  Downloading  8.0 MiB / 8.0 MiB  ·  plan 8.0 MiB / 128 MiB
-✓  runtime/firecracker  Downloaded  8.0 MiB / 8.0 MiB  ·  plan 8.0 MiB / 128 MiB
-✓  kernel/linux-6.8-x86_64  Already available  16.0 MiB / 16.0 MiB  ·  plan 24.0 MiB / 128 MiB
-↓  distribution/alpine-3.20/image  Verifying  104 MiB / 104 MiB  ·  plan 128 MiB / 128 MiB
+↓  runtime/firecracker-1.14.1-x86_64  Downloading  8.0 MiB / 8.0 MiB  ·  plan 8.0 MiB / 129 MiB
+✓  runtime/firecracker-1.14.1-x86_64  Downloaded  8.0 MiB / 8.0 MiB  ·  plan 8.0 MiB / 129 MiB
+✓  runtime/firectl-0.2.0-x86_64  Already available  1.0 MiB / 1.0 MiB  ·  plan 9.0 MiB / 129 MiB
+✓  kernel/linux-6.8-x86_64  Already available  16.0 MiB / 16.0 MiB  ·  plan 25.0 MiB / 129 MiB
+↓  distribution/alpine-3.20/image  Verifying  104 MiB / 104 MiB  ·  plan 129 MiB / 129 MiB
 
 ✓ Download complete
 ────────────────────────────────────────────────
 
-  3/3 groups ready · 4 files verified
-  128 MiB available of 128 MiB planned · 128 MiB verified
+  4/4 groups ready · 5 files verified
+  129 MiB available of 129 MiB planned · 129 MiB verified
 
 Artifacts
-  ✓  runtime/firecracker  Downloaded
+  ✓  runtime/firecracker-1.14.1-x86_64  Downloaded
+  ✓  runtime/firectl-0.2.0-x86_64  Already available
   ✓  kernel/linux-6.8-x86_64  Already available
   ✓  distribution/alpine-3.20  Downloaded
 ```
@@ -102,7 +105,7 @@ Before confirmation, the command must reject:
 - a kernel not published as compatible with its distribution;
 - a duplicate or incomplete explicit mapping;
 - a distribution or kernel for another architecture;
-- a runtime package without both `firecracker` and `firectl`;
+- runtime packages that do not collectively provide both `firecracker` and `firectl`;
 - a registry response that the SDK reports as unavailable, malformed, or unsupported.
 
 After confirmation, a runtime failure stops dependent downloads. A kernel failure skips the

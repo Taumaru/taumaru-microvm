@@ -9,8 +9,8 @@
 Add a `microvm download` command as a thin CLI workflow over the existing `MicroVmSdk`. The
 command will load the current distributions, kernels, and binary packages; select one or more
 host-compatible distributions and one compatible kernel per distribution; choose the highest
-host-compatible runtime package containing `firecracker` and `firectl`; show a review; and begin
-transfers only after confirmation.
+host-compatible package for each required runtime component (`firecracker` and `firectl`), reusing
+one package when it provides both; show a review; and begin transfers only after confirmation.
 
 Interactive selection uses `inquire`, while `indicatif` renders truthful aggregate and
 current-member progress from SDK callbacks. Explicit repeatable `--distribution` and
@@ -66,9 +66,9 @@ Expected failures return formatted nonzero CLI results without panic, stack trac
 SDK output. All repository artifacts and user-facing product strings remain in English.
 
 **Scale/Scope**: One command invocation may select multiple distributions, many images, and
-shared kernels, while downloading one runtime binary package. Kernel transfers are deduplicated
-within the plan. Concurrent multi-plan transfers, resumable transfers, authentication, custom
-registry selection, and MicroVM lifecycle actions remain out of scope.
+shared kernels, while downloading one or more runtime binary packages. Kernel transfers are
+deduplicated within the plan. Concurrent multi-plan transfers, resumable transfers, authentication,
+custom registry selection, and MicroVM lifecycle actions remain out of scope.
 
 ## Constitution Check
 
@@ -172,7 +172,7 @@ partial-download failure, and `130` for interactive or transfer cancellation. It
 1. resolve context and detect prompt/output capabilities;
 2. load the three SDK lists into one catalog;
 3. choose explicit selections or run the interactive selectors;
-4. validate compatibility and choose the runtime package;
+4. validate compatibility and choose the runtime packages;
 5. render review and require confirmation;
 6. execute runtime, unique kernels, and distributions in plan order;
 7. render verified, retained, failed, and final outcome states.
@@ -193,10 +193,11 @@ the kernel options are the intersection of its `supported_kernels` IDs, the list
 the host architecture. The distribution's `default_kernel` is marked when it is available in that
 intersection. Explicit mappings run the same validation and cannot bypass compatibility rules.
 
-Runtime selection filters packages to the host architecture and to packages whose file names
-include both exact required components, `firecracker` and `firectl`. It parses versions with
-`semver`, picks the highest version, and breaks equal-version ties by package ID. Missing or
-invalid candidates produce a pre-transfer failure and never fall back to an arbitrary package.
+Runtime selection filters packages to the host architecture and selects the highest valid semantic
+version for each required file component, `firecracker` and `firectl`. A package containing both
+components is selected once and reused; split registry packages are both selected. Equal-version
+ties are broken by package ID. Missing or invalid candidates produce a pre-transfer failure and
+never fall back to an arbitrary package.
 
 ### Plan size, deduplication, and order
 
@@ -221,9 +222,10 @@ corrupt file, calculate a digest, update a table, or call `resolve_binary` to in
 SDK's `SkippedExisting` and `AdoptedExisting` events are displayed distinctly, and an SDK error
 after earlier verified members is reported as retained work.
 
-The runtime group is executed first and is the only hard prerequisite for the rest of the plan.
-After it succeeds, each unique kernel and selected distribution group is attempted in order even
-if an earlier independent group fails. If the operator cancels during any operation, the executor
+Every selected runtime package is executed first and the runtime stage is the only hard prerequisite
+for the rest of the plan. After all runtime packages succeed, each unique kernel and selected
+distribution group is attempted in order even if an earlier independent group fails. If the operator
+cancels during any operation, the executor
 stops the current and subsequent groups, asks the SDK's cancellation-safe path to remove the
 partial temporary file, and reports retained verified work. The command returns a
 partial-failure outcome and exit code `1` if any required group fails, or cancellation and exit
