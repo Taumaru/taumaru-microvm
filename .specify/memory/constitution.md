@@ -1,10 +1,11 @@
 <!--
 Sync Impact Report
-- Version change: 1.0.0 -> 1.1.0
+- Version change: 1.1.0 -> 1.2.0
 - Modified principles:
-  - V. Calm, Accessible CLI and Intentional Documentation -> expanded with a project-wide
-    English language policy
-- Added sections: None
+  - IV. Closed for Modification, Open for Extension -> expanded with mandatory SDK and CLI
+    repository organization rules
+- Added sections:
+  - Repository Organization under Architecture & Product Boundaries
 - Removed sections: None
 - Follow-up TODOs: None
 -->
@@ -103,6 +104,95 @@ MicroVM processes on the host. It is not a substitute for Taumaru's authoritativ
 state. Firecracker and `firectl` details MUST stay inside the MicroVM layer, and callers MUST
 use typed SDK operations rather than assembling host commands themselves.
 
+### Repository Organization
+
+The workspace MUST use the following ownership-oriented layout as the default organization for
+SDK and CLI production code:
+
+```text
+crates/
+├── sdk/
+│   ├── Cargo.toml
+│   ├── src/
+│   │   ├── lib.rs
+│   │   ├── error.rs
+│   │   ├── manager.rs
+│   │   ├── domain/
+│   │   │   ├── mod.rs
+│   │   │   ├── microvm.rs
+│   │   │   ├── config.rs
+│   │   │   ├── lifecycle.rs
+│   │   │   └── artifact.rs
+│   │   ├── ports/
+│   │   │   ├── mod.rs
+│   │   │   ├── repository.rs
+│   │   │   ├── artifacts.rs
+│   │   │   └── runtime.rs
+│   │   └── adapters/
+│   │       ├── persistence/
+│   │       │   └── sqlite.rs
+│   │       ├── registry/
+│   │       │   └── taumaru.rs
+│   │       └── runtime/
+│   │           └── firecracker.rs
+│   └── tests/
+│       ├── public_api.rs
+│       ├── lifecycle.rs
+│       └── failure_paths.rs
+└── cli/
+    ├── Cargo.toml
+    ├── src/
+    │   ├── main.rs
+    │   ├── cli.rs
+    │   ├── context.rs
+    │   ├── error.rs
+    │   ├── commands/
+    │   │   ├── mod.rs
+    │   │   ├── create.rs
+    │   │   ├── configure.rs
+    │   │   ├── start.rs
+    │   │   ├── stop.rs
+    │   │   ├── reboot.rs
+    │   │   ├── delete.rs
+    │   │   ├── list.rs
+    │   │   ├── inspect.rs
+    │   │   └── status.rs
+    │   └── output/
+    │       ├── mod.rs
+    │       ├── human.rs
+    │       └── json.rs
+    └── tests/
+        └── command_surface.rs
+```
+
+The SDK layout MUST follow these ownership rules:
+
+- `src/lib.rs` is the public facade and MUST expose stable public types and operations through
+  deliberate re-exports rather than serving as a dumping ground for implementation logic.
+- `error.rs` owns the public typed error surface, while `manager.rs` coordinates lifecycle use
+  cases without exposing infrastructure details.
+- `domain/` contains MicroVM identities, configuration, artifacts, and lifecycle states without
+  direct filesystem, database, network, terminal, or process dependencies.
+- `ports/` contains replaceable abstractions for local persistence, artifact sources, and runtime
+  process control.
+- `adapters/` contains infrastructure implementations such as SQLite, the Taumaru registry,
+  and Firecracker. Firecracker and `firectl` mechanics MUST remain in the runtime adapter.
+
+The CLI layout MUST follow these ownership rules:
+
+- `main.rs` owns startup, top-level parse handling, and exit-code mapping; it MUST remain thin.
+- `cli.rs` owns Clap definitions, `context.rs` owns dependency wiring, and `error.rs` owns
+  user-facing error presentation.
+- Each `commands/` module MAY call the SDK for one cohesive command, but MUST NOT implement
+  lifecycle behavior or invoke Firecracker directly.
+- `output/` owns human and machine-readable presentation. Formatting MUST NOT change SDK domain
+  semantics.
+
+Unit tests SHOULD remain close to the module they exercise. SDK public-contract and failure-path
+tests belong in `crates/sdk/tests/`, while executable and command-surface tests belong in
+`crates/cli/tests/`. New directories and modules MUST be introduced when their first real
+capability requires them; the repository MUST NOT add speculative empty layers.
+
 ## Development Workflow & Quality Gates
 
 Every feature or behavior change MUST define its observable success, failure, and lifecycle
@@ -152,4 +242,4 @@ changes MUST be corrected before merge or carry a documented exception with a re
 scope, and expiry or follow-up plan. The constitution itself MUST be amended when a temporary
 exception becomes a permanent architectural or product rule.
 
-**Version**: 1.1.0 | **Ratified**: 2026-09-17 | **Last Amended**: 2026-09-17
+**Version**: 1.2.0 | **Ratified**: 2026-09-17 | **Last Amended**: 2026-09-17

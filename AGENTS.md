@@ -41,6 +41,95 @@ Dependency direction MUST flow toward the SDK. The SDK MUST NOT depend on the CL
 Agent, or Taumaru's distributed control services. Callers use typed SDK operations rather than
 assembling `firectl` or Firecracker commands themselves.
 
+## Repository Organization
+
+Use the following ownership-oriented layout as the default organization for SDK and CLI
+production code:
+
+```text
+crates/
+├── sdk/
+│   ├── Cargo.toml
+│   ├── src/
+│   │   ├── lib.rs              # Public facade and re-exports
+│   │   ├── error.rs            # Typed SDK errors
+│   │   ├── manager.rs          # Lifecycle use cases
+│   │   ├── domain/
+│   │   │   ├── mod.rs
+│   │   │   ├── microvm.rs      # Identity and VM metadata
+│   │   │   ├── config.rs
+│   │   │   ├── lifecycle.rs    # Explicit VM states
+│   │   │   └── artifact.rs
+│   │   ├── ports/
+│   │   │   ├── mod.rs
+│   │   │   ├── repository.rs   # Local state abstraction
+│   │   │   ├── artifacts.rs    # Artifact source abstraction
+│   │   │   └── runtime.rs      # Firecracker/process abstraction
+│   │   └── adapters/
+│   │       ├── persistence/
+│   │       │   └── sqlite.rs
+│   │       ├── registry/
+│   │       │   └── taumaru.rs
+│   │       └── runtime/
+│   │           └── firecracker.rs
+│   └── tests/
+│       ├── public_api.rs
+│       ├── lifecycle.rs
+│       └── failure_paths.rs
+└── cli/
+    ├── Cargo.toml
+    ├── src/
+    │   ├── main.rs            # Startup, parse handling, and exit codes
+    │   ├── cli.rs             # Clap definitions
+    │   ├── context.rs         # SDK and adapter wiring
+    │   ├── error.rs           # User-facing error formatting
+    │   ├── commands/
+    │   │   ├── mod.rs
+    │   │   ├── create.rs
+    │   │   ├── configure.rs
+    │   │   ├── start.rs
+    │   │   ├── stop.rs
+    │   │   ├── reboot.rs
+    │   │   ├── delete.rs
+    │   │   ├── list.rs
+    │   │   ├── inspect.rs
+    │   │   └── status.rs
+    │   └── output/
+    │       ├── mod.rs
+    │       ├── human.rs
+    │       └── json.rs
+    └── tests/
+        └── command_surface.rs
+```
+
+The SDK layout has these responsibilities:
+
+- `src/lib.rs` is the public facade. It exposes stable types and operations through deliberate
+  re-exports and does not become a dumping ground for implementation logic.
+- `error.rs` owns the public typed error surface, while `manager.rs` coordinates lifecycle use
+  cases without exposing infrastructure details.
+- `domain/` contains MicroVM identities, configuration, artifacts, and lifecycle states without
+  direct filesystem, database, network, terminal, or process dependencies.
+- `ports/` contains replaceable abstractions for local persistence, artifact sources, and runtime
+  process control.
+- `adapters/` contains infrastructure implementations such as SQLite, the Taumaru registry, and
+  Firecracker. Firecracker and `firectl` mechanics remain in the runtime adapter.
+
+The CLI layout has these responsibilities:
+
+- `main.rs` owns startup, top-level parse handling, and exit-code mapping and remains thin.
+- `cli.rs` owns Clap definitions, `context.rs` owns dependency wiring, and `error.rs` owns
+  user-facing error presentation.
+- Each `commands/` module may call the SDK for one cohesive command, but does not implement
+  lifecycle behavior or invoke Firecracker directly.
+- `output/` owns human and machine-readable presentation and does not change SDK domain
+  semantics.
+
+Keep unit tests close to the module they exercise. Put SDK public-contract and failure-path tests
+in `crates/sdk/tests/`, and executable or command-surface tests in `crates/cli/tests/`. Add new
+directories and modules when their first real capability requires them; do not add speculative
+empty layers. The current bootstrap may remain minimal until a feature needs this expansion.
+
 ## SDK Rules
 
 The SDK is an embeddable library and MUST be safe for applications with their own output,
