@@ -9,7 +9,7 @@
 ## Summary
 
 Create a virtual Cargo workspace with two members: the publishable `taumaru-microvm` SDK and
-the binary-only `taumaru-microvm-cli`. The SDK will expose one pure, documented example
+the binary-only `taumaru-microvm-cli`. The SDK will expose one pure, documented temporary example
 function. The CLI will depend on the SDK, expose the executable as `microvm`, and use Clap's
 derive API for baseline help, version, and argument parsing. The foundation will stay free of
 Firecracker, registry, database, and production lifecycle behavior.
@@ -39,8 +39,9 @@ must not initialize runtime resources or contact external services. No numeric l
 needed for this foundation.
 
 **Constraints**: Preserve the SDK/CLI dependency direction, keep the SDK free of panic and
-output side effects, use English for every project artifact, name the executable `microvm`,
-exclude the CLI from crates.io publication, and avoid unused direct dependencies.
+output side effects, use English for every project artifact, use MIT licensing for every project
+component, name the executable `microvm`, exclude the CLI from crates.io publication, and avoid
+unused direct dependencies.
 
 **Scale/Scope**: Two packages, one public SDK example function, baseline CLI help/version/
 empty-input/invalid-input paths, and their tests. No production MicroVM commands.
@@ -107,8 +108,8 @@ domain behavior out of the SDK.
 
 1. Replace the current root package manifest with a virtual workspace declaring `crates/sdk` and
    `crates/cli` as members and setting `resolver = "3"`.
-2. Define shared edition, version, description, repository, and license metadata at the
-   workspace level where appropriate. Keep the existing project version at `0.1.0`.
+2. Define shared edition, version, description, and MIT license metadata at the workspace level
+   where appropriate. Keep the existing project version at `0.1.0`.
 3. Name the SDK package `taumaru-microvm` and configure it as a library target intended for
    crates.io publication.
 4. Name the CLI package `taumaru-microvm-cli`, set `publish = false`, and declare a binary
@@ -118,16 +119,18 @@ domain behavior out of the SDK.
 
 ### SDK example boundary
 
-The SDK exports `pub fn example_message() -> &'static str`, documented in English. It returns
-the stable message `taumaru-microvm SDK is ready` and performs no I/O, logging, environment
-lookup, network access, persistence, process control, or global initialization.
+The SDK exports `pub fn example_message() -> &'static str`, documented in English as a temporary
+bootstrap demonstration API. It returns the deterministic message `taumaru-microvm SDK is ready`
+and performs no I/O, logging, environment lookup, network access, persistence, process control,
+or global initialization.
 
 ### CLI foundation
 
 Use Clap's derive API for a typed top-level parser with explicit name `microvm`, package-derived
-version, English description, standard help/version flags, and help guidance when no command is
-selected. Keep the initial parser free of production VM subcommands; the structure must leave a
-clear location for future subcommands.
+version, English description, and standard help/version flags. When no arguments are supplied,
+the CLI explicitly renders concise help guidance and exits with code `0`; invalid input remains a
+non-success Clap parse error. Keep the initial parser free of production VM subcommands; the
+structure must leave a clear location for future subcommands.
 
 Rely on Clap's default terminal-aware styling for baseline help and errors. Do not add a color,
 table, progress, JSON, async, or logging dependency until a later feature uses that capability.

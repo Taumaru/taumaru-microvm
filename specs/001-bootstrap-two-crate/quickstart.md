@@ -18,7 +18,8 @@ cargo metadata --no-deps --format-version 1
 ```
 
 Expected result: the metadata contains two packages named `taumaru-microvm` and
-`taumaru-microvm-cli`.
+`taumaru-microvm-cli`, both with MIT license metadata; the SDK is publishable and the CLI is
+excluded from crates.io publication.
 
 ## 2. Run workspace quality checks
 
@@ -55,7 +56,8 @@ Expected results:
 
 - `--help` exits successfully and shows usage for `microvm`.
 - `--version` exits successfully and shows the CLI version.
-- No arguments show concise help guidance without requiring runtime resources.
+- No arguments show concise help guidance, exit successfully with code `0`, and do not require
+  runtime resources.
 - An unknown command shows a clear parse error and exits unsuccessfully without a panic.
 
 The executable-level checks are also covered by:
@@ -75,4 +77,5 @@ cargo package -p taumaru-microvm --allow-dirty --no-verify
 
 Expected result: the CLI depends on the SDK and Clap; no logging, async, table, progress, or
 JSON dependency is added without a tested baseline use. The SDK package can be packaged for
-future publication. Actual publication and binary release distribution are separate work.
+future publication and reports MIT metadata. Actual publication and binary release distribution
+are separate work.

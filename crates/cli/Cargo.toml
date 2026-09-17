@@ -1,0 +1,15 @@
+[package]
+name = "taumaru-microvm-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description.workspace = true
+publish = false
+
+[[bin]]
+name = "microvm"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+taumaru-microvm = { path = "../sdk" }

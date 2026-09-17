@@ -44,15 +44,16 @@ identity while presenting the short user-facing command required by the feature.
 
 ## Decision 3: Use Clap's derive API for the CLI foundation
 
-**Decision**: Add Clap in the CLI crate with the `derive` feature and use typed parser,
-subcommand, and command metadata definitions. Set the command name explicitly to `microvm`,
-enable version metadata from the package, and configure missing subcommands to show help.
+**Decision**: Add Clap in the CLI crate with the `derive` feature and use typed parser and
+command metadata definitions. Set the command name explicitly to `microvm`, enable version
+metadata from the package, render concise help and exit successfully when no arguments are
+provided, and leave invalid input to Clap's non-success parse errors.
 
 **Rationale**: Clap's derive API generates a typed parser from Rust declarations, and its
-documented command attributes support explicit names, package-derived versions, and
-`arg_required_else_help`. Clap's default features provide help, usage, contextual errors,
-suggestions, and terminal styling, which covers the bootstrap without a second presentation
-framework.
+documented command attributes support explicit names and package-derived versions. A small
+explicit no-argument branch supplies the required successful help behavior, while Clap's default
+features provide usage, contextual errors, suggestions, and terminal styling without a second
+presentation framework.
 
 **Alternatives considered**:
 
@@ -85,9 +86,10 @@ also protects the SDK's no-logging and no-output contract.
 
 ## Decision 5: Export a pure, deterministic SDK example function
 
-**Decision**: Expose `pub fn example_message() -> &'static str` from the SDK. It returns the
-constant message `taumaru-microvm SDK is ready` and performs no I/O, logging, process control,
-environment lookup, network access, or persistence.
+**Decision**: Expose `pub fn example_message() -> &'static str` from the SDK as a temporary,
+documented bootstrap demonstration API. It returns the constant message `taumaru-microvm SDK is
+ready` and performs no I/O, logging, process control, environment lookup, network access, or
+persistence.
 
 **Rationale**: A pure function proves that a consumer can import and call the SDK independently
 from the CLI while making the no-panic and no-side-effect requirements straightforward to test.
@@ -123,14 +125,13 @@ dedicated CLI test harness if its value justifies it.
 ## Decision 7: Use conservative shared package metadata
 
 **Decision**: Keep the existing `0.1.0` project version and Rust 2024 edition. Add English
-package descriptions, repository metadata where known, and an initial dual-license expression
-of `MIT OR Apache-2.0` as the default Rust ecosystem assumption. Treat license-file completion
-and actual publication as release work outside this feature.
+package descriptions, repository metadata where known, and MIT license metadata for every
+project component. Treat license-file completion and actual publication as release work outside
+this feature.
 
 **Rationale**: Shared metadata makes both packages consistent and gives the SDK a credible
-publication starting point without coupling the CLI to crates.io. The license expression is a
-common Rust default, but it remains an explicit assumption that must be confirmed before a real
-release.
+publication starting point without coupling the CLI to crates.io. The MIT license is an explicit
+project decision confirmed during clarification.
 
 **Alternatives considered**:
 

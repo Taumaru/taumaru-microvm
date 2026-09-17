@@ -1,0 +1,10 @@
+[package]
+name = "taumaru-microvm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description.workspace = true
+publish = ["crates-io"]
+
+[lib]
+path = "src/lib.rs"

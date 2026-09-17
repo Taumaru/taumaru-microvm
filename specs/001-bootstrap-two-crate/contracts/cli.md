@@ -5,6 +5,7 @@
 - Executable name: `microvm`
 - Package: `taumaru-microvm-cli`
 - Publication: binary distribution; not crates.io publication
+- License: MIT
 - Output language: English
 
 ## Baseline Commands
@@ -20,6 +21,8 @@
 ## Parser Rules
 
 - The parser uses Clap's derive API with an explicit command name of `microvm`.
+- Clap is the only initial third-party runtime dependency; additional dependencies require a
+  baseline capability that uses them.
 - Help and version are available without a local database, registry connection, kernel,
   root filesystem, KVM, Firecracker process, or existing MicroVM.
 - Terminal styling is automatic and terminal-aware. Piped output remains usable as plain text.

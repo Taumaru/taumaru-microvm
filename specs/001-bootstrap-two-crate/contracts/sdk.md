@@ -4,6 +4,7 @@
 
 - Package: `taumaru-microvm`
 - Target: publishable Rust library
+- License: MIT
 - Public module: `src/lib.rs`
 - Artifact language: English
 
@@ -18,6 +19,9 @@ The function MUST return exactly:
 ```text
 taumaru-microvm SDK is ready
 ```
+
+The function is a temporary bootstrap demonstration API and may be replaced before the first
+stable release.
 
 ## Behavioral Contract
 

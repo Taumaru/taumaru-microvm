@@ -26,9 +26,9 @@ an independently verifiable increment after the shared foundation is ready.
 
 **Purpose**: Establish the virtual Cargo workspace and the two package manifests.
 
-- [ ] T001 Convert the root `Cargo.toml` into a virtual workspace and remove the obsolete root binary at `src/main.rs`, declaring `crates/sdk` and `crates/cli` as members, resolver `"3"`, Rust 2024 edition, version `0.1.0`, English metadata, and MIT licensing.
-- [ ] T002 [P] Create the publishable SDK manifest in `crates/sdk/Cargo.toml` with package name `taumaru-microvm`, a library target at `crates/sdk/src/lib.rs`, crates.io-ready metadata, MIT licensing, and no runtime dependencies.
-- [ ] T003 [P] Create the binary-only CLI manifest in `crates/cli/Cargo.toml` with package name `taumaru-microvm-cli`, `publish = false`, a binary target named `microvm` at `crates/cli/src/main.rs`, a path dependency on `taumaru-microvm`, and Clap 4.6 with the `derive` feature as the only third-party runtime dependency.
+- [X] T001 Convert the root `Cargo.toml` into a virtual workspace and remove the obsolete root binary at `src/main.rs`, declaring `crates/sdk` and `crates/cli` as members, resolver `"3"`, Rust 2024 edition, version `0.1.0`, English metadata, and MIT licensing.
+- [X] T002 [P] Create the publishable SDK manifest in `crates/sdk/Cargo.toml` with package name `taumaru-microvm`, a library target at `crates/sdk/src/lib.rs`, crates.io-ready metadata, MIT licensing, and no runtime dependencies.
+- [X] T003 [P] Create the binary-only CLI manifest in `crates/cli/Cargo.toml` with package name `taumaru-microvm-cli`, `publish = false`, a binary target named `microvm` at `crates/cli/src/main.rs`, a path dependency on `taumaru-microvm`, and Clap 4.6 with the `derive` feature as the only third-party runtime dependency.
 
 ---
 
@@ -38,9 +38,9 @@ an independently verifiable increment after the shared foundation is ready.
 
 **⚠️ CRITICAL**: No user story implementation can begin until this phase is complete.
 
-- [ ] T004 [P] Add a compileable SDK library target with English module-level Rustdoc and no runtime initialization in `crates/sdk/src/lib.rs`.
-- [ ] T005 [P] Add a compileable CLI binary entry point with no database, registry, Firecracker, or other runtime-resource initialization in `crates/cli/src/main.rs`.
-- [ ] T006 Generate the shared workspace lockfile at `Cargo.lock` and verify with `cargo metadata --no-deps --format-version 1` that exactly `taumaru-microvm` and `taumaru-microvm-cli` are workspace packages and that the CLI points to the SDK path dependency.
+- [X] T004 [P] Add a compileable SDK library target with English module-level Rustdoc and no runtime initialization in `crates/sdk/src/lib.rs`.
+- [X] T005 [P] Add a compileable CLI binary entry point with no database, registry, Firecracker, or other runtime-resource initialization in `crates/cli/src/main.rs`.
+- [X] T006 Generate the shared workspace lockfile at `Cargo.lock` and verify with `cargo metadata --no-deps --format-version 1` that exactly `taumaru-microvm` and `taumaru-microvm-cli` are workspace packages and that the CLI points to the SDK path dependency.
 
 **Checkpoint**: The virtual workspace and empty package targets compile, and the dependency
 direction is established before story work begins.
@@ -57,11 +57,11 @@ and confirm that the SDK is publication-ready while the CLI is excluded from cra
 
 ### Tests for User Story 1
 
-- [ ] T007 [P] [US1] Add an external-style package-boundary test in `crates/cli/tests/package_boundary.rs` that imports the `taumaru-microvm` SDK dependency and asserts the CLI package identity is `taumaru-microvm-cli` without introducing a reverse dependency.
+- [X] T007 [P] [US1] Add an external-style package-boundary test in `crates/cli/tests/package_boundary.rs` that imports the `taumaru-microvm` SDK dependency and asserts the CLI package identity is `taumaru-microvm-cli` without introducing a reverse dependency.
 
 ### Implementation and Verification for User Story 1
 
-- [ ] T008 [P] [US1] Verify the package boundary described by `Cargo.toml`, `crates/sdk/Cargo.toml`, `crates/cli/Cargo.toml`, and `Cargo.lock` using `cargo metadata`, `cargo check --workspace`, and `cargo tree -p taumaru-microvm-cli`; correct any package-name, publication, or dependency-direction drift.
+- [X] T008 [P] [US1] Verify the package boundary described by `Cargo.toml`, `crates/sdk/Cargo.toml`, `crates/cli/Cargo.toml`, and `Cargo.lock` using `cargo metadata`, `cargo check --workspace`, and `cargo tree -p taumaru-microvm-cli`; correct any package-name, publication, or dependency-direction drift.
 
 **Checkpoint**: User Story 1 is independently complete when both packages build, the CLI can
 compile against the SDK, the SDK remains publishable, and the CLI remains `publish = false`.
@@ -78,12 +78,12 @@ documented result across repeated calls.
 
 ### Tests for User Story 2
 
-- [ ] T009 [P] [US2] Add external-consumer contract tests in `crates/sdk/tests/public_api.rs` that call `example_message` through `std::panic::catch_unwind`, assert the exact result `taumaru-microvm SDK is ready`, verify repeatability, and keep the invocation free of test-authored output or logging.
+- [X] T009 [P] [US2] Add external-consumer contract tests in `crates/sdk/tests/public_api.rs` that call `example_message` through `std::panic::catch_unwind`, assert the exact result `taumaru-microvm SDK is ready`, verify repeatability, and keep the invocation free of test-authored output or logging.
 
 ### Implementation for User Story 2
 
-- [ ] T010 [US2] Implement `pub fn example_message() -> &'static str` in `crates/sdk/src/lib.rs` with English Rustdoc identifying it as a temporary bootstrap API, returning exactly `taumaru-microvm SDK is ready`, and performing no I/O, logging, tracing, environment lookup, persistence, process control, mutation, or panic-prone handling.
-- [ ] T011 [US2] Run `cargo test -p taumaru-microvm --test public_api` and `cargo doc -p taumaru-microvm --no-deps`, resolving contract or Rustdoc failures only in `crates/sdk/src/lib.rs` and `crates/sdk/tests/public_api.rs`.
+- [X] T010 [US2] Implement `pub fn example_message() -> &'static str` in `crates/sdk/src/lib.rs` with English Rustdoc identifying it as a temporary bootstrap API, returning exactly `taumaru-microvm SDK is ready`, and performing no I/O, logging, tracing, environment lookup, persistence, process control, mutation, or panic-prone handling.
+- [X] T011 [US2] Run `cargo test -p taumaru-microvm --test public_api` and `cargo doc -p taumaru-microvm --no-deps`, resolving contract or Rustdoc failures only in `crates/sdk/src/lib.rs` and `crates/sdk/tests/public_api.rs`.
 
 **Checkpoint**: User Story 2 is independently complete when an external consumer can import the
 SDK function, receive the exact deterministic value, and pass the no-panic and no-unsolicited-
@@ -101,12 +101,12 @@ without Firecracker, KVM, registry access, database state, or an existing MicroV
 
 ### Tests for User Story 3
 
-- [ ] T012 [P] [US3] Add executable smoke tests in `crates/cli/tests/command_surface.rs` using `std::process::Command` and `CARGO_BIN_EXE_microvm` to cover `--help`, `--version`, no arguments, an unknown command, and an invalid option with the required exit statuses, English output, and no panic.
+- [X] T012 [P] [US3] Add executable smoke tests in `crates/cli/tests/command_surface.rs` using `std::process::Command` and `CARGO_BIN_EXE_microvm` to cover `--help`, `--version`, no arguments, an unknown command, and an invalid option with the required exit statuses, English output, and no panic.
 
 ### Implementation for User Story 3
 
-- [ ] T013 [US3] Implement the typed Clap parser and thin entry point in `crates/cli/src/main.rs` with an explicit command name `microvm`, package-derived version, English description, standard help/version flags, concise help guidance with exit code `0` for no arguments, non-success Clap parse errors for invalid input, and no runtime-resource initialization or MicroVM lifecycle logic.
-- [ ] T014 [US3] Run `cargo test -p taumaru-microvm-cli --test command_surface` plus the `cargo run -p taumaru-microvm-cli -- --help`, `--version`, empty-input, and invalid-input commands documented in `specs/001-bootstrap-two-crate/quickstart.md`, correcting only the CLI source or smoke tests as needed.
+- [X] T013 [US3] Implement the typed Clap parser and thin entry point in `crates/cli/src/main.rs` with an explicit command name `microvm`, package-derived version, English description, standard help/version flags, concise help guidance with exit code `0` for no arguments, non-success Clap parse errors for invalid input, and no runtime-resource initialization or MicroVM lifecycle logic.
+- [X] T014 [US3] Run `cargo test -p taumaru-microvm-cli --test command_surface` plus the `cargo run -p taumaru-microvm-cli -- --help`, `--version`, empty-input, and invalid-input commands documented in `specs/001-bootstrap-two-crate/quickstart.md`, correcting only the CLI source or smoke tests as needed.
 
 **Checkpoint**: User Story 3 is independently complete when the installed or built command is
 `microvm`, baseline help/version/no-argument paths succeed, invalid input fails clearly, and the
@@ -119,11 +119,11 @@ CLI remains a presentation layer over the SDK boundary.
 **Purpose**: Reconcile design artifacts, audit project conventions, and prove the complete
 foundation against the repository quality gates.
 
-- [ ] T015 [P] Audit English-only source, identifiers, Rustdoc, CLI text, and test descriptions in `Cargo.toml`, `crates/sdk/Cargo.toml`, `crates/cli/Cargo.toml`, `crates/sdk/src/lib.rs`, `crates/sdk/tests/public_api.rs`, `crates/cli/src/main.rs`, `crates/cli/tests/package_boundary.rs`, and `crates/cli/tests/command_surface.rs`, correcting any non-English project artifact.
-- [ ] T016 [P] Synchronize the post-plan decisions in `specs/001-bootstrap-two-crate/plan.md`, `specs/001-bootstrap-two-crate/research.md`, `specs/001-bootstrap-two-crate/data-model.md`, `specs/001-bootstrap-two-crate/contracts/sdk.md`, `specs/001-bootstrap-two-crate/contracts/cli.md`, and `specs/001-bootstrap-two-crate/quickstart.md` so they consistently state MIT licensing, the temporary SDK example, Clap-only baseline dependencies, and successful no-argument CLI behavior.
-- [ ] T017 [P] Audit publication and dependency metadata in `Cargo.toml`, `crates/sdk/Cargo.toml`, `crates/cli/Cargo.toml`, and `Cargo.lock` with `cargo metadata`, `cargo tree`, and `cargo package -p taumaru-microvm --allow-dirty --no-verify`, confirming MIT metadata, SDK publication readiness, CLI `publish = false`, and no unused direct baseline dependencies.
-- [ ] T018 Run the complete quality gates from `specs/001-bootstrap-two-crate/quickstart.md`: `cargo fmt --all -- --check`, `cargo check --workspace`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, and `cargo test --workspace`; resolve failures in the affected source, manifest, or test paths before marking the feature complete.
-- [ ] T019 Run every validation command in `specs/001-bootstrap-two-crate/quickstart.md` from a clean workspace state and confirm the final package boundary, SDK contract, CLI command surface, English-only output, and out-of-scope runtime-resource assumptions.
+- [X] T015 [P] Audit English-only source, identifiers, Rustdoc, CLI text, and test descriptions in `Cargo.toml`, `crates/sdk/Cargo.toml`, `crates/cli/Cargo.toml`, `crates/sdk/src/lib.rs`, `crates/sdk/tests/public_api.rs`, `crates/cli/src/main.rs`, `crates/cli/tests/package_boundary.rs`, and `crates/cli/tests/command_surface.rs`, correcting any non-English project artifact.
+- [X] T016 [P] Synchronize the post-plan decisions in `specs/001-bootstrap-two-crate/plan.md`, `specs/001-bootstrap-two-crate/research.md`, `specs/001-bootstrap-two-crate/data-model.md`, `specs/001-bootstrap-two-crate/contracts/sdk.md`, `specs/001-bootstrap-two-crate/contracts/cli.md`, and `specs/001-bootstrap-two-crate/quickstart.md` so they consistently state MIT licensing, the temporary SDK example, Clap-only baseline dependencies, and successful no-argument CLI behavior.
+- [X] T017 [P] Audit publication and dependency metadata in `Cargo.toml`, `crates/sdk/Cargo.toml`, `crates/cli/Cargo.toml`, and `Cargo.lock` with `cargo metadata`, `cargo tree`, and `cargo package -p taumaru-microvm --allow-dirty --no-verify`, confirming MIT metadata, SDK publication readiness, CLI `publish = false`, and no unused direct baseline dependencies.
+- [X] T018 Run the complete quality gates from `specs/001-bootstrap-two-crate/quickstart.md`: `cargo fmt --all -- --check`, `cargo check --workspace`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, and `cargo test --workspace`; resolve failures in the affected source, manifest, or test paths before marking the feature complete.
+- [X] T019 Run every validation command in `specs/001-bootstrap-two-crate/quickstart.md` from a clean workspace state and confirm the final package boundary, SDK contract, CLI command surface, English-only output, and out-of-scope runtime-resource assumptions.
 
 ---
 
