@@ -1,11 +1,12 @@
 <!--
 Sync Impact Report
-- Version change: 1.1.0 -> 1.2.0
+- Version change: 1.2.0 -> 1.3.0
 - Modified principles:
   - IV. Closed for Modification, Open for Extension -> expanded with mandatory SDK and CLI
-    repository organization rules
+    repository organization and host data-directory ownership rules
 - Added sections:
   - Repository Organization under Architecture & Product Boundaries
+  - Host Data Directory under Repository Organization
 - Removed sections: None
 - Follow-up TODOs: None
 -->
@@ -165,6 +166,44 @@ crates/
         └── command_surface.rs
 ```
 
+#### Host Data Directory
+
+The CLI MUST resolve the host-local base directory and pass the resolved path explicitly to the
+SDK during dependency wiring. When `TAUMARU_HOME` is unset, the CLI MUST use the user's home
+directory default `~/.taumaru-microvm`. A custom base directory MUST be selected only through
+the `TAUMARU_HOME` environment variable; the CLI MUST NOT expose this setting through a command-
+line option or positional argument.
+
+The SDK MUST NOT discover or override the base directory by reading `HOME`, `TAUMARU_HOME`, or
+another environment variable. It MUST receive the base directory from its caller and own the
+layout and behavior of everything below that directory, including local state, downloaded
+artifacts, tool binaries, runtime files, locks, temporary files, cache entries, and cleanup.
+
+The SDK-owned directory MAY evolve as capabilities are added, but it MUST preserve clear
+separation between these categories:
+
+```text
+<taumaru-home>/
+├── state/
+│   └── inventory.db
+├── artifacts/
+│   ├── kernels/
+│   ├── rootfs/
+│   └── supporting/
+├── tools/
+│   ├── firecracker/
+│   └── firectl/
+├── runtime/
+│   └── <vm-id>/
+├── cache/
+└── tmp/
+```
+
+The SDK MUST create required directories on demand, apply appropriate local permissions, use
+safe and atomic file operations where applicable, and return typed errors for path, permission,
+download, integrity, locking, and storage failures. The CLI owns only path resolution and
+user-facing diagnostics; it MUST NOT implement or duplicate this directory management.
+
 The SDK layout MUST follow these ownership rules:
 
 - `src/lib.rs` is the public facade and MUST expose stable public types and operations through
@@ -242,4 +281,4 @@ changes MUST be corrected before merge or carry a documented exception with a re
 scope, and expiry or follow-up plan. The constitution itself MUST be amended when a temporary
 exception becomes a permanent architectural or product rule.
 
-**Version**: 1.2.0 | **Ratified**: 2026-09-17 | **Last Amended**: 2026-09-17
+**Version**: 1.3.0 | **Ratified**: 2026-09-17 | **Last Amended**: 2026-09-17
