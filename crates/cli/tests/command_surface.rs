@@ -56,3 +56,30 @@ fn invalid_option_returns_a_clear_error() {
     assert!(stderr.contains("--unknown"));
     assert!(!stderr.contains("panicked"));
 }
+
+#[test]
+fn download_help_exposes_repeatable_selection_options() {
+    let output = run_microvm(&["download", "--help"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(output.status.success());
+    assert!(stdout.contains("Usage: microvm download"));
+    assert!(stdout.contains("--distribution <DISTRIBUTION_ID>"));
+    assert!(stdout.contains("--kernel <DISTRIBUTION_ID=KERNEL_ID>"));
+    assert!(stdout.contains("--non-interactive"));
+}
+
+#[test]
+fn non_interactive_download_rejects_incomplete_selection_without_prompting() {
+    let home = tempfile::tempdir().expect("temporary home should be created");
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_microvm"))
+        .args(["download", "--non-interactive"])
+        .env("TAUMARU_HOME", home.path())
+        .output()
+        .expect("failed to execute microvm");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(!output.status.success());
+    assert!(stderr.contains("selection") || stderr.contains("plan"));
+    assert!(!stderr.contains("Select distributions"));
+}

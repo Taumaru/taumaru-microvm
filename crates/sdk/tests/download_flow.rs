@@ -5,7 +5,9 @@ use std::error::Error;
 use tempfile::tempdir;
 
 use support::FixtureServer;
-use taumaru_microvm::{ArtifactKind, DownloadDisposition, DownloadPhase, MicroVmSdk};
+use taumaru_microvm::{
+    ArtifactKind, DownloadCancellation, DownloadDisposition, DownloadPhase, MicroVmSdk, SdkError,
+};
 
 #[tokio::test]
 async fn downloads_a_kernel_with_integrity_and_live_progress()
@@ -202,5 +204,71 @@ async fn downloads_all_distribution_images_and_persists_kernel_compatibility()
             .all(|file| file.absolute_path.starts_with(home.path()))
     );
     assert_eq!(server.artifact_request_count(), 2);
+    Ok(())
+}
+
+#[tokio::test]
+async fn cancellation_does_not_publish_or_record_a_kernel()
+-> Result<(), Box<dyn Error + Send + Sync>> {
+    let server = FixtureServer::start().await?;
+    let home = tempdir()?;
+    let sdk = MicroVmSdk::with_registry_base_url(home.path(), server.base_url())?;
+    let cancellation = DownloadCancellation::new();
+    cancellation.cancel();
+    let mut phases = Vec::new();
+
+    let result = sdk
+        .download_kernel_with_cancellation("linux-test-x86_64", &cancellation, |event| {
+            phases.push(event.phase);
+        })
+        .await;
+
+    assert!(matches!(result, Err(SdkError::Cancelled)));
+    assert!(phases.contains(&DownloadPhase::Cancelled));
+    assert!(
+        !home
+            .path()
+            .join("artifacts/kernels/linux-test-x86_64/vmlinux")
+            .exists()
+    );
+    assert_eq!(server.artifact_request_count(), 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn cancellation_after_a_verified_binary_member_preserves_that_member()
+-> Result<(), Box<dyn Error + Send + Sync>> {
+    let server = FixtureServer::start().await?;
+    let home = tempdir()?;
+    let sdk = MicroVmSdk::with_registry_base_url(home.path(), server.base_url())?;
+    let cancellation = DownloadCancellation::new();
+    let callback_cancellation = cancellation.clone();
+
+    let result = sdk
+        .download_binary_with_cancellation(
+            "firecracker-test-1.0.0-x86_64",
+            &cancellation,
+            move |event| {
+                if event.phase == DownloadPhase::Completed
+                    && event.member_name.as_deref() == Some("firecracker")
+                {
+                    callback_cancellation.cancel();
+                }
+            },
+        )
+        .await;
+
+    assert!(matches!(result, Err(SdkError::Cancelled)));
+    assert!(
+        home.path()
+            .join("tools/firecracker-test-1.0.0-x86_64/firecracker/firecracker")
+            .exists()
+    );
+    assert!(
+        !home
+            .path()
+            .join("tools/firecracker-test-1.0.0-x86_64/jailer/jailer")
+            .exists()
+    );
     Ok(())
 }

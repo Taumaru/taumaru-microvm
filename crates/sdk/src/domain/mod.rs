@@ -3,8 +3,8 @@ pub mod artifact;
 pub mod registry;
 
 pub use artifact::{
-    ArtifactKind, DownloadDisposition, DownloadPhase, DownloadProgress, DownloadedBinary,
-    DownloadedDistribution, DownloadedFile, DownloadedKernel, InstalledBinary,
+    ArtifactKind, DownloadCancellation, DownloadDisposition, DownloadPhase, DownloadProgress,
+    DownloadedBinary, DownloadedDistribution, DownloadedFile, DownloadedKernel, InstalledBinary,
 };
 pub use registry::{
     Architecture, BinaryFile, BinaryPackage, BootConfiguration, Distribution, DistributionImage,

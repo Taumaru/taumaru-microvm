@@ -6,7 +6,7 @@ use rusqlite::Connection;
 use tempfile::tempdir;
 
 use support::FixtureServer;
-use taumaru_microvm::{MicroVmSdk, SdkError};
+use taumaru_microvm::{DownloadCancellation, DownloadPhase, MicroVmSdk, SdkError};
 
 #[tokio::test]
 async fn rejects_a_truncated_transfer_without_publishing_or_recording_it()
@@ -222,5 +222,43 @@ fn reports_a_typed_filesystem_error_for_a_file_used_as_sdk_home() -> Result<(), 
     let result = MicroVmSdk::new(&file_home);
 
     assert!(matches!(result, Err(SdkError::Filesystem { .. })));
+    Ok(())
+}
+
+#[tokio::test]
+async fn cancellation_emits_a_typed_terminal_phase_and_leaves_no_partial_file()
+-> Result<(), Box<dyn Error + Send + Sync>> {
+    let server = FixtureServer::start().await?;
+    let home = tempdir()?;
+    let sdk = MicroVmSdk::with_registry_base_url(home.path(), server.base_url())?;
+    let cancellation = DownloadCancellation::new();
+    let callback_cancellation = cancellation.clone();
+    let mut phases = Vec::new();
+
+    let result = sdk
+        .download_kernel_with_cancellation("linux-test-x86_64", &cancellation, |event| {
+            phases.push(event.phase.clone());
+            if event.phase == DownloadPhase::Downloading {
+                callback_cancellation.cancel();
+            }
+        })
+        .await;
+
+    assert!(matches!(result, Err(SdkError::Cancelled)));
+    assert!(phases.contains(&DownloadPhase::Cancelled));
+    assert!(
+        !home
+            .path()
+            .join("artifacts/kernels/linux-test-x86_64/vmlinux")
+            .exists()
+    );
+    assert!(!home.path().join("tmp").read_dir()?.any(|entry| {
+        entry.ok().is_some_and(|entry| {
+            entry
+                .path()
+                .extension()
+                .is_some_and(|extension| extension == "part")
+        })
+    }));
     Ok(())
 }

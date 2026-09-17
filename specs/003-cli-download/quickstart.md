@@ -23,7 +23,7 @@ The command loads the current registry collections, then:
 1. select one or more distributions with the keyboard;
 2. choose one compatible kernel for each distribution;
 3. review the runtime package, distribution/kernel pairs, image count, and estimated size;
-4. confirm `Download`;
+4. confirm `Start download`;
 5. observe runtime, kernel, and distribution progress until the verified result.
 
 Press Escape during selection or review to cancel before transfer. A cancellation does not alter
@@ -54,16 +54,40 @@ interactive catalog or the registry manifest.
 The exact progress refresh is terminal-dependent, but the semantic content remains stable:
 
 ```text
-Download plan
-  Runtime: Firecracker 1.14.1 (x86_64), 2 files
-  alpine-3.20 -> linux-6.8-x86_64 (default), 1 image
-  Estimated: 128 MiB
+·  Checking artifact registry
+✓  Registry ready · 3 distributions · 4 kernels · 1 runtime packages
 
-Downloading runtime/firecracker  8.0 MiB / 8.0 MiB  Downloaded
-Downloading kernel/linux-6.8-x86_64  16.0 MiB / 16.0 MiB  Already available
-Verifying distro/alpine-3.20/image  104 MiB / 104 MiB  Downloaded
+◆ Download plan
+────────────────────────────────────────────────
 
-Download complete: 3 groups verified, 128 MiB available
+Runtime
+  •  Firecracker 1.14.1 (firecracker-1.14.1-x86_64) · 2 files · x86_64
+     8.0 MiB expected
+
+Targets
+  •  alpine-3.20 (Alpine 3.20)
+     ↳  linux-6.8-x86_64 (Linux 6.8) · default · 1 image · 120 MiB
+
+Transfer
+  128 MiB · 3 planned groups · 1 images
+
+Review the plan above. The download starts after confirmation.
+
+↓  runtime/firecracker  Downloading  8.0 MiB / 8.0 MiB  ·  plan 8.0 MiB / 128 MiB
+✓  runtime/firecracker  Downloaded  8.0 MiB / 8.0 MiB  ·  plan 8.0 MiB / 128 MiB
+✓  kernel/linux-6.8-x86_64  Already available  16.0 MiB / 16.0 MiB  ·  plan 24.0 MiB / 128 MiB
+↓  distribution/alpine-3.20/image  Verifying  104 MiB / 104 MiB  ·  plan 128 MiB / 128 MiB
+
+✓ Download complete
+────────────────────────────────────────────────
+
+  3/3 groups ready · 4 files verified
+  128 MiB available of 128 MiB planned · 128 MiB verified
+
+Artifacts
+  ✓  runtime/firecracker  Downloaded
+  ✓  kernel/linux-6.8-x86_64  Already available
+  ✓  distribution/alpine-3.20  Downloaded
 ```
 
 For a valid cache hit, the terminal label is `Already available`; for a valid file that was not

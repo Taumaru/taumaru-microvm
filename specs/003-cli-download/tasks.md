@@ -22,8 +22,8 @@ test criteria, implementation work, and a validation checkpoint.
 
 **Purpose**: Add the dependencies and CLI module boundaries required by the planned command.
 
-- [ ] T001 Add workspace and crate dependency declarations for `inquire` 0.9.x, `indicatif` 0.18.x, `semver` 1.x, `tokio-util` 0.7.x, and Tokio `macros`, `rt-multi-thread`, and `signal` features in `Cargo.toml`, `crates/cli/Cargo.toml`, and `crates/sdk/Cargo.toml`; update `Cargo.lock` without adding HTTP, SQLite, hashing, or Firecracker dependencies to the CLI.
-- [ ] T002 Split the current CLI bootstrap into `crates/cli/src/main.rs`, `crates/cli/src/cli.rs`, `crates/cli/src/context.rs`, `crates/cli/src/error.rs`, `crates/cli/src/commands/mod.rs`, `crates/cli/src/commands/download.rs`, `crates/cli/src/output/mod.rs`, and `crates/cli/src/output/human.rs`, preserving existing help, version, no-argument, and invalid-input behavior.
+- [X] T001 Add workspace and crate dependency declarations for `inquire` 0.9.x, `indicatif` 0.18.x, `semver` 1.x, `tokio-util` 0.7.x, and Tokio `macros`, `rt-multi-thread`, and `signal` features in `Cargo.toml`, `crates/cli/Cargo.toml`, and `crates/sdk/Cargo.toml`; update `Cargo.lock` without adding HTTP, SQLite, hashing, or Firecracker dependencies to the CLI.
+- [X] T002 Split the current CLI bootstrap into `crates/cli/src/main.rs`, `crates/cli/src/cli.rs`, `crates/cli/src/context.rs`, `crates/cli/src/error.rs`, `crates/cli/src/commands/mod.rs`, `crates/cli/src/commands/download.rs`, `crates/cli/src/output/mod.rs`, and `crates/cli/src/output/human.rs`, preserving existing help, version, no-argument, and invalid-input behavior.
 
 ---
 
@@ -33,11 +33,11 @@ test criteria, implementation work, and a validation checkpoint.
 
 **CRITICAL**: No user story implementation can begin until this phase is complete.
 
-- [ ] T003 [P] Define typed CLI errors, user-facing what/why/next formatting hooks, and exit-code mapping (`0` success, `1` incomplete/failed plan, `130` cancellation) in `crates/cli/src/error.rs` and `crates/cli/src/main.rs` without `unwrap`, `expect`, panic output, stack traces, or SDK-side output.
-- [ ] T004 [P] Implement explicit home resolution and terminal capability detection in `crates/cli/src/context.rs` using `TAUMARU_HOME` when set and `~/.taumaru-microvm` otherwise; pass the resolved path to `MicroVmSdk::new`, detect TTY/`NO_COLOR`, and keep environment lookup out of the SDK.
-- [ ] T005 [P] Write failing SDK tests for cooperative cancellation, typed cancellation errors/phases, preservation of already verified members, and cleanup of an interrupted temporary file in `crates/sdk/tests/download_flow.rs` and `crates/sdk/tests/failure_paths.rs`.
-- [ ] T006 Implement `DownloadCancellation`, cancellation-aware `download_kernel_with_cancellation`, `download_binary_with_cancellation`, and `download_distribution_with_cancellation` paths in `crates/sdk/src/domain/artifact.rs`, `crates/sdk/src/manager.rs`, `crates/sdk/src/error.rs`, and `crates/sdk/src/lib.rs`; preserve existing uncancelled methods as compatible wrappers, remove temporary files before returning cancellation, never publish partial targets, and add the `tokio-util` dependency in `crates/sdk/Cargo.toml`.
-- [ ] T007 Define the CLI-internal SDK-shaped artifact client, progress sink, and cancellation-aware execution seams in `crates/cli/src/commands/download.rs` and `crates/cli/src/output/mod.rs`, keeping production behavior delegated to `MicroVmSdk` and allowing deterministic fakes without a second filesystem, checksum, cache, or SQLite implementation.
+- [X] T003 [P] Define typed CLI errors, user-facing what/why/next formatting hooks, and exit-code mapping (`0` success, `1` incomplete/failed plan, `130` cancellation) in `crates/cli/src/error.rs` and `crates/cli/src/main.rs` without `unwrap`, `expect`, panic output, stack traces, or SDK-side output.
+- [X] T004 [P] Implement explicit home resolution and terminal capability detection in `crates/cli/src/context.rs` using `TAUMARU_HOME` when set and `~/.taumaru-microvm` otherwise; pass the resolved path to `MicroVmSdk::new`, detect TTY/`NO_COLOR`, and keep environment lookup out of the SDK.
+- [X] T005 [P] Write failing SDK tests for cooperative cancellation, typed cancellation errors/phases, preservation of already verified members, and cleanup of an interrupted temporary file in `crates/sdk/tests/download_flow.rs` and `crates/sdk/tests/failure_paths.rs`.
+- [X] T006 Implement `DownloadCancellation`, cancellation-aware `download_kernel_with_cancellation`, `download_binary_with_cancellation`, and `download_distribution_with_cancellation` paths in `crates/sdk/src/domain/artifact.rs`, `crates/sdk/src/manager.rs`, `crates/sdk/src/error.rs`, and `crates/sdk/src/lib.rs`; preserve existing uncancelled methods as compatible wrappers, remove temporary files before returning cancellation, never publish partial targets, and add the `tokio-util` dependency in `crates/sdk/Cargo.toml`.
+- [X] T007 Define the CLI-internal SDK-shaped artifact client, progress sink, and cancellation-aware execution seams in `crates/cli/src/commands/download.rs` and `crates/cli/src/output/mod.rs`, keeping production behavior delegated to `MicroVmSdk` and allowing deterministic fakes without a second filesystem, checksum, cache, or SQLite implementation.
 
 **Checkpoint**: CLI modules compile as a wired skeleton, SDK cancellation tests define the safety
 contract, and the foundation owns no feature-specific artifact state.
@@ -57,18 +57,18 @@ download calls.
 
 ### Tests for User Story 1
 
-- [ ] T008 [US1] Write failing unit tests for catalog assembly, host-architecture filtering, and rejection of empty or duplicate registry identifiers in `crates/cli/src/commands/download.rs`.
-- [ ] T009 [US1] Write failing unit tests for explicit `distribution-id=kernel-id` parsing and validation in `crates/cli/src/commands/download.rs`, covering exactly one mapping per selected distribution, no mapping for an unselected distribution, unavailable kernels, incompatible kernels, and duplicate mappings.
-- [ ] T010 [US1] Write failing unit tests for runtime package selection and plan construction in `crates/cli/src/commands/download.rs`, covering the highest valid semantic version, required `firecracker` and `firectl` components, host architecture, deterministic ties, checked byte totals, unique kernel IDs, and deterministic member order.
-- [ ] T011 [P] [US1] Extend command-surface tests in `crates/cli/tests/command_surface.rs` for `microvm download`, repeatable `--distribution` and `--kernel` options, `--non-interactive`, help text, and the no-TTY incomplete-selection guard.
+- [X] T008 [US1] Write failing unit tests for catalog assembly, host-architecture filtering, and rejection of empty or duplicate registry identifiers in `crates/cli/src/commands/download.rs`.
+- [X] T009 [US1] Write failing unit tests for explicit `distribution-id=kernel-id` parsing and validation in `crates/cli/src/commands/download.rs`, covering exactly one mapping per selected distribution, no mapping for an unselected distribution, unavailable kernels, incompatible kernels, and duplicate mappings.
+- [X] T010 [US1] Write failing unit tests for runtime package selection and plan construction in `crates/cli/src/commands/download.rs`, covering the highest valid semantic version, required `firecracker` and `firectl` components, host architecture, deterministic ties, checked byte totals, unique kernel IDs, and deterministic member order.
+- [X] T011 [P] [US1] Extend command-surface tests in `crates/cli/tests/command_surface.rs` for `microvm download`, repeatable `--distribution` and `--kernel` options, `--non-interactive`, help text, and the no-TTY incomplete-selection guard.
 
 ### Implementation for User Story 1
 
-- [ ] T012 [US1] Define the Clap root, `Download` subcommand, repeatable distribution/kernel options, and `--non-interactive` flag in `crates/cli/src/cli.rs` and register the command in `crates/cli/src/commands/mod.rs` while retaining the existing top-level command behavior.
-- [ ] T013 [US1] Implement `RegistryCatalog`, `DistributionSelection`, `RuntimeBinarySelection`, `DownloadPlan`, and `PlanMember` in `crates/cli/src/commands/download.rs`, including host architecture mapping, supported-kernel intersection, default-kernel marking, runtime package filtering, semantic version ordering, required component checks, checked size totals, unique-kernel deduplication, and deterministic distribution/kernel ordering.
-- [ ] T014 [US1] Implement explicit selection parsing and non-interactive validation in `crates/cli/src/commands/download.rs`, rejecting empty selections, duplicate IDs, malformed mappings, incomplete mappings, unselected distribution mappings, unknown IDs, incompatible architectures, and kernels absent from a distribution's supported-kernel set before confirmation or transfer.
-- [ ] T015 [US1] Implement the interactive `inquire::MultiSelect`, per-distribution `inquire::Select`, review, and `inquire::Confirm` flow in `crates/cli/src/commands/download.rs` and `crates/cli/src/output/human.rs`, showing focus/selection markers, default-kernel text, distribution/kernel pairs, runtime package, image count, estimated size, and cancellation before transfer.
-- [ ] T016 [US1] Wire catalog loading, explicit-versus-interactive selection, plan validation, review, and confirmation into `crates/cli/src/main.rs`, `crates/cli/src/context.rs`, `crates/cli/src/commands/mod.rs`, and `crates/cli/src/commands/download.rs`, guaranteeing that no SDK download operation is called before confirmation and that pre-transfer cancellation maps to exit code `130`.
+- [X] T012 [US1] Define the Clap root, `Download` subcommand, repeatable distribution/kernel options, and `--non-interactive` flag in `crates/cli/src/cli.rs` and register the command in `crates/cli/src/commands/mod.rs` while retaining the existing top-level command behavior.
+- [X] T013 [US1] Implement `RegistryCatalog`, `DistributionSelection`, `RuntimeBinarySelection`, `DownloadPlan`, and `PlanMember` in `crates/cli/src/commands/download.rs`, including host architecture mapping, supported-kernel intersection, default-kernel marking, runtime package filtering, semantic version ordering, required component checks, checked size totals, unique-kernel deduplication, and deterministic distribution/kernel ordering.
+- [X] T014 [US1] Implement explicit selection parsing and non-interactive validation in `crates/cli/src/commands/download.rs`, rejecting empty selections, duplicate IDs, malformed mappings, incomplete mappings, unselected distribution mappings, unknown IDs, incompatible architectures, and kernels absent from a distribution's supported-kernel set before confirmation or transfer.
+- [X] T015 [US1] Implement the interactive `inquire::MultiSelect`, per-distribution `inquire::Select`, review, and `inquire::Confirm` flow in `crates/cli/src/commands/download.rs` and `crates/cli/src/output/human.rs`, showing focus/selection markers, default-kernel text, distribution/kernel pairs, runtime package, image count, estimated size, and cancellation before transfer.
+- [X] T016 [US1] Wire catalog loading, explicit-versus-interactive selection, plan validation, review, and confirmation into `crates/cli/src/main.rs`, `crates/cli/src/context.rs`, `crates/cli/src/commands/mod.rs`, and `crates/cli/src/commands/download.rs`, guaranteeing that no SDK download operation is called before confirmation and that pre-transfer cancellation maps to exit code `130`.
 
 **Checkpoint**: User Story 1 is independently usable as a safe plan-building flow; it can list,
 select, validate, review, confirm, or cancel without transferring artifacts.
@@ -87,14 +87,14 @@ kernel, one call per distribution, and success only after every SDK result is ve
 
 ### Tests for User Story 2
 
-- [ ] T017 [US2] Write failing executor tests with an SDK-shaped fake in `crates/cli/src/commands/download.rs` that record calls and assert runtime binary first, unique kernels once, deterministic kernel/distribution order, and no lifecycle or direct Firecracker invocation.
-- [ ] T018 [US2] Write failing success-path tests in `crates/cli/src/commands/download.rs` for multi-image distributions and the invariant that the command reports success only after the runtime package, every unique kernel, and every selected distribution image group returns a verified SDK result.
+- [X] T017 [US2] Write failing executor tests with an SDK-shaped fake in `crates/cli/src/commands/download.rs` that record calls and assert runtime binary first, unique kernels once, deterministic kernel/distribution order, and no lifecycle or direct Firecracker invocation.
+- [X] T018 [US2] Write failing success-path tests in `crates/cli/src/commands/download.rs` for multi-image distributions and the invariant that the command reports success only after the runtime package, every unique kernel, and every selected distribution image group returns a verified SDK result.
 
 ### Implementation for User Story 2
 
-- [ ] T019 [US2] Implement the generic confirmed-plan executor in `crates/cli/src/commands/download.rs`, executing the runtime binary member first, then each unique kernel, then each selected distribution image group in deterministic order and collecting verified `DownloadedBinary`, `DownloadedKernel`, and `DownloadedDistribution` results.
-- [ ] T020 [US2] Implement the production SDK artifact client adapter in `crates/cli/src/commands/download.rs`, forwarding IDs and callbacks to the SDK's cancellation-aware download methods without inspecting paths, hashes, file existence, SQLite, or cache state in the CLI.
-- [ ] T021 [US2] Connect the confirmed plan to the executor and final success result in `crates/cli/src/main.rs`, `crates/cli/src/commands/mod.rs`, and `crates/cli/src/commands/download.rs`, returning success only when all planned groups are verified and retaining the runtime prerequisite short-circuit for later failure handling.
+- [X] T019 [US2] Implement the generic confirmed-plan executor in `crates/cli/src/commands/download.rs`, executing the runtime binary member first, then each unique kernel, then each selected distribution image group in deterministic order and collecting verified `DownloadedBinary`, `DownloadedKernel`, and `DownloadedDistribution` results.
+- [X] T020 [US2] Implement the production SDK artifact client adapter in `crates/cli/src/commands/download.rs`, forwarding IDs and callbacks to the SDK's cancellation-aware download methods without inspecting paths, hashes, file existence, SQLite, or cache state in the CLI.
+- [X] T021 [US2] Connect the confirmed plan to the executor and final success result in `crates/cli/src/main.rs`, `crates/cli/src/commands/mod.rs`, and `crates/cli/src/commands/download.rs`, returning success only when all planned groups are verified and retaining the runtime prerequisite short-circuit for later failure handling.
 
 **Checkpoint**: A confirmed plan performs the complete happy-path acquisition through the SDK,
 deduplicates shared kernels, includes every distribution image group, and cannot report premature
@@ -113,15 +113,15 @@ interactive and non-TTY renderers preserve identity and terminal disposition lab
 
 ### Tests for User Story 3
 
-- [ ] T022 [US3] Write failing tests in `crates/cli/src/commands/download.rs` for forwarding `Downloaded`, `AdoptedExisting`, and `SkippedExisting` SDK dispositions as `Downloaded`, `Adopted`, and `Already available` without issuing an extra transfer decision in the CLI.
-- [ ] T023 [US3] Write failing progress-normalization tests in `crates/cli/src/commands/download.rs` for artifact/member identity, `Downloading`/`Verifying`/terminal stages, current and expected member bytes, completed-plan offsets, aggregate current/expected bytes, and no fabricated percentage or byte values.
-- [ ] T024 [P] [US3] Write failing renderer tests in `crates/cli/src/output/human.rs` for TTY, non-TTY, `NO_COLOR`, and narrow-terminal output, ensuring focus, stage, identity, byte counters, success, failure, and cache dispositions remain distinguishable through text or symbols.
+- [X] T022 [US3] Write failing tests in `crates/cli/src/commands/download.rs` for forwarding `Downloaded`, `AdoptedExisting`, and `SkippedExisting` SDK dispositions as `Downloaded`, `Adopted`, and `Already available` without issuing an extra transfer decision in the CLI.
+- [X] T023 [US3] Write failing progress-normalization tests in `crates/cli/src/commands/download.rs` for artifact/member identity, `Downloading`/`Verifying`/terminal stages, current and expected member bytes, completed-plan offsets, aggregate current/expected bytes, and no fabricated percentage or byte values.
+- [X] T024 [P] [US3] Write failing renderer tests in `crates/cli/src/output/human.rs` for TTY, non-TTY, `NO_COLOR`, and narrow-terminal output, ensuring focus, stage, identity, byte counters, success, failure, and cache dispositions remain distinguishable through text or symbols.
 
 ### Implementation for User Story 3
 
-- [ ] T025 [US3] Implement the `indicatif` aggregate/current-member progress renderer and deterministic line renderer in `crates/cli/src/output/human.rs`, using stderr for progress, hiding bars for non-TTY output, respecting `NO_COLOR`, and retaining calm compact labels for narrow terminals.
-- [ ] T026 [US3] Map SDK `DownloadProgress` callbacks into `DownloadProgressView` in `crates/cli/src/commands/download.rs`, adding only expected bytes from completed plan members to the SDK operation aggregate and mapping every SDK phase/disposition to explicit text.
-- [ ] T027 [US3] Implement review and final result rendering in `crates/cli/src/output/human.rs`, including estimated and verified totals, current group, groups acquired/adopted/already available, successful groups, failed groups, skipped groups, and retry context without changing SDK semantics.
+- [X] T025 [US3] Implement the `indicatif` aggregate/current-member progress renderer and deterministic line renderer in `crates/cli/src/output/human.rs`, using stderr for progress, hiding bars for non-TTY output, respecting `NO_COLOR`, and retaining calm compact labels for narrow terminals.
+- [X] T026 [US3] Map SDK `DownloadProgress` callbacks into `DownloadProgressView` in `crates/cli/src/commands/download.rs`, adding only expected bytes from completed plan members to the SDK operation aggregate and mapping every SDK phase/disposition to explicit text.
+- [X] T027 [US3] Implement review and final result rendering in `crates/cli/src/output/human.rs`, including estimated and verified totals, current group, groups acquired/adopted/already available, successful groups, failed groups, skipped groups, and retry context without changing SDK semantics.
 
 **Checkpoint**: Repeated downloads expose the SDK's intelligent reuse outcome, progress remains
 truthful in every terminal mode, and the final output is compact, readable, and script-safe.
@@ -140,16 +140,16 @@ successful, failed, skipped, and cancelled groups.
 
 ### Tests for User Story 4
 
-- [ ] T028 [US4] Write failing tests in `crates/cli/src/commands/download.rs` proving that a runtime-bundle failure produces a nonzero outcome and makes zero kernel or distribution calls.
-- [ ] T029 [US4] Write failing tests in `crates/cli/src/commands/download.rs` proving that a selected kernel failure skips only the associated distribution image group, continues unrelated groups, preserves earlier verified results, and separates successful and failed groups in the summary.
-- [ ] T030 [US4] Write failing partial-failure tests in `crates/cli/src/commands/download.rs` and `crates/cli/src/output/human.rs` for a multi-image distribution failure, retained successful members, actionable what/why/next text, and exit code `1`.
-- [ ] T031 [P] [US4] Write failing cancellation tests in `crates/sdk/tests/download_flow.rs` and `crates/cli/src/commands/download.rs` proving that `Ctrl-C` signals the SDK token, waits for cleanup, publishes no partial artifact, preserves verified groups, starts no subsequent group, reports cancellation, and returns exit code `130`.
+- [X] T028 [US4] Write failing tests in `crates/cli/src/commands/download.rs` proving that a runtime-bundle failure produces a nonzero outcome and makes zero kernel or distribution calls.
+- [X] T029 [US4] Write failing tests in `crates/cli/src/commands/download.rs` proving that a selected kernel failure skips only the associated distribution image group, continues unrelated groups, preserves earlier verified results, and separates successful and failed groups in the summary.
+- [X] T030 [US4] Write failing partial-failure tests in `crates/cli/src/commands/download.rs` and `crates/cli/src/output/human.rs` for a multi-image distribution failure, retained successful members, actionable what/why/next text, and exit code `1`.
+- [X] T031 [P] [US4] Write failing cancellation tests in `crates/sdk/tests/download_flow.rs` and `crates/cli/src/commands/download.rs` proving that `Ctrl-C` signals the SDK token, waits for cleanup, publishes no partial artifact, preserves verified groups, starts no subsequent group, reports cancellation, and returns exit code `130`.
 
 ### Implementation for User Story 4
 
-- [ ] T032 [US4] Implement `MemberOutcome` and `DownloadOutcome` failure handling in `crates/cli/src/commands/download.rs`, making runtime failure terminal, skipping a distribution's images when its kernel fails, continuing unrelated groups, retaining verified results, and returning nonzero for failed or skipped required groups.
-- [ ] T033 [US4] Implement cooperative `Ctrl-C` handling with `tokio::signal::ctrl_c` and the shared `DownloadCancellation` token in `crates/cli/src/main.rs` and `crates/cli/src/commands/download.rs`, awaiting SDK cleanup before returning, stopping current/subsequent plan members, and mapping cancellation to exit code `130`.
-- [ ] T034 [US4] Complete typed error formatting and terminal summaries in `crates/cli/src/error.rs` and `crates/cli/src/output/human.rs`, explaining what happened, why preparation is incomplete or cancelled, what to do next, and which groups succeeded, failed, skipped, or were cancelled.
+- [X] T032 [US4] Implement `MemberOutcome` and `DownloadOutcome` failure handling in `crates/cli/src/commands/download.rs`, making runtime failure terminal, skipping a distribution's images when its kernel fails, continuing unrelated groups, retaining verified results, and returning nonzero for failed or skipped required groups.
+- [X] T033 [US4] Implement cooperative `Ctrl-C` handling with `tokio::signal::ctrl_c` and the shared `DownloadCancellation` token in `crates/cli/src/main.rs` and `crates/cli/src/commands/download.rs`, awaiting SDK cleanup before returning, stopping current/subsequent plan members, and mapping cancellation to exit code `130`.
+- [X] T034 [US4] Complete typed error formatting and terminal summaries in `crates/cli/src/error.rs` and `crates/cli/src/output/human.rs`, explaining what happened, why preparation is incomplete or cancelled, what to do next, and which groups succeeded, failed, skipped, or were cancelled.
 
 **Checkpoint**: Registry, filesystem, SDK, partial-download, and cancellation failures are calm,
 actionable, nonzero outcomes; no invalid partial artifact is published and verified work remains
@@ -168,13 +168,13 @@ is deterministic, and invalid mappings make zero download calls.
 
 ### Tests for User Story 5
 
-- [ ] T035 [P] [US5] Add parser and process-level tests in `crates/cli/src/cli.rs` and `crates/cli/tests/command_surface.rs` for repeatable `--distribution`, repeatable `--kernel`, `--non-interactive`, no-prompt behavior, and deterministic non-TTY error text when selections are incomplete.
-- [ ] T036 [US5] Write failing explicit-mode tests in `crates/cli/src/commands/download.rs` proving valid mappings produce the same `DownloadPlan` as interactive selections and invalid, unknown, incompatible, duplicate, or incomplete mappings start no transfer.
+- [X] T035 [P] [US5] Add parser and process-level tests in `crates/cli/src/cli.rs` and `crates/cli/tests/command_surface.rs` for repeatable `--distribution`, repeatable `--kernel`, `--non-interactive`, no-prompt behavior, and deterministic non-TTY error text when selections are incomplete.
+- [X] T036 [US5] Write failing explicit-mode tests in `crates/cli/src/commands/download.rs` proving valid mappings produce the same `DownloadPlan` as interactive selections and invalid, unknown, incompatible, duplicate, or incomplete mappings start no transfer.
 
 ### Implementation for User Story 5
 
-- [ ] T037 [US5] Finish the explicit-selection execution branch in `crates/cli/src/commands/download.rs` and `crates/cli/src/main.rs`, requiring complete mappings, bypassing `inquire` entirely, reusing the same catalog validation and confirmed-plan executor, and rejecting incomplete input before SDK downloads.
-- [ ] T038 [US5] Ensure deterministic script output and cross-mode plan equivalence in `crates/cli/src/output/human.rs` and `crates/cli/src/commands/download.rs`, preserving stable ordering, stable status labels, concise summaries, and nonzero exit behavior for every incomplete explicit plan.
+- [X] T037 [US5] Finish the explicit-selection execution branch in `crates/cli/src/commands/download.rs` and `crates/cli/src/main.rs`, requiring complete mappings, bypassing `inquire` entirely, reusing the same catalog validation and confirmed-plan executor, and rejecting incomplete input before SDK downloads.
+- [X] T038 [US5] Ensure deterministic script output and cross-mode plan equivalence in `crates/cli/src/output/human.rs` and `crates/cli/src/commands/download.rs`, preserving stable ordering, stable status labels, concise summaries, and nonzero exit behavior for every incomplete explicit plan.
 
 **Checkpoint**: Interactive and explicit invocations share one plan validator and executor; valid
 automation has no prompts and invalid automation cannot trigger a download.
@@ -186,9 +186,9 @@ automation has no prompts and invalid automation cannot trigger a download.
 **Purpose**: Document the public boundary, protect package direction, and run the complete quality
 gates.
 
-- [ ] T039 [P] Document the public cancellation token, cancellation-aware SDK methods, cancellation error/phase, and CLI command help in `crates/sdk/src/lib.rs`, `crates/sdk/src/domain/artifact.rs`, `crates/sdk/src/error.rs`, and `crates/cli/src/cli.rs` with English Rustdoc/help text and no undocumented compatibility-sensitive behavior.
-- [ ] T040 [P] Add regression assertions for the CLI-to-SDK package boundary and direct-dependency policy in `crates/cli/tests/package_boundary.rs` and `crates/cli/Cargo.toml`, ensuring the CLI has no direct HTTP, SQLite, hashing, or Firecracker dependency and does not duplicate lifecycle behavior.
-- [ ] T041 Run the focused and workspace checks from `specs/003-cli-download/quickstart.md`, including formatting, CLI tests, `cargo check --all-targets --all-features`, `cargo clippy --all-targets --all-features -- -D warnings`, and `cargo test --all-targets --all-features`; resolve regressions before marking the feature complete.
+- [X] T039 [P] Document the public cancellation token, cancellation-aware SDK methods, cancellation error/phase, and CLI command help in `crates/sdk/src/lib.rs`, `crates/sdk/src/domain/artifact.rs`, `crates/sdk/src/error.rs`, and `crates/cli/src/cli.rs` with English Rustdoc/help text and no undocumented compatibility-sensitive behavior.
+- [X] T040 [P] Add regression assertions for the CLI-to-SDK package boundary and direct-dependency policy in `crates/cli/tests/package_boundary.rs` and `crates/cli/Cargo.toml`, ensuring the CLI has no direct HTTP, SQLite, hashing, or Firecracker dependency and does not duplicate lifecycle behavior.
+- [X] T041 Run the focused and workspace checks from `specs/003-cli-download/quickstart.md`, including formatting, CLI tests, `cargo check --all-targets --all-features`, `cargo clippy --all-targets --all-features -- -D warnings`, and `cargo test --all-targets --all-features`; resolve regressions before marking the feature complete.
 
 ---
 

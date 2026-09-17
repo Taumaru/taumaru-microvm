@@ -12,4 +12,11 @@ path = "src/main.rs"
 
 [dependencies]
 clap.workspace = true
+indicatif.workspace = true
+inquire.workspace = true
+semver.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal"] }
 taumaru-microvm = { path = "../sdk" }
+
+[dev-dependencies]
+tempfile.workspace = true

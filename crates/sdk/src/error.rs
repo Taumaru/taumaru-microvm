@@ -89,6 +89,10 @@ pub enum SdkError {
     /// A registry artifact is valid JSON but cannot be used by the requested operation.
     #[error("artifact {artifact} is incompatible: {reason}")]
     IncompatibleArtifact { artifact: String, reason: String },
+
+    /// A download was cancelled before its current unverified file could be published.
+    #[error("download was cancelled")]
+    Cancelled,
 }
 
 impl SdkError {

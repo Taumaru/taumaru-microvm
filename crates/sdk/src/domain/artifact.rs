@@ -1,5 +1,7 @@
 use std::path::Path;
 
+use tokio_util::sync::CancellationToken;
+
 use super::registry::{Architecture, BinaryPackage, Distribution, Kernel};
 
 /// Identifies the kind of physical artifact being transferred.
@@ -26,6 +28,47 @@ pub enum DownloadPhase {
     AdoptedExisting,
     /// The existing correct file and complete inventory relationship were reused.
     SkippedExisting,
+    /// The operation stopped cooperatively before publishing an unverified file.
+    Cancelled,
+}
+
+/// Cooperative cancellation shared by one or more SDK artifact operations.
+///
+/// Cancelling a token does not remove verified files or inventory records that were committed
+/// before cancellation. An in-flight member is cleaned up by the SDK before its operation
+/// returns, and an unverified temporary file is never published as the managed target.
+#[derive(Clone, Debug)]
+pub struct DownloadCancellation {
+    token: CancellationToken,
+}
+
+impl DownloadCancellation {
+    /// Creates a new cancellation handle in the non-cancelled state.
+    pub fn new() -> Self {
+        Self {
+            token: CancellationToken::new(),
+        }
+    }
+
+    /// Requests cooperative cancellation of the associated download operation.
+    pub fn cancel(&self) {
+        self.token.cancel();
+    }
+
+    /// Returns whether cancellation has been requested.
+    pub fn is_cancelled(&self) -> bool {
+        self.token.is_cancelled()
+    }
+
+    pub(crate) fn token(&self) -> CancellationToken {
+        self.token.clone()
+    }
+}
+
+impl Default for DownloadCancellation {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Progress information emitted while a public download operation runs.

@@ -12,9 +12,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use crate::adapters::persistence::sqlite::SqliteRepository;
 use crate::adapters::registry::taumaru::TaumaruRegistryClient;
 use crate::domain::artifact::{
-    ArtifactKind, DownloadDisposition, DownloadPhase, DownloadProgress, DownloadSpec,
-    DownloadedBinary, DownloadedDistribution, DownloadedFile, DownloadedKernel, FileIntegrity,
-    InstalledBinary, ProgressTracker, is_valid_sha256, validate_registry_path,
+    ArtifactKind, DownloadCancellation, DownloadDisposition, DownloadPhase, DownloadProgress,
+    DownloadSpec, DownloadedBinary, DownloadedDistribution, DownloadedFile, DownloadedKernel,
+    FileIntegrity, InstalledBinary, ProgressTracker, is_valid_sha256, validate_registry_path,
 };
 use crate::domain::registry::{
     BinaryFile, BinaryPackage, Distribution, DistributionImage, Kernel, TaumaruRegistry,
@@ -140,6 +140,24 @@ impl MicroVmSdk {
     pub async fn download_kernel<F>(
         &self,
         kernel_id: &str,
+        on_progress: F,
+    ) -> Result<DownloadedKernel, SdkError>
+    where
+        F: FnMut(DownloadProgress) + Send,
+    {
+        let cancellation = DownloadCancellation::new();
+        self.download_kernel_with_cancellation(kernel_id, &cancellation, on_progress)
+            .await
+    }
+
+    /// Downloads one kernel while observing a caller-owned cancellation handle.
+    ///
+    /// Cancellation is cooperative. The SDK removes the current temporary file before
+    /// returning [`SdkError::Cancelled`] and preserves members that were already committed.
+    pub async fn download_kernel_with_cancellation<F>(
+        &self,
+        kernel_id: &str,
+        cancellation: &DownloadCancellation,
         mut on_progress: F,
     ) -> Result<DownloadedKernel, SdkError>
     where
@@ -158,7 +176,7 @@ impl MicroVmSdk {
         let member = self.kernel_member(kernel)?;
         let mut tracker = ProgressTracker::new(member.spec.expected_size);
         let file = self
-            .download_member(&member, &mut tracker, &mut on_progress)
+            .download_member(&member, cancellation, &mut tracker, &mut on_progress)
             .await?;
         let LogicalMember::Kernel { kernel } = member.logical else {
             return Err(SdkError::Migration(
@@ -175,6 +193,22 @@ impl MicroVmSdk {
     pub async fn download_binary<F>(
         &self,
         binary_id: &str,
+        on_progress: F,
+    ) -> Result<DownloadedBinary, SdkError>
+    where
+        F: FnMut(DownloadProgress) + Send,
+    {
+        let cancellation = DownloadCancellation::new();
+        self.download_binary_with_cancellation(binary_id, &cancellation, on_progress)
+            .await
+    }
+
+    /// Downloads every file in a binary package while observing a caller-owned cancellation
+    /// handle. Verified members remain available when a later member is cancelled.
+    pub async fn download_binary_with_cancellation<F>(
+        &self,
+        binary_id: &str,
+        cancellation: &DownloadCancellation,
         mut on_progress: F,
     ) -> Result<DownloadedBinary, SdkError>
     where
@@ -200,7 +234,7 @@ impl MicroVmSdk {
         let mut files = Vec::with_capacity(members.len());
         for member in &members {
             files.push(
-                self.download_member(member, &mut tracker, &mut on_progress)
+                self.download_member(member, cancellation, &mut tracker, &mut on_progress)
                     .await?,
             );
         }
@@ -217,6 +251,22 @@ impl MicroVmSdk {
     pub async fn download_distribution<F>(
         &self,
         distribution_id: &str,
+        on_progress: F,
+    ) -> Result<DownloadedDistribution, SdkError>
+    where
+        F: FnMut(DownloadProgress) + Send,
+    {
+        let cancellation = DownloadCancellation::new();
+        self.download_distribution_with_cancellation(distribution_id, &cancellation, on_progress)
+            .await
+    }
+
+    /// Downloads every image in a distribution while observing a caller-owned cancellation
+    /// handle. Verified images remain available when a later image is cancelled.
+    pub async fn download_distribution_with_cancellation<F>(
+        &self,
+        distribution_id: &str,
+        cancellation: &DownloadCancellation,
         mut on_progress: F,
     ) -> Result<DownloadedDistribution, SdkError>
     where
@@ -245,7 +295,7 @@ impl MicroVmSdk {
         let mut images = Vec::with_capacity(members.len());
         for member in &members {
             images.push(
-                self.download_member(member, &mut tracker, &mut on_progress)
+                self.download_member(member, cancellation, &mut tracker, &mut on_progress)
                     .await?,
             );
         }
@@ -426,14 +476,23 @@ impl MicroVmSdk {
     async fn download_member<F>(
         &self,
         member: &DownloadMember,
+        cancellation: &DownloadCancellation,
         tracker: &mut ProgressTracker,
         on_progress: &mut F,
     ) -> Result<DownloadedFile, SdkError>
     where
         F: FnMut(DownloadProgress) + Send,
     {
+        if cancellation.is_cancelled() {
+            on_progress(tracker.event(&member.spec, DownloadPhase::Cancelled, 0));
+            return Err(SdkError::Cancelled);
+        }
         let target_lock = self.target_lock(&member.spec.absolute_path)?;
         let _target_guard = target_lock.lock().await;
+        if cancellation.is_cancelled() {
+            on_progress(tracker.event(&member.spec, DownloadPhase::Cancelled, 0));
+            return Err(SdkError::Cancelled);
+        }
         let physical_integrity = calculate_file_integrity(&member.spec.absolute_path).await?;
         let repository_spec = member.spec.clone();
         let repository_integrity = physical_integrity.clone();
@@ -442,6 +501,11 @@ impl MicroVmSdk {
                 repository.inspect_member(&repository_spec, repository_integrity.as_ref())
             })
             .await?;
+
+        if cancellation.is_cancelled() {
+            on_progress(tracker.event(&member.spec, DownloadPhase::Cancelled, 0));
+            return Err(SdkError::Cancelled);
+        }
 
         match decide_cache(&member.spec, physical_integrity.as_ref(), inventory_state) {
             CacheDecision::Skip => {
@@ -474,12 +538,16 @@ impl MicroVmSdk {
                 ))
             }
             CacheDecision::Replace => {
+                if cancellation.is_cancelled() {
+                    on_progress(tracker.event(&member.spec, DownloadPhase::Cancelled, 0));
+                    return Err(SdkError::Cancelled);
+                }
                 let removal_spec = member.spec.clone();
                 self.run_repository(move |repository| repository.remove_member(&removal_spec))
                     .await?;
                 remove_invalid_target_if_exists(&member.spec.absolute_path).await?;
                 let integrity = self
-                    .stream_and_publish(member, tracker, on_progress)
+                    .stream_and_publish(member, cancellation, tracker, on_progress)
                     .await?;
                 self.persist_member(member, &integrity).await?;
                 on_progress(tracker.event(
@@ -532,6 +600,7 @@ impl MicroVmSdk {
     async fn stream_and_publish<F>(
         &self,
         member: &DownloadMember,
+        cancellation: &DownloadCancellation,
         tracker: &ProgressTracker,
         on_progress: &mut F,
     ) -> Result<FileIntegrity, SdkError>
@@ -540,7 +609,7 @@ impl MicroVmSdk {
     {
         let temporary_path = temporary_path(&self.home, &member.spec.artifact_key)?;
         let result = self
-            .stream_to_temporary(member, tracker, on_progress, &temporary_path)
+            .stream_to_temporary(member, cancellation, tracker, on_progress, &temporary_path)
             .await;
         let integrity = match result {
             Ok(integrity) => integrity,
@@ -549,6 +618,15 @@ impl MicroVmSdk {
                 return Err(error);
             }
         };
+        if cancellation.is_cancelled() {
+            let _ = async_fs::remove_file(&temporary_path).await;
+            on_progress(tracker.event(
+                &member.spec,
+                DownloadPhase::Cancelled,
+                integrity.size_bytes,
+            ));
+            return Err(SdkError::Cancelled);
+        }
         if let Err(error) = async_fs::rename(&temporary_path, &member.spec.absolute_path)
             .await
             .map_err(|source| {
@@ -568,6 +646,7 @@ impl MicroVmSdk {
     async fn stream_to_temporary<F>(
         &self,
         member: &DownloadMember,
+        cancellation: &DownloadCancellation,
         tracker: &ProgressTracker,
         on_progress: &mut F,
         temporary_path: &Path,
@@ -598,7 +677,22 @@ impl MicroVmSdk {
         let mut response = self.registry.fetch_file(&member.spec.registry_url).await?;
         let mut hasher = Sha256::new();
         let mut size_bytes = 0_u64;
-        while let Some(chunk) = response.chunk().await? {
+        let cancellation_token = cancellation.token();
+        loop {
+            if cancellation.is_cancelled() {
+                on_progress(tracker.event(&member.spec, DownloadPhase::Cancelled, size_bytes));
+                return Err(SdkError::Cancelled);
+            }
+            let chunk = tokio::select! {
+                result = response.chunk() => result?,
+                _ = cancellation_token.cancelled() => {
+                    on_progress(tracker.event(&member.spec, DownloadPhase::Cancelled, size_bytes));
+                    return Err(SdkError::Cancelled);
+                }
+            };
+            let Some(chunk) = chunk else {
+                break;
+            };
             let chunk_size = u64::try_from(chunk.len()).map_err(|_| {
                 SdkError::Migration("HTTP response chunk exceeds u64 size".to_owned())
             })?;
@@ -610,6 +704,10 @@ impl MicroVmSdk {
             })?;
             hasher.update(&chunk);
             on_progress(tracker.event(&member.spec, DownloadPhase::Downloading, size_bytes));
+        }
+        if cancellation.is_cancelled() {
+            on_progress(tracker.event(&member.spec, DownloadPhase::Cancelled, size_bytes));
+            return Err(SdkError::Cancelled);
         }
         file.flush().await.map_err(|source| {
             SdkError::filesystem("flush temporary download file", temporary_path, source)
