@@ -69,7 +69,7 @@ SQLite transaction across network awaits; valid cache hits perform no second tra
 terminate the process. The caller supplies the base path. Only verified files become final targets
 or verified inventory records. Migrations are separate SQL files, idempotent, checksum-tracked,
 and run before the SDK constructor returns. Registry-controlled paths must remain under the SDK
-home. Existing bootstrap API behavior must be preserved.
+home.
 
 **Scale/Scope**: Multiple kernel versions and architectures, binary packages with multiple
 components, and distributions with multiple images may coexist in one home. The first migration
@@ -240,7 +240,7 @@ integrity, stale-record, and not-found failures without leaking presentation pol
 
 ## Implementation Sequence
 
-1. Add the dependency declarations and preserve the existing bootstrap API.
+1. Add the dependency declarations and preserve the existing workspace boundaries.
 2. Vendor the exact official registry type file and add domain/progress/result types plus typed
    errors.
 3. Add the initial SQL migration and migration runner; make `MicroVmSdk::new` create directories

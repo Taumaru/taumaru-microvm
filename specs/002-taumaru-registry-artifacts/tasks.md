@@ -24,7 +24,7 @@ task names the files it owns so the work can be executed without rediscovering t
 fixtures without changing the CLI lifecycle surface.
 
 - [X] T001 Add the `tokio`, `reqwest`, `rusqlite`, `serde`, `serde_json`, `sha2`, and `thiserror` dependency declarations with the planned minimal features in `Cargo.toml`, `crates/sdk/Cargo.toml`, and `Cargo.lock`.
-- [X] T002 Create the planned SDK module, migration, fixture, and integration-test paths under `crates/sdk/src/domain/`, `crates/sdk/src/ports/`, `crates/sdk/src/adapters/persistence/`, `crates/sdk/src/adapters/registry/`, `crates/sdk/migrations/`, and `crates/sdk/tests/`, while preserving `example_message` in `crates/sdk/src/lib.rs`.
+- [X] T002 Create the planned SDK module, migration, fixture, and integration-test paths under `crates/sdk/src/domain/`, `crates/sdk/src/ports/`, `crates/sdk/src/adapters/persistence/`, `crates/sdk/src/adapters/registry/`, `crates/sdk/migrations/`, and `crates/sdk/tests/`.
 - [X] T003 [P] Add a schema-version 1 manifest fixture, small kernel/binary/image payloads, and a reusable local HTTP fixture-server helper in `crates/sdk/tests/fixtures/` and `crates/sdk/tests/support/mod.rs` for deterministic tests without production downloads.
 - [X] T004 [P] Download and vendor the exact official Rust registry definition referenced by `types/registry.rs` into `crates/sdk/src/domain/registry.rs`, preserving its published content and source provenance from `https://artifacts.taumaru.com/v1/types/registry.rs` rather than manually recreating the models.
 
@@ -68,7 +68,7 @@ unsupported-schema fixtures and assert typed errors with no SDK output or panic.
 
 - [X] T015 [P] [US1] Write failing unit tests for schema-version checks, duplicate identifiers, required metadata, URL/path containment, lowercase 64-hex SHA-256 validation, and unsupported registry responses in `crates/sdk/src/adapters/registry/taumaru.rs`.
 - [X] T016 [P] [US1] Write failing async contract tests for `list_kernels`, `list_binaries`, and `list_distributions`, including nested binary files, distribution images, ELF/filesystem metadata, and typed unavailable/malformed/schema errors in `crates/sdk/tests/registry_contract.rs`.
-- [X] T017 [P] [US1] Write failing public API and Rustdoc compile tests for `MicroVmSdk`, the three list methods, deliberate registry-type re-exports, and the unchanged `example_message` in `crates/sdk/tests/public_api.rs`.
+- [X] T017 [P] [US1] Write failing public API and Rustdoc compile tests for `MicroVmSdk`, the three list methods, and deliberate registry-type re-exports in `crates/sdk/tests/public_api.rs`.
 
 ### Implementation for User Story 1
 
@@ -137,7 +137,7 @@ file and assert a typed stale/integrity error instead of an unsafe path.
 
 - [X] T038 [US3] Implement the durable binary lookup query and repository mapping in `crates/sdk/src/ports/repository.rs` and `crates/sdk/src/adapters/persistence/sqlite.rs`; require the complete `downloads` plus `binary_files` relationship and distinguish package ID, component, version, architecture, and verified path.
 - [X] T039 [US3] Implement `resolve_binary` in `crates/sdk/src/manager.rs`; revalidate that the recorded path remains below the SDK home and that its current size and SHA-256 match the verified inventory before returning `InstalledBinary`, otherwise return a typed stale or integrity error.
-- [X] T040 [US3] Complete public resolver exports and Rustdoc contract examples in `crates/sdk/src/lib.rs`, `crates/sdk/src/domain/artifact.rs`, and `crates/sdk/tests/public_api.rs`, preserving the existing bootstrap API and keeping resolution independent of process-local memory or directory scans.
+- [X] T040 [US3] Complete public resolver exports and Rustdoc contract examples in `crates/sdk/src/lib.rs`, `crates/sdk/src/domain/artifact.rs`, and `crates/sdk/tests/public_api.rs`, keeping resolution independent of process-local memory or directory scans.
 
 **Checkpoint**: User Story 3 is independently usable when restart, identity-separation, path
 mutation, and public API tests pass against the durable SQLite inventory.

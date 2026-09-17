@@ -17,21 +17,3 @@ pub use domain::{
 };
 pub use error::SdkError;
 pub use manager::MicroVmSdk;
-
-/// Returns a deterministic readiness message for the bootstrap SDK.
-///
-/// This is a temporary demonstration API. It may be replaced before the first stable release
-/// and does not represent the future MicroVM manager API.
-///
-/// # Examples
-///
-/// ```
-/// assert_eq!(
-///     taumaru_microvm::example_message(),
-///     "taumaru-microvm SDK is ready"
-/// );
-/// ```
-#[must_use]
-pub fn example_message() -> &'static str {
-    "taumaru-microvm SDK is ready"
-}

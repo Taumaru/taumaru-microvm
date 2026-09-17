@@ -236,7 +236,6 @@ cache, choose another artifact, or report the failure. No variant writes diagnos
 ## Compatibility and side effects
 
 - The current supported registry schema is version 1.
-- `example_message` remains available and unchanged as the temporary bootstrap API.
 - All public list/download/resolve methods are asynchronous except construction, which performs
   mandatory migrations synchronously before returning.
 - The SDK owns directories and files below the supplied home but does not delete valid artifacts
