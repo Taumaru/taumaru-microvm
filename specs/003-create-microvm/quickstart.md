@@ -31,13 +31,14 @@ let sdk = MicroVmSdk::new("/var/lib/taumaru")?;
 // Artifact acquisition is intentionally separate from creation.
 sdk.download_distribution("ubuntu-24.04", |_| {}).await?;
 sdk.download_kernel("linux-6.8-x86_64", |_| {}).await?;
-sdk.download_binary("firecracker-1.14.1-x86_64", |_| {}).await?;
-sdk.download_binary("firectl-1.14.1-x86_64", |_| {}).await?;
+sdk.download_binary("firecracker-1.17.0-x86_64", |_| {}).await?;
+sdk.download_binary("firectl-0.2.0-x86_64", |_| {}).await?;
 ```
 
 The concrete IDs above are illustrative; the caller must use IDs published by the configured
-registry and the distribution's actual default kernel. The two binary package versions must match
-the runtime compatibility policy.
+registry and the distribution's actual default kernel. The two runtime packages may be a single
+combined package or separate packages with different versions; each required component is selected
+independently using the current host-architecture and highest-valid-semantic-version policy.
 
 ## Create a host-only VM
 

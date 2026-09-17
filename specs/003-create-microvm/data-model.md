@@ -119,6 +119,12 @@ process identifier when a setup process is active, and the last observed process
 successful row has no active process and no live socket. The firectl/firecracker paths are
 recorded separately so future operations can revalidate each independent artifact.
 
+The selected runtime package IDs may be the same when one package provides both required
+components, or different when the registry publishes split packages. Selection uses valid
+semantic versions and host architecture independently for `firecracker` and `firectl`, choosing
+the highest valid version for each component with deterministic tie-breaking; the versions do not
+need to match.
+
 ## Registry additions used by creation
 
 `DistributionImage` gains an optional `minimum_size_bytes` field in the Rust registry model and

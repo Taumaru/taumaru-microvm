@@ -119,7 +119,9 @@ Required behavior:
    physical digest/size.
 3. Resolve the distribution's default kernel and one independently tracked Firecracker package
    plus one independently tracked `firectl` package. Both must be verified, executable when
-   required, architecture-compatible, and exact-version compatible.
+   required, architecture-compatible, and selected using the component-aware semantic-version
+   policy. One package may provide both components; split packages may provide them with different
+   versions. Runtime startup remains the final compatibility check.
 4. Reject all missing, stale, corrupt, ambiguous, or incompatible prerequisites before creating
    host resources. Creation never downloads a missing artifact.
 5. Claim the VM name and volume path under a per-VM lock. A missing volume path defaults to

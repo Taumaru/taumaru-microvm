@@ -126,12 +126,14 @@ Sources: [Firecracker network setup](https://github.com/firecracker-microvm/fire
 
 - Firecracker and `firectl` remain independent inventory records. Resolution selects one verified
   executable component named `firecracker` and one named `firectl` for the host architecture.
-- The conservative compatibility rule for this feature is exact release-version equality between
-  the selected package versions, in addition to matching architecture and valid executable
-  metadata. This avoids making an unverified API pairing decision when the registry offers
-  multiple packages.
-- If no unique exact-version pair exists, creation returns a typed runtime prerequisite or
-  compatibility error. It never downloads, guesses, or selects an arbitrary pair.
+- The current artifact-selection behavior permits one package to provide both components or split
+  packages to provide them independently. For each required component, candidates are filtered by
+  host architecture and valid semantic version, then the highest valid version is selected with a
+  deterministic package-ID tie-breaker. Split packages may have different versions.
+- Creation must not invent an equal-version requirement that the registry and current download
+  workflow do not impose. The runtime adapter remains responsible for detecting an unusable
+  Firecracker/`firectl` combination during temporary startup and returning a typed compatibility
+  error. Missing, stale, ambiguous, or incompatible candidates still fail before host mutation.
 
 ### Persistence and failure safety
 

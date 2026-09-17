@@ -86,8 +86,10 @@ Research is recorded in [research.md](./research.md). The resolved decisions are
    size at least as large as both that minimum and the verified source file.
 3. Copy the source into `{volume_path}/rootfs.ext4`, expand the copy and ext4 filesystem when
    needed, and pass that copy to `firectl` as a writable root drive.
-4. Resolve Firecracker and `firectl` as independent verified executable artifacts. Require host
-   architecture compatibility and exact package release-version equality for this initial pair.
+4. Resolve Firecracker and `firectl` as independent verified executable artifacts. A package may
+   provide both components or the components may come from separate packages; select valid
+   semantic-version packages for the host architecture independently for each component, choosing
+   the highest valid version deterministically. The package versions may differ.
 5. Generate one Ed25519 key pair per VM, store paths under the VM directory, and inject only the
    public key at `/root/.ssh/authorized_keys` in the VM-local rootfs copy. Return/persist the
    private-key path only.
@@ -177,8 +179,10 @@ Extend artifact resolution with a method that returns a complete creation prereq
 
 - the selected image and its verified local path;
 - the distribution's default kernel and verified local path;
-- one installed `firecracker` component and one installed `firectl` component from independent
-  packages, both with the same exact release version and compatible architecture.
+- one installed `firecracker` component and one installed `firectl` component from the current
+  artifact inventory. A single package may provide both components; otherwise separate packages
+  are selected independently using valid semantic versions, host architecture, required component
+  coverage, and highest-version deterministic ordering. The package versions may differ.
 
 If the inventory is incomplete, stale, ambiguous, or incompatible, map the result to a typed
 preflight error before host mutation. Do not adopt an untracked file merely because it exists.
@@ -294,7 +298,8 @@ The dependency-ordered implementation sequence for `$speckit-tasks` is:
 2. Add domain request, result, state, network, credential, and runtime types with Rustdoc.
 3. Add typed errors and path/resource validation helpers.
 4. Add the SQLite migration, migration registration/schema verification, and repository methods.
-5. Add artifact prerequisite resolution and independent Firecracker/firectl compatibility checks.
+5. Add artifact prerequisite resolution and independent Firecracker/firectl component-selection
+   and compatibility checks.
 6. Add storage/key/guest-filesystem ports and Linux adapters for copy, resize, mount, and key
    injection.
 7. Add network ports and Linux host-only/LAN implementations with ownership-aware reconciliation.
@@ -314,7 +319,7 @@ The dependency-ordered implementation sequence for `$speckit-tasks` is:
 | Moving a physical uplink into a bridge can disrupt host networking | Snapshot addresses/routes, support only a validated manageable uplink path, make the operation typed/failable, and reverse every attempt-owned change on failure. |
 | A LAN DHCP lease cannot be known while the VM is stopped | Temporarily start only for MAC-correlated lease observation, bound the wait, then stop and remove the socket before success. |
 | ext4 helper or mount failure leaves a partial rootfs | Use an attempt-local copy, offline operations, explicit unmount/final verification, and reverse-order cleanup. |
-| Firecracker/firectl API mismatch | Resolve independent artifacts only when architecture and exact release version match; reject ambiguous pairs. |
+| Firecracker/firectl API mismatch | Reuse the component-aware selection policy from the current artifact workflow, allow independently versioned split packages, validate the temporary runtime, and return a typed incompatibility error on startup failure. |
 | Host reboot removes TAP/bridge/firewall state | Persist desired resource fingerprints and make `configure_network` compare, skip, and repair each item. |
 | Multiple VMs collide on names, paths, addresses, or shared bridge | Use SQLite uniqueness, per-name locks, deterministic address/MAC allocation, resource ownership, and bridge refcounts. |
 | Secrets leak through errors or diagnostics | Keep key contents out of domain/repository types, capture subprocess output, return paths/fingerprints only, and test output silence. |

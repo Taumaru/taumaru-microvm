@@ -24,6 +24,7 @@
 - Q: Where should the Firecracker control socket and other VM-exclusive files live? → A: They must live inside the VM volume directory; the socket path is `{vm_volume_path}/firecracker.sock`, alongside the copied `.ext4` image, SSH keys, and other files exclusive to that VM.
 - Q: What guest path must receive the generated public SSH key? → A: Every image must use `/root/.ssh/authorized_keys`; the SDK injects the key only into the per-VM `.ext4` copy and does not require a registry or caller-provided path.
 - Q: Should Firecracker and `firectl` be acquired and tracked as one package or as separate artifacts? → A: Track them as independent artifacts and resolve a verified compatible pair during creation; neither binary requires the other to be distributed in the same package.
+- Q: How should independently tracked Firecracker and `firectl` packages be selected when their versions differ? → A: Follow the existing artifact-selection behavior: a package may provide both components or the components may come from separate packages; select host-architecture-compatible packages with valid semantic versions independently for each required component, choosing the highest valid version deterministically. The package versions do not need to be equal.
 - Q: How should the SDK configure the guest's IP address and gateway? → A: Use standardized boot parameters: static IP, gateway, and route for host-only mode, and DHCP for LAN mode; the SDK does not run a per-VM DHCP server.
 - Q: What should remain when creation fails after creating VM resources? → A: Roll back all resources created by the attempt, including process, network, socket, SSH keys, and copied `rootfs.ext4`; preserve the source image and pre-existing caller-owned data.
 - Q: In which public operations should the SDK return the persisted private-key path? → A: Return it in the creation result and persist it for future SDK operations; this feature is limited to initial creation/configuration, so listing, inspection/status, deletion, start, stop, and reboot operations are out of scope. The SDK must also expose an independently callable network-configuration operation that reconciles existing host state, skips already-correct items, repairs only missing or stale items, and leaves the VM stopped before returning.
@@ -234,7 +235,10 @@ resources are repaired, and every VM remains stopped and independently addressab
   artifacts MUST be present in the local inventory, present at their recorded paths, verified
   against their recorded integrity metadata, and executable when required. The selected pair MUST
   satisfy the host, architecture, and compatibility constraints even when the artifacts were
-  acquired separately.
+  acquired separately. One package MAY provide both components; otherwise the SDK MUST select
+  separate packages independently. The package versions MAY differ, and selection MUST use valid
+  semantic versions, host architecture, required component coverage, and a deterministic highest
+  version per component rather than requiring equal versions.
 - **FR-007**: If a distribution, kernel, runtime binary, or required supporting record is missing,
   stale, corrupted, or incompatible, the SDK MUST return a typed error that distinguishes the
   failing precondition, identifies the affected artifact, and tells the caller to acquire or
@@ -450,9 +454,12 @@ resources are repaired, and every VM remains stopped and independently addressab
   readiness and host-local VM metadata. No distributed control-plane state, registry write, cloud
   scheduling, billing, or authentication behavior is added.
 - The existing inventory can resolve one deterministic compatible pair from independently tracked
-  Firecracker and `firectl` artifacts. If either component is missing, unverified, or incompatible,
-  or more than one candidate pair is equally valid and cannot be selected deterministically,
-  creation returns a typed prerequisite or conflict error instead of choosing arbitrarily.
+  Firecracker and `firectl` artifacts. A single package may provide both components, or separate
+  packages may provide them with different versions. Selection uses valid semantic versions,
+  host architecture, required component coverage, and the highest valid version per component. If
+  either component is missing, unverified, or incompatible, or candidate selection cannot be made
+  deterministic, creation returns a typed prerequisite or conflict error instead of choosing
+  arbitrarily.
 - The default network mode is host-only. LAN exposure means reachability from the host's local
   network; it does not promise an Internet-routable public address, port forwarding, firewall
   policy, or inbound access beyond what the host network permits.
