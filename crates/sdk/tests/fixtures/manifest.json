@@ -1,0 +1,225 @@
+{
+  "schema_version": 1,
+  "registry": {
+    "name": "Taumaru Fixture Registry",
+    "version": "1.0.0",
+    "description": "Small deterministic fixture registry for SDK tests.",
+    "base_url": "http://fixture.invalid/v1/",
+    "updated_at": "2026-09-17T12:00:00Z"
+  },
+  "kernels": [
+    {
+      "id": "linux-test-x86_64",
+      "name": "Linux Test",
+      "display_name": "Linux Test (x86_64)",
+      "version": "6.1.0-test",
+      "architecture": "x86_64",
+      "path": "kernels/linux-test-x86_64/vmlinux",
+      "url": "http://fixture.invalid/v1/kernels/linux-test-x86_64/vmlinux",
+      "filename": "vmlinux",
+      "size_bytes": 15,
+      "sha256": "19034b8326bddd75c6fd63c489ada9c7f6a8807312e1dd9318bc23c4898ad498",
+      "format": "elf",
+      "mime_type": "application/x-executable",
+      "elf": {
+        "class": "ELF64",
+        "endianness": "little",
+        "type": "EXEC (Executable file)",
+        "machine": "Advanced Micro Devices X86-64",
+        "entry_point": "0x1000",
+        "build_id": "fixture-kernel-build",
+        "linkage": "static",
+        "stripped": false
+      },
+      "modified_at": "2026-09-17T12:00:00Z"
+    },
+    {
+      "id": "linux-test-aarch64",
+      "name": "Linux Test",
+      "display_name": "Linux Test (aarch64)",
+      "version": "6.1.0-test",
+      "architecture": "aarch64",
+      "path": "kernels/linux-test-aarch64/vmlinux",
+      "url": "http://fixture.invalid/v1/kernels/linux-test-aarch64/vmlinux",
+      "filename": "vmlinux",
+      "size_bytes": 15,
+      "sha256": "19034b8326bddd75c6fd63c489ada9c7f6a8807312e1dd9318bc23c4898ad498",
+      "format": "linux-arm64-image",
+      "mime_type": "application/octet-stream",
+      "modified_at": "2026-09-17T12:00:00Z"
+    }
+  ],
+  "binaries": [
+    {
+      "id": "firecracker-test-1.0.0-x86_64",
+      "name": "firecracker-test",
+      "display_name": "Firecracker Test 1.0.0 (x86_64)",
+      "description": "Fixture runtime package.",
+      "version": "1.0.0",
+      "architecture": "x86_64",
+      "files": [
+        {
+          "name": "firecracker",
+          "path": "binaries/firecracker-test/1.0.0/x86_64/firecracker",
+          "url": "http://fixture.invalid/v1/binaries/firecracker-test/1.0.0/x86_64/firecracker",
+          "filename": "firecracker",
+          "size_bytes": 20,
+          "sha256": "d00d70b4c386b45cda87929258e5317019595179cef442cca028bb21c0c37ceb",
+          "mime_type": "application/x-pie-executable",
+          "executable": true,
+          "mode": "755",
+          "permissions": "-rwxr-xr-x",
+          "format": "elf",
+          "elf": {
+            "class": "ELF64",
+            "endianness": "little",
+            "type": "DYN (Position-Independent Executable file)",
+            "machine": "Advanced Micro Devices X86-64",
+            "entry_point": "0x1000",
+            "linkage": "static",
+            "stripped": true
+          },
+          "modified_at": "2026-09-17T12:00:00Z"
+        },
+        {
+          "name": "jailer",
+          "path": "binaries/firecracker-test/1.0.0/x86_64/jailer",
+          "url": "http://fixture.invalid/v1/binaries/firecracker-test/1.0.0/x86_64/jailer",
+          "filename": "jailer",
+          "size_bytes": 15,
+          "sha256": "95949ec91bdfc742bda3ae2bf053c0821f76dae41577e34ccaa47da742fbf3b0",
+          "mime_type": "application/x-pie-executable",
+          "executable": true,
+          "mode": "755",
+          "permissions": "-rwxr-xr-x",
+          "format": "elf",
+          "modified_at": "2026-09-17T12:00:00Z"
+        }
+      ]
+    },
+    {
+      "id": "firecracker-test-1.0.0-aarch64",
+      "name": "firecracker-test",
+      "display_name": "Firecracker Test 1.0.0 (aarch64)",
+      "description": "Fixture ARM runtime package.",
+      "version": "1.0.0",
+      "architecture": "aarch64",
+      "files": [
+        {
+          "name": "firecracker",
+          "path": "binaries/firecracker-test/1.0.0/aarch64/firecracker",
+          "url": "http://fixture.invalid/v1/binaries/firecracker-test/1.0.0/aarch64/firecracker",
+          "filename": "firecracker",
+          "size_bytes": 20,
+          "sha256": "d00d70b4c386b45cda87929258e5317019595179cef442cca028bb21c0c37ceb",
+          "mime_type": "application/x-pie-executable",
+          "executable": true,
+          "mode": "755",
+          "permissions": "-rwxr-xr-x",
+          "format": "elf",
+          "modified_at": "2026-09-17T12:00:00Z"
+        }
+      ]
+    }
+  ],
+  "distributions": [
+    {
+      "id": "alpine-test-1.0",
+      "name": "Alpine",
+      "display_name": "Alpine Test 1.0",
+      "description": "Fixture distribution image set.",
+      "distribution": "alpine",
+      "version": "1.0",
+      "codename": "fixture",
+      "architecture": "x86_64",
+      "vendor": "Taumaru",
+      "homepage": "https://example.invalid/alpine",
+      "default_kernel": "linux-test-x86_64",
+      "supported_kernels": ["linux-test-x86_64", "linux-test-aarch64"],
+      "boot": {
+        "root_device": "/dev/vda",
+        "kernel_args": ["console=ttyS0", "root=/dev/vda", "rw"]
+      },
+      "requirements": {
+        "min_memory_mb": 128,
+        "min_vcpus": 1
+      },
+      "images": [
+        {
+          "id": "alpine-test-minimal",
+          "name": "Minimal",
+          "display_name": "Alpine Test Minimal",
+          "description": "Small fixture root filesystem.",
+          "variant": "minimal",
+          "path": "images/alpine/1.0/alpine-test-minimal.ext4",
+          "url": "http://fixture.invalid/v1/images/alpine/1.0/alpine-test-minimal.ext4",
+          "filename": "alpine-test-minimal.ext4",
+          "format": "ext4",
+          "filesystem": {
+            "type": "ext4",
+            "uuid": "00000000-0000-0000-0000-000000000001",
+            "block_size": 4096,
+            "block_count": 10,
+            "free_blocks": 5,
+            "inode_count": 10,
+            "free_inodes": 5,
+            "features": ["has_journal", "extent"]
+          },
+          "size_bytes": 15,
+          "sha256": "2a8035a6be213e14ae659c4fa51badeb83f5607126820d0a8c01fd424f8a6f6d",
+          "capabilities": ["networking"],
+          "mime_type": "application/octet-stream",
+          "modified_at": "2026-09-17T12:00:00Z"
+        },
+        {
+          "id": "alpine-test-debug",
+          "name": "Debug",
+          "display_name": "Alpine Test Debug",
+          "description": "Second fixture root filesystem.",
+          "variant": "debug",
+          "path": "images/alpine/1.0/alpine-test-debug.ext4",
+          "url": "http://fixture.invalid/v1/images/alpine/1.0/alpine-test-debug.ext4",
+          "filename": "alpine-test-debug.ext4",
+          "format": "ext4",
+          "filesystem": {
+            "type": "ext4",
+            "uuid": "00000000-0000-0000-0000-000000000002",
+            "block_size": 4096,
+            "block_count": 20,
+            "free_blocks": 10,
+            "inode_count": 20,
+            "free_inodes": 10,
+            "features": ["has_journal", "extent"]
+          },
+          "size_bytes": 22,
+          "sha256": "a91400813428b09e010c6c4c4ba09efea7896be81d94d558fa88455b101be8d3",
+          "capabilities": ["networking", "debug"],
+          "mime_type": "application/octet-stream",
+          "modified_at": "2026-09-17T12:00:00Z"
+        }
+      ]
+    }
+  ],
+  "types": [
+    {
+      "id": "registry-types",
+      "name": "Registry Types",
+      "display_name": "Taumaru Registry Types",
+      "description": "Fixture registry type definitions.",
+      "format": "serde_json",
+      "schema_version": 1,
+      "files": [
+        {
+          "language": "rust",
+          "path": "types/registry.rs",
+          "url": "http://fixture.invalid/v1/types/registry.rs",
+          "filename": "registry.rs",
+          "size_bytes": 1,
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+          "mime_type": "text/plain",
+          "modified_at": "2026-09-17T12:00:00Z"
+        }
+      ]
+    }
+  ]
+}

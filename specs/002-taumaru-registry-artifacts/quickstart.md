@@ -18,7 +18,9 @@ From the repository root:
 cargo fmt --all -- --check
 cargo test -p taumaru-microvm --test registry_contract
 cargo test -p taumaru-microvm --test download_flow
+cargo test -p taumaru-microvm --test failure_paths
 cargo test -p taumaru-microvm --test sqlite_persistence
+cargo test -p taumaru-microvm --test public_api
 ```
 
 The focused tests should prove the following:
@@ -39,7 +41,8 @@ The focused tests should prove the following:
 8. Distribution images and ordered kernel compatibility rows are persisted without confusing a
    distribution image with its referenced kernel.
 9. Interrupted, truncated, malformed, unsafe-path, permission, migration-drift, database, and
-   integrity failures return typed errors without SDK output or panic.
+   integrity failures return typed errors without SDK output or panic; invalid kernel cleanup
+   removes its physical, logical, and compatibility rows.
 
 ## Run the complete quality gates
 
@@ -82,3 +85,5 @@ Expected results:
 - Every verified binary has a `downloads` row and a related `binary_files` row.
 - Absolute paths remain below `<sdk-home>` and relative paths contain no leading separator.
 - Re-running the same download does not add duplicate rows or transfer the file again.
+- A failed replacement leaves no invalid final file, temporary part file, or unverified physical
+  inventory row; a previously downloaded invalid kernel also loses its compatibility links.
