@@ -1,7 +1,3 @@
-ALTER TABLE distribution_images
-    ADD COLUMN minimum_size_bytes INTEGER
-    CHECK (minimum_size_bytes IS NULL OR minimum_size_bytes > 0);
-
 CREATE TABLE IF NOT EXISTS network_bridges (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     bridge_name TEXT NOT NULL,

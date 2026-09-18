@@ -99,14 +99,13 @@ pub enum SdkError {
         reason: String,
     },
 
-    /// The requested root disk is smaller than a safe physical or registry floor.
+    /// The requested root disk is smaller than the original image file.
     #[error(
-        "disk size for image {image_id} is too small: requested {requested_size_bytes} bytes, minimum {minimum_size_bytes:?}, source {source_size_bytes} bytes"
+        "disk size for image {image_id} is too small: requested {requested_size_bytes} bytes, original image size {source_size_bytes} bytes"
     )]
     DiskSizeTooSmall {
         image_id: String,
         requested_size_bytes: u64,
-        minimum_size_bytes: Option<u64>,
         source_size_bytes: u64,
     },
 

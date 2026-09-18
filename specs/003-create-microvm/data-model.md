@@ -11,7 +11,7 @@ The request is caller-owned input and is never stored verbatim as an opaque blob
 | `name` | `String` | 1–64 ASCII characters; first character alphanumeric; remaining characters alphanumeric, `-`, or `_`; no spaces, separators, dots, or control characters. |
 | `distribution_id` | `String` | Non-empty validated registry ID. |
 | `image_id` | `String` | Non-empty validated image ID belonging to `distribution_id`. |
-| `disk_size_bytes` | `u64` | Positive; at least the registry minimum and the verified source image size; never shrunk. |
+| `disk_size_bytes` | `u64` | Positive; at least the image's registry-reported `size_bytes` and verified source size; never shrunk. |
 | `vcpu_count` | `u32` | Positive and at least the distribution minimum. |
 | `memory_bytes` | `u64` | Positive and at least the distribution minimum converted to bytes; checked conversion to the `firectl` MiB argument. |
 | `expose_on_lan` | `bool` | `false` selects host-only networking; `true` selects bridge/DHCP networking. |
@@ -127,13 +127,10 @@ need to match.
 
 ## Registry additions used by creation
 
-The registry adapter reads optional `minimum_size_bytes` metadata from the raw registry response
-and persists it in the corresponding inventory column. The existing public `DistributionImage`
-Rust model remains unchanged to preserve the current SDK/CLI construction contract; the adapter's
-side metadata keeps the value optional so existing registry records remain representable. Creation
-treats `NULL` as a typed missing-prerequisite error. The physical `size_bytes` remains the verified
-current image size and is an additional floor. No registry service or download behavior is changed
-by this feature.
+The registry image's `size_bytes` is the original `.ext4` file size and is the minimum disk size
+accepted by creation. The same verified value is persisted in `distribution_images.size_bytes` and
+used as the physical floor before copying. No duplicate minimum-size field is required, and no
+registry service or download behavior is changed by this feature.
 
 The image validation path also requires `format == "ext4"` and
 `filesystem.type == "ext4"`. The distribution's existing boot configuration and default kernel

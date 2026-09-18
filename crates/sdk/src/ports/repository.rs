@@ -44,7 +44,6 @@ pub(crate) trait ArtifactRepository: Send + Sync {
         distribution: &Distribution,
         image: &DistributionImage,
         kernels: &[Kernel],
-        minimum_size_bytes: Option<u64>,
         spec: &DownloadSpec,
         integrity: &FileIntegrity,
     ) -> Result<(), SdkError>;

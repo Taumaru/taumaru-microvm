@@ -41,7 +41,7 @@ types, and artifact readiness are completed before story-specific implementation
 user story implementation can begin until this phase is complete.
 
 - [X] T004 [P] Create the MicroVM identity, creation-result, network-result, SSH metadata, and immutable configuration types in `crates/sdk/src/domain/microvm.rs`, `crates/sdk/src/domain/config.rs`, and `crates/sdk/src/domain/lifecycle.rs`, including the states `creating`, temporary `running`, and successful stopped `configured`.
-- [X] T005 [P] Read optional distribution minimum-size metadata from the raw registry response, persist it without changing the existing public image model, validate ext4 metadata, and add split runtime package fixtures in `crates/sdk/src/domain/registry.rs`, `crates/sdk/src/adapters/registry/taumaru.rs`, and `crates/sdk/tests/fixtures/manifest.json`.
+- [X] T005 [P] Use the registry image `size_bytes` as the original `.ext4` minimum disk size, validate ext4 metadata, and add split runtime package fixtures in `crates/sdk/src/domain/registry.rs`, `crates/sdk/src/adapters/registry/taumaru.rs`, and `crates/sdk/tests/fixtures/manifest.json`.
 - [X] T006 [P] Add typed SDK errors for invalid requests, artifact readiness, disk-size prerequisites, runtime compatibility, storage ownership, lifecycle conflicts, network/permission failures, guest filesystem/credentials, temporary startup, and aggregate cleanup in `crates/sdk/src/error.rs` without including private-key contents or unrestricted command output.
 - [X] T007 Add `0002_microvm_creation.sql` with `microvms`, `vm_networks`, `network_bridges`, `vm_network_resources`, `vm_credentials`, and `vm_runtime` tables, ownership constraints, path/address indexes, and foreign-key behavior in `crates/sdk/migrations/0002_microvm_creation.sql`; register it and require its schema in `crates/sdk/src/adapters/persistence/migrations.rs`.
 - [X] T008 Extend the artifact and repository ports for local prerequisite resolution, binary-component candidate lookup, VM lookup, immutable-config comparison, provisional state transitions, network ownership, credential paths, and runtime metadata in `crates/sdk/src/ports/artifacts.rs` and `crates/sdk/src/ports/repository.rs`.
@@ -100,7 +100,7 @@ guest/SQLite failures; verify typed errors, no unsafe output, no configured row,
 
 ### Tests for User Story 2
 
-- [ ] T025 [P] [US2] Write failing prerequisite tests for unknown/incomplete/stale distribution images, missing registry minimum, stale kernel, missing or non-executable Firecracker/`firectl`, incompatible architecture, invalid resources, and no host mutation in `crates/sdk/tests/failure_paths.rs`.
+- [ ] T025 [P] [US2] Write failing prerequisite tests for unknown/incomplete/stale distribution images, undersized requests relative to image `size_bytes`, stale kernel, missing or non-executable Firecracker/`firectl`, incompatible architecture, invalid resources, and no host mutation in `crates/sdk/tests/failure_paths.rs`.
 - [ ] T026 [US2] Write failing concurrency, immutable-conflict, volume-ownership, rollback, caller-data-preservation, and SDK-silence tests in `crates/sdk/tests/concurrency.rs` and `crates/sdk/tests/failure_paths.rs`.
 
 ### Implementation for User Story 2

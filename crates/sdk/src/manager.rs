@@ -79,7 +79,6 @@ enum LogicalMember {
         distribution: Distribution,
         image: Box<DistributionImage>,
         kernels: Vec<Kernel>,
-        minimum_size_bytes: Option<u64>,
     },
 }
 
@@ -716,20 +715,10 @@ impl MicroVmSdk {
                 reason: "the selected image is not an ext4 filesystem image".to_owned(),
             });
         }
-        let minimum_size = self
-            .registry
-            .minimum_size_bytes(&distribution.id, &image.id)?
-            .ok_or_else(|| SdkError::ArtifactPrerequisite {
-                kind: "distribution image".to_owned(),
-                id: image.id.clone(),
-                path: self.home.join("artifacts/rootfs"),
-                reason: "the registry image has no declared minimum writable disk size".to_owned(),
-            })?;
-        if request.disk_size_bytes < image.size_bytes || request.disk_size_bytes < minimum_size {
+        if request.disk_size_bytes < image.size_bytes {
             return Err(SdkError::DiskSizeTooSmall {
                 image_id: image.id.clone(),
                 requested_size_bytes: request.disk_size_bytes,
-                minimum_size_bytes: Some(minimum_size),
                 source_size_bytes: image.size_bytes,
             });
         }
@@ -1528,9 +1517,6 @@ impl MicroVmSdk {
         Ok(DownloadMember {
             spec,
             logical: LogicalMember::DistributionImage {
-                minimum_size_bytes: self
-                    .registry
-                    .minimum_size_bytes(&distribution.id, &image.id)?,
                 distribution,
                 image: Box::new(image),
                 kernels,
@@ -1647,7 +1633,6 @@ impl MicroVmSdk {
                     repository.persist_binary_file(&package, &file, &spec, &integrity)
                 }
                 LogicalMember::DistributionImage {
-                    minimum_size_bytes,
                     distribution,
                     image,
                     kernels,
@@ -1655,7 +1640,6 @@ impl MicroVmSdk {
                     &distribution,
                     &image,
                     &kernels,
-                    minimum_size_bytes,
                     &spec,
                     &integrity,
                 ),
@@ -2730,14 +2714,6 @@ mod tests {
             let url = url.to_owned();
             Box::pin(async move { Err(SdkError::InvalidUrl { url }) })
         }
-
-        fn minimum_size_bytes(
-            &self,
-            _distribution_id: &str,
-            image_id: &str,
-        ) -> Result<Option<u64>, SdkError> {
-            Ok((image_id == "alpine-test-minimal").then_some(15))
-        }
     }
 
     #[derive(Default)]
@@ -3192,7 +3168,6 @@ mod tests {
                 distribution,
                 image,
                 &manifest.kernels,
-                Some(image.size_bytes),
                 &download_spec(
                     &sdk.home,
                     ArtifactKind::DistributionImage,

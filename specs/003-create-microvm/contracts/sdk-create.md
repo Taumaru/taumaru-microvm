@@ -115,8 +115,8 @@ Required behavior:
 1. Validate the name, IDs, resource sizes, volume path, and explicit SDK home without consulting
    environment variables.
 2. Resolve the exact distribution and caller-selected image from the local artifact inventory,
-   verify the image's ownership by the distribution, ext4 metadata, registry minimum size, and
-   physical digest/size.
+   verify the image's ownership by the distribution, ext4 metadata, registry-reported `size_bytes`
+   as the minimum disk size, and physical digest/size.
 3. Resolve the distribution's default kernel and one independently tracked Firecracker package
    plus one independently tracked `firectl` package. Both must be verified, executable when
    required, architecture-compatible, and selected using the component-aware semantic-version
@@ -189,7 +189,7 @@ following categories, preserving the existing artifact/download errors:
 |---|---|
 | Invalid request/name/resource | Field and validation reason; no host mutation. |
 | Missing or stale artifact | Artifact kind, registry ID, local path, and acquire/repair reason. |
-| Image disk-size prerequisite | Image ID, requested size, registry minimum, and current image size when applicable. |
+| Image disk-size prerequisite | Image ID, requested size, registry-reported `size_bytes`, and current verified image size. |
 | Runtime incompatibility | Firecracker/firectl component, package IDs/versions, architecture, and compatibility reason. |
 | Storage conflict | VM name, volume path, owner, and preservation reason; caller data is untouched. |
 | VM lifecycle conflict | VM name, current state, and requested operation. |

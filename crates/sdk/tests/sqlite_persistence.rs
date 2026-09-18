@@ -168,9 +168,9 @@ async fn persists_each_member_and_distribution_relationship_in_normalized_tables
         connection.query_row("SELECT COUNT(*) FROM distribution_images", [], |row| {
             row.get(0)
         })?;
-    let image_minimums: Vec<i64> = {
+    let image_sizes: Vec<i64> = {
         let mut statement = connection
-            .prepare("SELECT minimum_size_bytes FROM distribution_images ORDER BY registry_id")?;
+            .prepare("SELECT size_bytes FROM distribution_images ORDER BY registry_id")?;
         statement
             .query_map([], |row| row.get(0))?
             .collect::<Result<Vec<_>, _>>()?
@@ -207,7 +207,7 @@ async fn persists_each_member_and_distribution_relationship_in_normalized_tables
     )?;
 
     assert_eq!(image_count, 2);
-    assert_eq!(image_minimums, [22, 15]);
+    assert_eq!(image_sizes, [22, 15]);
     assert_eq!(distribution_kernel_count, 2);
     assert_eq!(default_kernel_count, 1);
     assert_eq!(boot_args, ["console=ttyS0", "root=/dev/vda", "rw"]);

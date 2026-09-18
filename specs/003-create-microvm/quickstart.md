@@ -13,7 +13,7 @@ The host must be Linux with:
 - the ext4 filesystem and resize helpers used by the SDK storage adapter;
 - a registry inventory containing the caller-selected distribution image, its default kernel,
   one verified Firecracker executable, and one verified `firectl` executable;
-- a registry-declared minimum disk size for the selected image.
+- the selected image's registry-reported `size_bytes`, which is the minimum disk size.
 
 The SDK home must be supplied explicitly. It is the directory containing `state/inventory.db`,
 downloaded artifacts, and the default VM volumes. The SDK does not read `HOME` or another
@@ -101,7 +101,7 @@ DHCP lease. It never starts a VM as the successful final state.
 ## Expected failure handling
 
 Creation fails before host mutation when an ID, image, kernel, runtime binary, architecture,
-registry minimum, resource value, or KVM prerequisite is invalid. After mutation begins, every
+image size, resource value, or KVM prerequisite is invalid. After mutation begins, every
 failure runs rollback for attempt-owned files, credentials, process/socket, network resources, and
 the provisional SQLite row. Existing source artifacts, caller-owned directories/files, other VM
 records, and foreign network resources are preserved.

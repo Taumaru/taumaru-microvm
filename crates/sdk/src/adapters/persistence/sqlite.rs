@@ -365,7 +365,6 @@ impl ArtifactRepository for SqliteRepository {
         distribution: &Distribution,
         image: &DistributionImage,
         kernels: &[Kernel],
-        minimum_size_bytes: Option<u64>,
         spec: &DownloadSpec,
         integrity: &FileIntegrity,
     ) -> Result<(), SdkError> {
@@ -424,15 +423,12 @@ impl ArtifactRepository for SqliteRepository {
         persist_kernel_references(&transaction, distribution_id, distribution, kernels, now)?;
 
         let download_id = persist_download(&transaction, spec, integrity)?;
-        let minimum_size_bytes = minimum_size_bytes
-            .map(|value| to_sqlite_integer(value, &spec.artifact_key))
-            .transpose()?;
         transaction.execute(
             "INSERT INTO distribution_images (
                 distribution_id, download_id, registry_id, name, display_name, description,
                 variant, format, registry_path, registry_url, filename, size_bytes, sha256,
-                minimum_size_bytes, mime_type, modified_at, created_at, updated_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?17)
+                mime_type, modified_at, created_at, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?16)
             ON CONFLICT(distribution_id, registry_id) DO UPDATE SET
                 download_id = excluded.download_id,
                 name = excluded.name,
@@ -444,7 +440,6 @@ impl ArtifactRepository for SqliteRepository {
                 registry_url = excluded.registry_url,
                 filename = excluded.filename,
                 size_bytes = excluded.size_bytes,
-                minimum_size_bytes = excluded.minimum_size_bytes,
                 sha256 = excluded.sha256,
                 mime_type = excluded.mime_type,
                 modified_at = excluded.modified_at,
@@ -463,7 +458,6 @@ impl ArtifactRepository for SqliteRepository {
                 image.filename,
                 to_sqlite_integer(image.size_bytes, &spec.artifact_key)?,
                 image.sha256,
-                minimum_size_bytes,
                 image.mime_type,
                 image.modified_at,
                 now,

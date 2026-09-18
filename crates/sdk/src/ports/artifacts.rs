@@ -10,10 +10,4 @@ pub(crate) type RegistryFuture<'a, T> =
 pub(crate) trait ArtifactSource: Send + Sync {
     fn fetch_manifest(&self) -> RegistryFuture<'_, TaumaruRegistry>;
     fn fetch_file(&self, url: &str) -> RegistryFuture<'_, reqwest::Response>;
-
-    fn minimum_size_bytes(
-        &self,
-        distribution_id: &str,
-        image_id: &str,
-    ) -> Result<Option<u64>, SdkError>;
 }

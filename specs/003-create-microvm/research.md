@@ -58,15 +58,14 @@ same temporary start without changing the final stopped state.
 - The SDK creates the VM directory first, copies the source bytes into an attempt-local temporary
   file in that directory, atomically renames it to `rootfs.ext4`, and then grows the copy only
   when the requested size exceeds the source size.
-- A request is rejected before copying when it is below the registry-declared image minimum or
-  below the physical source image size. Missing registry minimum metadata is a typed prerequisite
-  error; the SDK never infers a minimum from the file.
+- A request is rejected before copying when it is below the image's registry-reported `size_bytes`
+  or below the physical source image size. The registry-reported image size is the original `.ext4`
+  file size and therefore the minimum disk size; the SDK does not require a separate minimum field.
 - Growth is performed by an ext4 storage adapter using a file-size expansion followed by an
   offline filesystem resize. The adapter verifies the final byte size and ext4 metadata. Shrink
   is never attempted.
-- The registry model and SQLite persistence must carry the declared minimum size as optional
-  metadata so that absence remains distinguishable from zero. The create preflight rejects an
-  image with no declared minimum.
+- The existing registry image `size_bytes` and SQLite `distribution_images.size_bytes` are the
+  single source of truth for the minimum disk size.
 
 The exact helper binaries (`resize2fs`, filesystem inspection, and mount helpers) are invoked by
 an injected typed host-command port. Arguments are passed as individual values, output is captured,

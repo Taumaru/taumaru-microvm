@@ -36,7 +36,6 @@ impl GuestStorage for Ext4Storage {
             return Err(SdkError::DiskSizeTooSmall {
                 image_id: source.display().to_string(),
                 requested_size_bytes,
-                minimum_size_bytes: None,
                 source_size_bytes: source_size,
             });
         }

@@ -14,8 +14,8 @@
 
 - Q: Should the creation volume path represent the writable root disk or a separate data disk? → A: It is the per-VM volume directory; inside it the SDK stores a `.ext4` copy of the downloaded distribution image as the root disk passed to `firectl`, together with the VM's exclusive keys, socket, and other files.
 - Q: When a distribution has more than one compatible image available, which image should the SDK use for boot? → A: The caller must provide the specific image ID to the SDK.
-- Q: How should the SDK determine the minimum allowed disk size for the selected .ext4 image? → A: Use only the minimum declared by the registry; if it is absent, return an error.
-- Q: What should happen when the requested disk size is above the registry minimum but below the image's current size? → A: Reject the request.
+- Q: How should the SDK determine the minimum allowed disk size for the selected .ext4 image? → A: Use the registry-reported `size_bytes`, which is the original image file size.
+- Q: What should happen when the requested disk size is below the image's registry-reported `size_bytes`? → A: Reject the request.
 - Q: Which units and format should the public SDK use for disk size and RAM? → A: Disk and RAM use integer bytes; vCPU uses an integer count.
 - Q: When LAN exposure is enabled, how should the SDK attach the VM to the local network? → A: The SDK manages a bridge connected to the host's detected uplink; the VM receives a LAN address through DHCP, address conflicts or unavailable DHCP are errors, and the SDK never falls back to host-only mode.
 - Q: When LAN exposure is disabled, how should the SDK provide host-only networking? → A: The SDK allocates an exclusive private /30 per VM, creates a TAP interface, makes the guest reachable from the host, and provides outbound connectivity through host NAT.
@@ -273,11 +273,11 @@ resources are repaired, and every VM remains stopped and independently addressab
   NOT overwrite or reinitialize a directory that belongs to another VM or contains caller-owned
   data. A previously created SDK-owned directory and its files may be reused only when its VM
   ownership and source-image identity match the persisted record. The source image MUST remain
-  unchanged. If the requested disk size is below the minimum disk size declared by the selected
-  image's registry metadata, creation MUST fail before host mutation. If that registry minimum is
-  absent, creation MUST return a typed prerequisite error before host mutation. The requested
-  disk size MUST also be at least the selected image's current size; otherwise creation MUST
-  return a typed disk-size error before copying. After the copy is created, if the requested size
+  unchanged. The registry-reported `size_bytes` is the original `.ext4` file size and is the
+  minimum disk size. If the requested disk size is smaller, creation MUST fail before host
+  mutation with a typed disk-size error. The requested disk size MUST also be at least the
+  verified local image size; otherwise creation MUST return a typed disk-size error before
+  copying. After the copy is created, if the requested size
   is greater than the copied image's current size, the SDK MUST grow `rootfs.ext4` and its
   filesystem to the requested size. The resulting `rootfs.ext4` file MUST be passed to firectl as
   the VM root drive.
@@ -446,10 +446,10 @@ resources are repaired, and every VM remains stopped and independently addressab
 - The caller supplies a specific image registry ID. The SDK validates that the image belongs to
   the requested distribution and is compatible with the host, while the distribution metadata
   supplies the default kernel. There is no implicit image selection.
-- The selected image's registry metadata declares the minimum allowed disk size. If that value
-  is absent, the SDK rejects creation rather than inferring a minimum from the file.
-- The requested disk size must be at least both the registry-declared minimum and the selected
-  image's current size. The SDK only expands the copied .ext4 image; it never shrinks it.
+- The selected image's registry-reported `size_bytes` is the original `.ext4` file size and the
+  minimum allowed disk size.
+- The requested disk size must be at least the selected image's registry-reported and verified
+  current size. The SDK only expands the copied `.ext4` image; it never shrinks it.
 - The existing local SQLite-backed inventory remains the source of truth for downloaded artifact
   readiness and host-local VM metadata. No distributed control-plane state, registry write, cloud
   scheduling, billing, or authentication behavior is added.

@@ -191,7 +191,6 @@
           },
           "size_bytes": 15,
       "sha256": "2a8035a6be213e14ae659c4fa51badeb83f5607126820d0a8c01fd424f8a6f6d",
-          "minimum_size_bytes": 15,
           "capabilities": ["networking"],
           "mime_type": "application/octet-stream",
           "modified_at": "2026-09-17T12:00:00Z"
@@ -218,7 +217,6 @@
           },
           "size_bytes": 22,
           "sha256": "a91400813428b09e010c6c4c4ba09efea7896be81d94d558fa88455b101be8d3",
-          "minimum_size_bytes": 22,
           "capabilities": ["networking", "debug"],
           "mime_type": "application/octet-stream",
           "modified_at": "2026-09-17T12:00:00Z"

@@ -82,8 +82,8 @@ Research is recorded in [research.md](./research.md). The resolved decisions are
 
 1. Use the exact caller-selected image and the distribution's default kernel from verified local
    inventory; creation never downloads or silently selects a different image.
-2. Require image format/filesystem `ext4`, a registry-declared minimum size, and a requested disk
-   size at least as large as both that minimum and the verified source file.
+2. Require image format/filesystem `ext4`, use the registry-reported image `size_bytes` as the
+   minimum disk size, and require the requested disk size to be at least that value.
 3. Copy the source into `{volume_path}/rootfs.ext4`, expand the copy and ext4 filesystem when
    needed, and pass that copy to `firectl` as a writable root drive.
 4. Resolve Firecracker and `firectl` as independent verified executable artifacts. A package may
@@ -171,10 +171,10 @@ attempt-created paths from caller-owned paths for rollback.
 
 ### Artifact and registry integration
 
-Read optional `minimum_size_bytes` from raw registry metadata and persist it in the artifact
-inventory so missing metadata is distinguishable from zero. Keep the existing public registry image
-model compatible with the SDK/CLI construction contract; update registry validation, fixtures, the
-distribution-image persistence query, and migration schema without changing download behavior.
+Use the registry image `size_bytes` as the minimum disk size because it is the original `.ext4`
+file size. Keep the existing public registry image model and artifact inventory schema as the source
+of truth; update validation, fixtures, and creation preflight without adding a duplicate field or
+changing download behavior.
 
 Extend artifact resolution with a method that returns a complete creation prerequisite set:
 

@@ -141,13 +141,7 @@ fn verify_required_schema(connection: &Connection) -> Result<(), SdkError> {
         ),
         (
             "distribution_images",
-            &[
-                "id",
-                "distribution_id",
-                "download_id",
-                "registry_id",
-                "minimum_size_bytes",
-            ],
+            &["id", "distribution_id", "download_id", "registry_id"],
         ),
         (
             "distribution_kernels",
