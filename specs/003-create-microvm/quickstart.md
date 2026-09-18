@@ -120,7 +120,8 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-targets --all-features
 ```
 
-The SDK tests use fake artifact, storage, network, guest-filesystem, and runtime ports for
-deterministic success, idempotency, conflict, skip, repair, and rollback cases. Privileged Linux
-integration tests are opt-in and run in an isolated network namespace when the required host
-capabilities are available.
+The current automated suite covers registry/download behavior, SQLite persistence, public API
+contracts, storage and runtime validation, and deterministic creation/reconciliation/rollback
+cases through injected test ports in the SDK manager tests. Real host integration for KVM, ext4
+mounting, TAP/bridge setup, nftables, and DHCP requires a capability-gated Linux environment and
+is not executed by the default test suite.

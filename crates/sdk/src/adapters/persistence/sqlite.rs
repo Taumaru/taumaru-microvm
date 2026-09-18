@@ -1,16 +1,24 @@
 use std::convert::TryFrom;
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 use crate::domain::artifact::{ArtifactKind, DownloadSpec, FileIntegrity, InstalledBinary};
+use crate::domain::lifecycle::{MicroVmState, NetworkMode};
+use crate::domain::microvm::{
+    MicroVmRecord, NetworkConfiguration, NetworkResource, PersistedCredential, PersistedNetwork,
+    PersistedNetworkResource, PersistedRuntime,
+};
 use crate::domain::registry::{
     Architecture, BinaryFile, BinaryPackage, Distribution, DistributionImage, ElfMetadata,
     Endianness, Kernel, Linkage,
 };
 use crate::error::SdkError;
-use crate::ports::repository::{ArtifactRepository, InventoryState};
+use crate::ports::repository::{
+    ArtifactRepository, InventoryState, LocalArtifact, MicroVmRepository, StoredMicroVm,
+};
 
 use super::migrations;
 
@@ -357,6 +365,7 @@ impl ArtifactRepository for SqliteRepository {
         distribution: &Distribution,
         image: &DistributionImage,
         kernels: &[Kernel],
+        minimum_size_bytes: Option<u64>,
         spec: &DownloadSpec,
         integrity: &FileIntegrity,
     ) -> Result<(), SdkError> {
@@ -415,12 +424,15 @@ impl ArtifactRepository for SqliteRepository {
         persist_kernel_references(&transaction, distribution_id, distribution, kernels, now)?;
 
         let download_id = persist_download(&transaction, spec, integrity)?;
+        let minimum_size_bytes = minimum_size_bytes
+            .map(|value| to_sqlite_integer(value, &spec.artifact_key))
+            .transpose()?;
         transaction.execute(
             "INSERT INTO distribution_images (
                 distribution_id, download_id, registry_id, name, display_name, description,
                 variant, format, registry_path, registry_url, filename, size_bytes, sha256,
-                mime_type, modified_at, created_at, updated_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?16)
+                minimum_size_bytes, mime_type, modified_at, created_at, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?17)
             ON CONFLICT(distribution_id, registry_id) DO UPDATE SET
                 download_id = excluded.download_id,
                 name = excluded.name,
@@ -432,6 +444,7 @@ impl ArtifactRepository for SqliteRepository {
                 registry_url = excluded.registry_url,
                 filename = excluded.filename,
                 size_bytes = excluded.size_bytes,
+                minimum_size_bytes = excluded.minimum_size_bytes,
                 sha256 = excluded.sha256,
                 mime_type = excluded.mime_type,
                 modified_at = excluded.modified_at,
@@ -450,6 +463,7 @@ impl ArtifactRepository for SqliteRepository {
                 image.filename,
                 to_sqlite_integer(image.size_bytes, &spec.artifact_key)?,
                 image.sha256,
+                minimum_size_bytes,
                 image.mime_type,
                 image.modified_at,
                 now,
@@ -545,6 +559,832 @@ impl ArtifactRepository for SqliteRepository {
             executable: executable != 0,
         })
     }
+
+    fn resolve_kernel(&self, kernel_id: &str) -> Result<LocalArtifact, SdkError> {
+        let connection = self.connection()?;
+        let row = connection
+            .query_row(
+                "SELECT d.absolute_path, d.actual_size_bytes, d.actual_sha256,
+                        d.expected_size_bytes, d.expected_sha256, d.verification_status
+                 FROM kernels k
+                 JOIN downloads d ON d.id = k.download_id
+                 WHERE k.registry_id = ?1 AND k.download_id IS NOT NULL",
+                params![kernel_id],
+                |row| {
+                    Ok((
+                        PathBuf::from(row.get::<_, String>(0)?),
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                    ))
+                },
+            )
+            .optional()?;
+        local_artifact_from_row(row, "kernel", kernel_id)
+    }
+
+    fn resolve_distribution_image(
+        &self,
+        distribution_id: &str,
+        image_id: &str,
+    ) -> Result<LocalArtifact, SdkError> {
+        let connection = self.connection()?;
+        let row = connection
+            .query_row(
+                "SELECT d.absolute_path, d.actual_size_bytes, d.actual_sha256,
+                        d.expected_size_bytes, d.expected_sha256, d.verification_status
+                 FROM distribution_images di
+                 JOIN distributions dist ON dist.id = di.distribution_id
+                 JOIN downloads d ON d.id = di.download_id
+                 WHERE dist.registry_id = ?1 AND di.registry_id = ?2
+                   AND di.download_id IS NOT NULL",
+                params![distribution_id, image_id],
+                |row| {
+                    Ok((
+                        PathBuf::from(row.get::<_, String>(0)?),
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                    ))
+                },
+            )
+            .optional()?;
+        local_artifact_from_row(row, "distribution image", image_id)
+    }
+
+    fn list_installed_binaries(&self) -> Result<Vec<InstalledBinary>, SdkError> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT bp.registry_id, bf.component_name, bp.version, bp.architecture,
+                    d.absolute_path, d.actual_size_bytes, d.actual_sha256, bf.executable,
+                    d.expected_size_bytes, d.expected_sha256, d.verification_status
+             FROM binary_packages bp
+             JOIN binary_files bf ON bf.binary_package_id = bp.id
+             JOIN downloads d ON d.id = bf.download_id
+             ORDER BY bp.registry_id, bf.component_name",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                PathBuf::from(row.get::<_, String>(4)?),
+                row.get::<_, i64>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, i64>(7)?,
+                row.get::<_, i64>(8)?,
+                row.get::<_, String>(9)?,
+                row.get::<_, String>(10)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let (
+                package_id,
+                component_name,
+                version,
+                architecture,
+                path,
+                actual_size,
+                actual_sha256,
+                executable,
+                expected_size,
+                expected_sha256,
+                status,
+            ) = row?;
+            let actual_size = u64::try_from(actual_size)
+                .map_err(|_| SdkError::Migration("negative binary size in inventory".to_owned()))?;
+            let expected_size = u64::try_from(expected_size).map_err(|_| {
+                SdkError::Migration("negative expected binary size in inventory".to_owned())
+            })?;
+            if status != "verified"
+                || actual_size != expected_size
+                || actual_sha256 != expected_sha256
+            {
+                return Err(SdkError::StaleBinary {
+                    package_id,
+                    component_name,
+                    path,
+                });
+            }
+            Ok(InstalledBinary {
+                package_id,
+                component_name,
+                version,
+                architecture: parse_architecture(&architecture)?,
+                path,
+                size_bytes: actual_size,
+                sha256: actual_sha256,
+                executable: executable != 0,
+            })
+        })
+        .collect()
+    }
+}
+
+impl MicroVmRepository for SqliteRepository {
+    fn find_microvm(&self, name: &str) -> Result<Option<StoredMicroVm>, SdkError> {
+        let connection = self.connection()?;
+        let row = connection
+            .query_row(
+                "SELECT id, name, state, distribution_id, image_id, kernel_id,
+                        firecracker_package_id, firectl_package_id, disk_size_bytes,
+                        memory_requested_bytes, memory_effective_mib, vcpu_count,
+                        volume_path, rootfs_path, socket_path, expose_on_lan,
+                        created_at, updated_at
+                 FROM microvms WHERE name = ?1",
+                params![name],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, String>(7)?,
+                        row.get::<_, i64>(8)?,
+                        row.get::<_, i64>(9)?,
+                        row.get::<_, i64>(10)?,
+                        row.get::<_, i64>(11)?,
+                        PathBuf::from(row.get::<_, String>(12)?),
+                        PathBuf::from(row.get::<_, String>(13)?),
+                        PathBuf::from(row.get::<_, String>(14)?),
+                        row.get::<_, i64>(15)?,
+                        row.get::<_, i64>(16)?,
+                        row.get::<_, i64>(17)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let record = record_from_row(row)?;
+        let network = load_network_record(&connection, record.id)?;
+        let credential = load_credential_record(&connection, record.id)?;
+        let runtime = load_runtime_record(&connection, record.id)?;
+        Ok(Some(StoredMicroVm {
+            record,
+            network,
+            credential,
+            runtime,
+        }))
+    }
+
+    fn find_volume_owner(&self, volume_path: &Path) -> Result<Option<String>, SdkError> {
+        let connection = self.connection()?;
+        connection
+            .query_row(
+                "SELECT name FROM microvms WHERE volume_path = ?1",
+                params![volume_path.to_string_lossy().into_owned()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(SdkError::from)
+    }
+
+    fn list_host_only_networks(&self) -> Result<Vec<(String, IpAddr, String)>, SdkError> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT m.name, n.guest_ip, n.tap_name
+             FROM microvms m JOIN vm_networks n ON n.microvm_id = m.id
+             WHERE n.mode = 'host_only'",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let (name, address, tap) = row?;
+            let address = address.parse::<IpAddr>().map_err(|error| {
+                SdkError::Migration(format!("invalid persisted guest IP for {name}: {error}"))
+            })?;
+            Ok((name, address, tap))
+        })
+        .collect()
+    }
+
+    fn insert_creating(&self, record: &MicroVmRecord) -> Result<i64, SdkError> {
+        let connection = self.connection()?;
+        connection.execute(
+            "INSERT INTO microvms (
+                name, state, distribution_id, image_id, kernel_id,
+                firecracker_package_id, firectl_package_id, disk_size_bytes,
+                memory_requested_bytes, memory_effective_mib, vcpu_count,
+                volume_path, rootfs_path, socket_path, expose_on_lan, created_at, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?16)",
+            params![
+                record.name,
+                record.state.as_str(),
+                record.distribution_id,
+                record.image_id,
+                record.kernel_id,
+                record.firecracker_package_id,
+                record.firectl_package_id,
+                to_sqlite_integer(record.disk_size_bytes, "VM disk size")?,
+                to_sqlite_integer(record.memory_bytes, "VM memory")?,
+                to_sqlite_integer(record.memory_effective_mib, "VM effective memory")?,
+                i64::from(record.vcpu_count),
+                record.volume_path.to_string_lossy().into_owned(),
+                record.rootfs_path.to_string_lossy().into_owned(),
+                record.socket_path.to_string_lossy().into_owned(),
+                bool_to_sqlite(record.expose_on_lan),
+                record.created_at,
+            ],
+        )?;
+        Ok(connection.last_insert_rowid())
+    }
+
+    fn persist_network(&self, vm_id: i64, network: &PersistedNetwork) -> Result<(), SdkError> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        persist_network_transaction(&transaction, vm_id, network)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn persist_credential(
+        &self,
+        vm_id: i64,
+        credential: &PersistedCredential,
+    ) -> Result<(), SdkError> {
+        let connection = self.connection()?;
+        connection.execute(
+            "INSERT INTO vm_credentials (
+                microvm_id, private_key_path, public_key_path, guest_authorized_keys_path,
+                key_type, ssh_user, ssh_port, public_key_fingerprint, file_mode
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            ON CONFLICT(microvm_id) DO UPDATE SET
+                private_key_path = excluded.private_key_path,
+                public_key_path = excluded.public_key_path,
+                guest_authorized_keys_path = excluded.guest_authorized_keys_path,
+                key_type = excluded.key_type,
+                ssh_user = excluded.ssh_user,
+                ssh_port = excluded.ssh_port,
+                public_key_fingerprint = excluded.public_key_fingerprint,
+                file_mode = excluded.file_mode",
+            params![
+                vm_id,
+                credential.private_key_path.to_string_lossy().into_owned(),
+                credential.public_key_path.to_string_lossy().into_owned(),
+                credential.guest_authorized_keys_path,
+                credential.key_type,
+                credential.ssh_user,
+                i64::from(credential.ssh_port),
+                credential.public_key_fingerprint,
+                credential.file_mode,
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn persist_runtime(&self, vm_id: i64, runtime: &PersistedRuntime) -> Result<(), SdkError> {
+        let connection = self.connection()?;
+        connection.execute(
+            "INSERT INTO vm_runtime (
+                microvm_id, firecracker_path, firectl_path, socket_path,
+                process_id, process_state, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            ON CONFLICT(microvm_id) DO UPDATE SET
+                firecracker_path = excluded.firecracker_path,
+                firectl_path = excluded.firectl_path,
+                socket_path = excluded.socket_path,
+                process_id = excluded.process_id,
+                process_state = excluded.process_state,
+                updated_at = excluded.updated_at",
+            params![
+                vm_id,
+                runtime.firecracker_path.to_string_lossy().into_owned(),
+                runtime.firectl_path.to_string_lossy().into_owned(),
+                runtime.socket_path.to_string_lossy().into_owned(),
+                runtime.process_id.map(i64::from),
+                runtime.process_state,
+                unix_timestamp()?,
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn update_state(&self, vm_id: i64, state: MicroVmState) -> Result<(), SdkError> {
+        let connection = self.connection()?;
+        connection.execute(
+            "UPDATE microvms SET state = ?1, updated_at = ?2 WHERE id = ?3",
+            params![state.as_str(), unix_timestamp()?, vm_id],
+        )?;
+        Ok(())
+    }
+
+    fn delete_microvm(&self, vm_id: i64) -> Result<(), SdkError> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        transaction.execute("DELETE FROM microvms WHERE id = ?1", params![vm_id])?;
+        transaction.execute(
+            "UPDATE network_bridges
+             SET reference_count = (
+                 SELECT COUNT(*) FROM vm_networks WHERE bridge_id = network_bridges.id
+             ), updated_at = ?1",
+            params![unix_timestamp()?],
+        )?;
+        transaction.execute(
+            "DELETE FROM network_bridges
+             WHERE reference_count = 0 AND ownership = 'sdk:taumaru'",
+            [],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn update_network(&self, vm_id: i64, network: &PersistedNetwork) -> Result<(), SdkError> {
+        self.persist_network(vm_id, network)
+    }
+
+    fn bridge_has_other_references(
+        &self,
+        vm_id: i64,
+        bridge_name: &str,
+        uplink_name: &str,
+    ) -> Result<bool, SdkError> {
+        let connection = self.connection()?;
+        let referenced: i64 = connection.query_row(
+            "SELECT EXISTS(
+                SELECT 1
+                FROM vm_networks n
+                JOIN network_bridges b ON b.id = n.bridge_id
+                WHERE n.microvm_id != ?1
+                  AND b.bridge_name = ?2
+                  AND b.uplink_name = ?3
+                  AND b.ownership = 'sdk:taumaru'
+            )",
+            params![vm_id, bridge_name, uplink_name],
+            |row| row.get(0),
+        )?;
+        Ok(referenced != 0)
+    }
+
+    fn bridge_is_managed(&self, bridge_name: &str, uplink_name: &str) -> Result<bool, SdkError> {
+        let connection = self.connection()?;
+        let managed: i64 = connection.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM network_bridges
+                WHERE bridge_name = ?1
+                  AND uplink_name = ?2
+                  AND ownership = 'sdk:taumaru'
+            )",
+            params![bridge_name, uplink_name],
+            |row| row.get(0),
+        )?;
+        Ok(managed != 0)
+    }
+
+    fn load_network(&self, vm_id: i64) -> Result<NetworkConfiguration, SdkError> {
+        let connection = self.connection()?;
+        Ok(load_network_record(&connection, vm_id)?.config)
+    }
+}
+
+type MicroVmRow = (
+    i64,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    i64,
+    i64,
+    i64,
+    i64,
+    PathBuf,
+    PathBuf,
+    PathBuf,
+    i64,
+    i64,
+    i64,
+);
+
+fn record_from_row(row: MicroVmRow) -> Result<MicroVmRecord, SdkError> {
+    let (
+        id,
+        name,
+        state,
+        distribution_id,
+        image_id,
+        kernel_id,
+        firecracker_package_id,
+        firectl_package_id,
+        disk_size_bytes,
+        memory_bytes,
+        memory_effective_mib,
+        vcpu_count,
+        volume_path,
+        rootfs_path,
+        socket_path,
+        expose_on_lan,
+        created_at,
+        _updated_at,
+    ) = row;
+    let state = MicroVmState::parse(&state)
+        .ok_or_else(|| SdkError::Migration(format!("unknown persisted VM state {state}")))?;
+    let disk_size_bytes = from_sqlite_integer(disk_size_bytes, "VM disk size")?;
+    let memory_bytes = from_sqlite_integer(memory_bytes, "VM memory")?;
+    let memory_effective_mib = from_sqlite_integer(memory_effective_mib, "VM effective memory")?;
+    let vcpu_count = u32::try_from(vcpu_count)
+        .map_err(|_| SdkError::Migration("persisted vCPU count is invalid".to_owned()))?;
+    Ok(MicroVmRecord {
+        id,
+        name,
+        state,
+        distribution_id,
+        image_id,
+        kernel_id,
+        firecracker_package_id,
+        firectl_package_id,
+        disk_size_bytes,
+        memory_bytes,
+        memory_effective_mib,
+        vcpu_count,
+        volume_path,
+        rootfs_path,
+        socket_path,
+        expose_on_lan: expose_on_lan != 0,
+        created_at,
+    })
+}
+
+fn load_network_record(connection: &Connection, vm_id: i64) -> Result<PersistedNetwork, SdkError> {
+    let row = connection
+        .query_row(
+            "SELECT n.mode, n.guest_ip, n.prefix_length, n.gateway_ip, n.host_ip,
+                    n.tap_name, n.guest_mac, n.bridge_id, b.bridge_name, n.uplink_name,
+                    n.dhcp_lease_reference, n.desired_boot_parameters,
+                    n.bridge_created_by_sdk, n.uplink_attached_by_sdk,
+                    n.forwarding_enabled_by_sdk, n.nat_table_created_by_sdk,
+                    n.nat_chain_created_by_sdk, n.host_address_specs,
+                    n.default_route_specs
+             FROM vm_networks n
+             LEFT JOIN network_bridges b ON b.id = n.bridge_id
+             WHERE n.microvm_id = ?1",
+            params![vm_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, Option<i64>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, Option<String>>(9)?,
+                    row.get::<_, Option<String>>(10)?,
+                    row.get::<_, String>(11)?,
+                    row.get::<_, i64>(12)?,
+                    row.get::<_, i64>(13)?,
+                    row.get::<_, i64>(14)?,
+                    row.get::<_, i64>(15)?,
+                    row.get::<_, i64>(16)?,
+                    row.get::<_, String>(17)?,
+                    row.get::<_, String>(18)?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or_else(|| SdkError::Migration(format!("network record is missing for VM {vm_id}")))?;
+    let (
+        mode,
+        guest_ip,
+        prefix_length,
+        gateway_ip,
+        host_ip,
+        tap_name,
+        guest_mac,
+        _bridge_id,
+        bridge_name,
+        uplink_name,
+        dhcp_lease_reference,
+        desired_boot_parameters,
+        bridge_created_by_sdk,
+        uplink_attached_by_sdk,
+        forwarding_enabled_by_sdk,
+        nat_table_created_by_sdk,
+        nat_chain_created_by_sdk,
+        host_address_specs,
+        default_route_specs,
+    ) = row;
+    let mode = NetworkMode::parse(&mode)
+        .ok_or_else(|| SdkError::Migration(format!("unknown persisted network mode {mode}")))?;
+    let config = NetworkConfiguration {
+        mode,
+        guest_address: parse_ip(&guest_ip, "guest IP")?,
+        prefix_length: u8::try_from(prefix_length)
+            .map_err(|_| SdkError::Migration("persisted network prefix is invalid".to_owned()))?,
+        gateway: parse_optional_ip(gateway_ip.as_deref(), "gateway IP")?,
+        tap_name,
+        bridge_name,
+        uplink_name,
+    };
+
+    let mut statement = connection.prepare(
+        "SELECT resource_kind, resource_identity, desired_fingerprint, ownership,
+                adapter_handle, last_observed
+         FROM vm_network_resources WHERE microvm_id = ?1 ORDER BY id",
+    )?;
+    let resources = statement
+        .query_map(params![vm_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, String>(5)?,
+            ))
+        })?
+        .map(|row| {
+            let (resource, identity, fingerprint, ownership, adapter_handle, last_observed) = row?;
+            let resource = NetworkResource::parse(&resource).ok_or_else(|| {
+                SdkError::Migration(format!("unknown persisted network resource {resource}"))
+            })?;
+            Ok(PersistedNetworkResource {
+                resource,
+                identity,
+                fingerprint,
+                ownership,
+                adapter_handle,
+                last_observed,
+            })
+        })
+        .collect::<Result<Vec<_>, SdkError>>()?;
+
+    Ok(PersistedNetwork {
+        config,
+        host_address: parse_optional_ip(host_ip.as_deref(), "host IP")?,
+        guest_mac,
+        dhcp_lease_reference,
+        desired_boot_parameters,
+        bridge_created_by_sdk: bridge_created_by_sdk != 0,
+        uplink_attached_by_sdk: uplink_attached_by_sdk != 0,
+        forwarding_enabled_by_sdk: forwarding_enabled_by_sdk != 0,
+        nat_table_created_by_sdk: nat_table_created_by_sdk != 0,
+        nat_chain_created_by_sdk: nat_chain_created_by_sdk != 0,
+        host_address_specs: serde_json::from_str(&host_address_specs).map_err(|error| {
+            SdkError::Migration(format!("invalid persisted host address state: {error}"))
+        })?,
+        default_route_specs: serde_json::from_str(&default_route_specs).map_err(|error| {
+            SdkError::Migration(format!("invalid persisted default route state: {error}"))
+        })?,
+        resources,
+    })
+}
+
+fn load_credential_record(
+    connection: &Connection,
+    vm_id: i64,
+) -> Result<PersistedCredential, SdkError> {
+    let row = connection
+        .query_row(
+            "SELECT private_key_path, public_key_path, guest_authorized_keys_path,
+                    key_type, ssh_user, ssh_port, public_key_fingerprint, file_mode
+             FROM vm_credentials WHERE microvm_id = ?1",
+            params![vm_id],
+            |row| {
+                Ok((
+                    PathBuf::from(row.get::<_, String>(0)?),
+                    PathBuf::from(row.get::<_, String>(1)?),
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or_else(|| {
+            SdkError::Migration(format!("credential record is missing for VM {vm_id}"))
+        })?;
+    let (private_key_path, public_key_path, guest_path, key_type, user, port, fingerprint, mode) =
+        row;
+    Ok(PersistedCredential {
+        private_key_path,
+        public_key_path,
+        guest_authorized_keys_path: guest_path,
+        key_type,
+        ssh_user: user,
+        ssh_port: u16::try_from(port)
+            .map_err(|_| SdkError::Migration("persisted SSH port is invalid".to_owned()))?,
+        public_key_fingerprint: fingerprint,
+        file_mode: mode,
+    })
+}
+
+fn load_runtime_record(connection: &Connection, vm_id: i64) -> Result<PersistedRuntime, SdkError> {
+    let row = connection
+        .query_row(
+            "SELECT firecracker_path, firectl_path, socket_path, process_id, process_state
+             FROM vm_runtime WHERE microvm_id = ?1",
+            params![vm_id],
+            |row| {
+                Ok((
+                    PathBuf::from(row.get::<_, String>(0)?),
+                    PathBuf::from(row.get::<_, String>(1)?),
+                    PathBuf::from(row.get::<_, String>(2)?),
+                    row.get::<_, Option<i64>>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or_else(|| SdkError::Migration(format!("runtime record is missing for VM {vm_id}")))?;
+    let (firecracker_path, firectl_path, socket_path, process_id, process_state) = row;
+    Ok(PersistedRuntime {
+        firecracker_path,
+        firectl_path,
+        socket_path,
+        process_id: process_id
+            .map(|value| {
+                u32::try_from(value)
+                    .map_err(|_| SdkError::Migration("persisted process ID is invalid".to_owned()))
+            })
+            .transpose()?,
+        process_state,
+    })
+}
+
+fn persist_network_transaction(
+    transaction: &Transaction<'_>,
+    vm_id: i64,
+    network: &PersistedNetwork,
+) -> Result<(), SdkError> {
+    let previous_bridge_id: Option<i64> = transaction
+        .query_row(
+            "SELECT bridge_id FROM vm_networks WHERE microvm_id = ?1",
+            params![vm_id],
+            |row| row.get::<_, Option<i64>>(0),
+        )
+        .optional()?
+        .flatten();
+    let bridge_id = match (&network.config.bridge_name, &network.config.uplink_name) {
+        (Some(bridge_name), Some(uplink_name)) => {
+            let existing = transaction
+                .query_row(
+                    "SELECT id, ownership FROM network_bridges
+                     WHERE bridge_name = ?1 AND uplink_name = ?2",
+                    params![bridge_name, uplink_name],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+                )
+                .optional()?;
+            match existing {
+                Some((id, ownership)) if ownership == "sdk:taumaru" => Some(id),
+                Some((_id, ownership)) => {
+                    return Err(SdkError::Network {
+                        mode: network.config.mode.to_string(),
+                        operation: "persist bridge ownership".to_owned(),
+                        resource: bridge_name.clone(),
+                        reason: format!("bridge is owned by {ownership}"),
+                    });
+                }
+                None => {
+                    transaction.execute(
+                        "INSERT INTO network_bridges (
+                            bridge_name, uplink_name, ownership, reference_count,
+                            created_at, updated_at
+                        ) VALUES (?1, ?2, 'sdk:taumaru', 0, ?3, ?3)",
+                        params![bridge_name, uplink_name, unix_timestamp()?],
+                    )?;
+                    Some(transaction.last_insert_rowid())
+                }
+            }
+        }
+        (None, None) => None,
+        _ => {
+            return Err(SdkError::Network {
+                mode: network.config.mode.to_string(),
+                operation: "persist network configuration".to_owned(),
+                resource: "bridge/uplink".to_owned(),
+                reason: "LAN configuration must include both bridge and uplink".to_owned(),
+            });
+        }
+    };
+    let guest_ip = network.config.guest_address.to_string();
+    let gateway_ip = network.config.gateway.map(|value| value.to_string());
+    let host_ip = network.host_address.map(|value| value.to_string());
+    transaction.execute(
+        "INSERT INTO vm_networks (
+            microvm_id, mode, guest_ip, prefix_length, gateway_ip, host_ip,
+            tap_name, guest_mac, bridge_id, uplink_name, dhcp_lease_reference,
+            desired_boot_parameters, bridge_created_by_sdk, uplink_attached_by_sdk,
+            forwarding_enabled_by_sdk, nat_table_created_by_sdk, nat_chain_created_by_sdk,
+            host_address_specs, default_route_specs, updated_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)
+        ON CONFLICT(microvm_id) DO UPDATE SET
+            mode = excluded.mode,
+            guest_ip = excluded.guest_ip,
+            prefix_length = excluded.prefix_length,
+            gateway_ip = excluded.gateway_ip,
+            host_ip = excluded.host_ip,
+            tap_name = excluded.tap_name,
+            guest_mac = excluded.guest_mac,
+            bridge_id = excluded.bridge_id,
+            uplink_name = excluded.uplink_name,
+            dhcp_lease_reference = excluded.dhcp_lease_reference,
+            desired_boot_parameters = excluded.desired_boot_parameters,
+            bridge_created_by_sdk = excluded.bridge_created_by_sdk,
+            uplink_attached_by_sdk = excluded.uplink_attached_by_sdk,
+            forwarding_enabled_by_sdk = excluded.forwarding_enabled_by_sdk,
+            nat_table_created_by_sdk = excluded.nat_table_created_by_sdk,
+            nat_chain_created_by_sdk = excluded.nat_chain_created_by_sdk,
+            host_address_specs = excluded.host_address_specs,
+            default_route_specs = excluded.default_route_specs,
+            updated_at = excluded.updated_at",
+        params![
+            vm_id,
+            network.config.mode.as_str(),
+            guest_ip,
+            i64::from(network.config.prefix_length),
+            gateway_ip,
+            host_ip,
+            network.config.tap_name,
+            network.guest_mac,
+            bridge_id,
+            network.config.uplink_name,
+            network.dhcp_lease_reference,
+            network.desired_boot_parameters,
+            network.bridge_created_by_sdk,
+            network.uplink_attached_by_sdk,
+            network.forwarding_enabled_by_sdk,
+            network.nat_table_created_by_sdk,
+            network.nat_chain_created_by_sdk,
+            serde_json::to_string(&network.host_address_specs).map_err(|error| {
+                SdkError::Migration(format!("could not encode host address state: {error}"))
+            })?,
+            serde_json::to_string(&network.default_route_specs).map_err(|error| {
+                SdkError::Migration(format!("could not encode default route state: {error}"))
+            })?,
+            unix_timestamp()?,
+        ],
+    )?;
+    transaction.execute(
+        "DELETE FROM vm_network_resources WHERE microvm_id = ?1",
+        params![vm_id],
+    )?;
+    for resource in &network.resources {
+        transaction.execute(
+            "INSERT INTO vm_network_resources (
+                microvm_id, resource_kind, resource_identity, desired_fingerprint,
+                ownership, adapter_handle, last_observed
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                vm_id,
+                resource.resource.as_str(),
+                resource.identity,
+                resource.fingerprint,
+                resource.ownership,
+                resource.adapter_handle,
+                resource.last_observed,
+            ],
+        )?;
+    }
+    let now = unix_timestamp()?;
+    transaction.execute(
+        "UPDATE network_bridges
+         SET reference_count = (
+             SELECT COUNT(*) FROM vm_networks WHERE bridge_id = network_bridges.id
+         ), updated_at = ?1",
+        params![now],
+    )?;
+    if let Some(previous_bridge_id) = previous_bridge_id
+        && Some(previous_bridge_id) != bridge_id
+    {
+        transaction.execute(
+            "DELETE FROM network_bridges
+             WHERE id = ?1 AND reference_count = 0 AND ownership = 'sdk:taumaru'",
+            params![previous_bridge_id],
+        )?;
+    }
+    Ok(())
+}
+
+fn parse_ip(value: &str, field: &str) -> Result<IpAddr, SdkError> {
+    value
+        .parse()
+        .map_err(|error| SdkError::Migration(format!("invalid persisted {field} {value}: {error}")))
+}
+
+fn parse_optional_ip(value: Option<&str>, field: &str) -> Result<Option<IpAddr>, SdkError> {
+    value.map(|value| parse_ip(value, field)).transpose()
 }
 
 pub(crate) fn open_connection(database_path: &Path) -> Result<Connection, SdkError> {
@@ -552,6 +1392,37 @@ pub(crate) fn open_connection(database_path: &Path) -> Result<Connection, SdkErr
     connection.busy_timeout(SQLITE_BUSY_TIMEOUT)?;
     connection.execute_batch("PRAGMA foreign_keys = ON;")?;
     Ok(connection)
+}
+
+fn local_artifact_from_row(
+    row: Option<(PathBuf, i64, String, i64, String, String)>,
+    kind: &str,
+    id: &str,
+) -> Result<LocalArtifact, SdkError> {
+    let Some((path, actual_size, actual_sha256, expected_size, expected_sha256, status)) = row
+    else {
+        return Err(SdkError::NotFound {
+            kind: kind.to_owned(),
+            id: id.to_owned(),
+        });
+    };
+    let actual_size = u64::try_from(actual_size)
+        .map_err(|_| SdkError::Migration(format!("negative {kind} size in inventory")))?;
+    let expected_size = u64::try_from(expected_size)
+        .map_err(|_| SdkError::Migration(format!("negative {kind} expected size in inventory")))?;
+    if status != "verified" || actual_size != expected_size || actual_sha256 != expected_sha256 {
+        return Err(SdkError::ArtifactPrerequisite {
+            kind: kind.to_owned(),
+            id: id.to_owned(),
+            path,
+            reason: "the local inventory entry is stale".to_owned(),
+        });
+    }
+    Ok(LocalArtifact {
+        path,
+        size_bytes: actual_size,
+        sha256: actual_sha256,
+    })
 }
 
 fn persist_download(
@@ -919,6 +1790,11 @@ fn unix_timestamp() -> Result<i64, SdkError> {
 fn to_sqlite_integer(value: u64, context: &str) -> Result<i64, SdkError> {
     i64::try_from(value)
         .map_err(|_| SdkError::invalid_metadata(context, "value exceeds SQLite INTEGER"))
+}
+
+fn from_sqlite_integer(value: i64, context: &str) -> Result<u64, SdkError> {
+    u64::try_from(value)
+        .map_err(|_| SdkError::Migration(format!("negative {context} stored in SQLite")))
 }
 
 fn bool_to_sqlite(value: bool) -> i64 {

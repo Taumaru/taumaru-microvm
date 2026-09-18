@@ -19,7 +19,7 @@ async fn lists_all_registry_collections_and_nested_members()
     let distributions = sdk.list_distributions().await?;
 
     assert_eq!(kernels.len(), 2);
-    assert_eq!(binaries.len(), 2);
+    assert_eq!(binaries.len(), 3);
     assert_eq!(binaries[0].files.len(), 2);
     assert_eq!(distributions.len(), 1);
     assert_eq!(distributions[0].images.len(), 2);

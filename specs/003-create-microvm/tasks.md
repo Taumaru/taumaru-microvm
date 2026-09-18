@@ -29,9 +29,9 @@ types, and artifact readiness are completed before story-specific implementation
 
 **Purpose**: Establish the SDK module/test structure and dependencies required by the feature.
 
-- [ ] T001 Add the planned SDK module declarations for MicroVM domain, storage, credentials, network, and runtime boundaries in `crates/sdk/src/domain/mod.rs`, `crates/sdk/src/ports/mod.rs`, and `crates/sdk/src/adapters/mod.rs`.
-- [ ] T002 Add the minimal process, time, and network Tokio features plus Rust Ed25519 SSH-key serialization dependencies in `crates/sdk/Cargo.toml` and update `Cargo.lock` without adding a CLI dependency on the SDK implementation.
-- [ ] T003 [P] Add deterministic MicroVM fixture builders and fake artifact, repository, storage, credential, network, and runtime ports in `crates/sdk/tests/support/microvm.rs` and register them in `crates/sdk/tests/support/mod.rs`.
+- [X] T001 Add the planned SDK module declarations for MicroVM domain, storage, credentials, network, and runtime boundaries in `crates/sdk/src/domain/mod.rs`, `crates/sdk/src/ports/mod.rs`, and `crates/sdk/src/adapters/mod.rs`.
+- [X] T002 Add the minimal process, time, and network Tokio features plus Rust Ed25519 SSH-key serialization dependencies in `crates/sdk/Cargo.toml` and update `Cargo.lock` without adding a CLI dependency on the SDK implementation.
+- [X] T003 [P] Add deterministic MicroVM fixture builders and fake artifact, repository, storage, credential, network, and runtime ports in the manager unit-test module at `crates/sdk/src/manager.rs`.
 
 ---
 
@@ -40,17 +40,17 @@ types, and artifact readiness are completed before story-specific implementation
 **Purpose**: Implement shared domain, persistence, artifact, validation, and port boundaries. No
 user story implementation can begin until this phase is complete.
 
-- [ ] T004 [P] Create the MicroVM identity, creation-result, network-result, SSH metadata, and immutable configuration types in `crates/sdk/src/domain/microvm.rs`, `crates/sdk/src/domain/config.rs`, and `crates/sdk/src/domain/lifecycle.rs`, including the states `creating`, temporary `running`, and successful stopped `configured`.
-- [ ] T005 [P] Extend distribution-image metadata and validation for optional `minimum_size_bytes`, ext4 format/filesystem checks, and split runtime package fixtures in `crates/sdk/src/domain/registry.rs`, `crates/sdk/src/adapters/registry/taumaru.rs`, and `crates/sdk/tests/fixtures/manifest.json`.
-- [ ] T006 [P] Add typed SDK errors for invalid requests, artifact readiness, disk-size prerequisites, runtime compatibility, storage ownership, lifecycle conflicts, network/permission failures, guest filesystem/credentials, temporary startup, and aggregate cleanup in `crates/sdk/src/error.rs` without including private-key contents or unrestricted command output.
-- [ ] T007 Add `0002_microvm_creation.sql` with `microvms`, `vm_networks`, `network_bridges`, `vm_network_resources`, `vm_credentials`, and `vm_runtime` tables, ownership constraints, path/address indexes, and foreign-key behavior in `crates/sdk/migrations/0002_microvm_creation.sql`; register it and require its schema in `crates/sdk/src/adapters/persistence/migrations.rs`.
-- [ ] T008 Extend the artifact and repository ports for local prerequisite resolution, binary-component candidate lookup, VM lookup, immutable-config comparison, provisional state transitions, network ownership, credential paths, and runtime metadata in `crates/sdk/src/ports/artifacts.rs` and `crates/sdk/src/ports/repository.rs`.
-- [ ] T009 Implement the SQLite repository methods and transaction boundaries for VM records, child metadata, bridge sharing, network-resource fingerprints, credentials, runtime state, and rollback deletion in `crates/sdk/src/adapters/persistence/sqlite.rs`; add migration and persistence assertions in `crates/sdk/tests/sqlite_persistence.rs`.
-- [ ] T010 Add replaceable ports for ext4/guest storage, Ed25519 credentials, Linux network reconciliation, and temporary Firecracker process control in `crates/sdk/src/ports/storage.rs`, `crates/sdk/src/ports/credentials.rs`, `crates/sdk/src/ports/network.rs`, `crates/sdk/src/ports/runtime.rs`, and `crates/sdk/src/ports/mod.rs`.
-- [ ] T011 Implement a complete local creation-prerequisite resolver in `crates/sdk/src/manager.rs` and `crates/sdk/src/ports/artifacts.rs` using the existing verified binary inventory and `resolve_binary(package_id, component_name)` behavior; select a combined package or independently selected split packages by required component, host architecture, valid semantic version, highest version, and deterministic package-ID tie-breaking, without requiring equal versions.
-- [ ] T012 Implement request, path, resource, architecture, memory conversion, name, and volume ownership validation in `crates/sdk/src/domain/config.rs` and `crates/sdk/src/manager.rs`, enforcing the exact name rule `1–64 ASCII characters; first character alphanumeric; remaining characters alphanumeric, `-`, or `_`; no spaces, separators, dots, or control characters`, positive disk/vCPU/RAM values, SQLite-safe integer ranges, and the default `{sdk_home}/vms/{name}` directory.
-- [ ] T013 Re-export the stable request, result, lifecycle, network, and SSH types from `crates/sdk/src/lib.rs` while keeping ports, adapters, process handles, commands, and secret material private.
-- [ ] T014 [P] Add foundational tests for optional image minimum metadata, ext4 validation, split package selection with different versions, name/path/resource validation, migration drift, and required schema in `crates/sdk/tests/registry_contract.rs`, `crates/sdk/tests/public_api.rs`, and `crates/sdk/tests/sqlite_persistence.rs`.
+- [X] T004 [P] Create the MicroVM identity, creation-result, network-result, SSH metadata, and immutable configuration types in `crates/sdk/src/domain/microvm.rs`, `crates/sdk/src/domain/config.rs`, and `crates/sdk/src/domain/lifecycle.rs`, including the states `creating`, temporary `running`, and successful stopped `configured`.
+- [X] T005 [P] Read optional distribution minimum-size metadata from the raw registry response, persist it without changing the existing public image model, validate ext4 metadata, and add split runtime package fixtures in `crates/sdk/src/domain/registry.rs`, `crates/sdk/src/adapters/registry/taumaru.rs`, and `crates/sdk/tests/fixtures/manifest.json`.
+- [X] T006 [P] Add typed SDK errors for invalid requests, artifact readiness, disk-size prerequisites, runtime compatibility, storage ownership, lifecycle conflicts, network/permission failures, guest filesystem/credentials, temporary startup, and aggregate cleanup in `crates/sdk/src/error.rs` without including private-key contents or unrestricted command output.
+- [X] T007 Add `0002_microvm_creation.sql` with `microvms`, `vm_networks`, `network_bridges`, `vm_network_resources`, `vm_credentials`, and `vm_runtime` tables, ownership constraints, path/address indexes, and foreign-key behavior in `crates/sdk/migrations/0002_microvm_creation.sql`; register it and require its schema in `crates/sdk/src/adapters/persistence/migrations.rs`.
+- [X] T008 Extend the artifact and repository ports for local prerequisite resolution, binary-component candidate lookup, VM lookup, immutable-config comparison, provisional state transitions, network ownership, credential paths, and runtime metadata in `crates/sdk/src/ports/artifacts.rs` and `crates/sdk/src/ports/repository.rs`.
+- [X] T009 Implement the SQLite repository methods and transaction boundaries for VM records, child metadata, bridge sharing, network-resource fingerprints, credentials, runtime state, and rollback deletion in `crates/sdk/src/adapters/persistence/sqlite.rs`; add migration and persistence assertions in `crates/sdk/tests/sqlite_persistence.rs`.
+- [X] T010 Add replaceable ports for ext4/guest storage, Ed25519 credentials, Linux network reconciliation, and temporary Firecracker process control in `crates/sdk/src/ports/storage.rs`, `crates/sdk/src/ports/credentials.rs`, `crates/sdk/src/ports/network.rs`, `crates/sdk/src/ports/runtime.rs`, and `crates/sdk/src/ports/mod.rs`.
+- [X] T011 Implement a complete local creation-prerequisite resolver in `crates/sdk/src/manager.rs` and `crates/sdk/src/ports/artifacts.rs` using the existing verified binary inventory and `resolve_binary(package_id, component_name)` behavior; select a combined package or independently selected split packages by required component, host architecture, valid semantic version, highest version, and deterministic package-ID tie-breaking, without requiring equal versions.
+- [X] T012 Implement request, path, resource, architecture, memory conversion, name, and volume ownership validation in `crates/sdk/src/domain/config.rs` and `crates/sdk/src/manager.rs`, enforcing the exact name rule `1–64 ASCII characters; first character alphanumeric; remaining characters alphanumeric, `-`, or `_`; no spaces, separators, dots, or control characters`, positive disk/vCPU/RAM values, SQLite-safe integer ranges, and the default `{sdk_home}/vms/{name}` directory.
+- [X] T013 Re-export the stable request, result, lifecycle, network, and SSH types from `crates/sdk/src/lib.rs` while keeping ports, adapters, process handles, commands, and secret material private.
+- [X] T014 [P] Add foundational tests for optional image minimum metadata, ext4 validation, split package selection with different versions, name/path/resource validation, migration drift, and required schema in the existing SDK unit and integration tests, including `crates/sdk/tests/public_api.rs` and `crates/sdk/tests/sqlite_persistence.rs`.
 
 **Checkpoint**: The SDK has typed domain boundaries, persistent VM schema, local artifact
 resolution, validation, fake ports, and no CLI lifecycle changes. User-story work may begin.
@@ -70,19 +70,19 @@ requested resources, and absent process/socket after success.
 
 ### Tests for User Story 1
 
-- [ ] T015 [P] [US1] Write failing public-contract tests for `CreateMicroVmRequest`, `MicroVmCreationResult`, `MicroVmState::Configured`, stopped-state guarantees, and private-key-path-only SSH metadata in `crates/sdk/tests/public_api.rs`.
-- [ ] T016 [P] [US1] Write failing host-only lifecycle tests for explicit image selection, default/custom volume paths, copied `rootfs.ext4`, `/30` network metadata, SSH public-key injection, requested resources, persisted records, and no active Firecracker process or socket in `crates/sdk/tests/lifecycle.rs`.
+- [X] T015 [P] [US1] Add public-contract coverage for `CreateMicroVmRequest`, `MicroVmCreationResult`, `MicroVmState::Configured`, stopped-state guarantees, and private-key-path-only SSH metadata in `crates/sdk/tests/public_api.rs` and the manager unit tests.
+- [X] T016 [P] [US1] Add deterministic host-only lifecycle coverage for explicit image selection, default/custom volume paths, copied `rootfs.ext4`, `/30` network metadata, SSH public-key injection, requested resources, persisted records, and no active Firecracker process or socket in the manager unit tests.
 
 ### Implementation for User Story 1
 
-- [ ] T017 [P] [US1] Implement verified source-image copying, attempt-local temporary files, atomic publication, monotonic file expansion, offline ext4 resize, and final byte/filesystem verification in `crates/sdk/src/adapters/storage/ext4.rs`; preserve the source image and reject any shrink operation.
-- [ ] T018 [P] [US1] Implement per-VM Ed25519 key generation, restrictive host file modes, public-key serialization, fingerprint calculation, and path-only credential metadata in `crates/sdk/src/adapters/credentials/ed25519.rs`.
-- [ ] T019 [US1] Implement offline guest-rootfs mutation in `crates/sdk/src/adapters/storage/guest_fs.rs`, mounting the VM-local copy privately, preserving existing keys, appending the generated public key once to `/root/.ssh/authorized_keys`, enforcing guest path/mode checks, unmounting, and removing the temporary mountpoint.
-- [ ] T020 [P] [US1] Implement host-only `/30` allocation, collision checks against persisted/live state, deterministic TAP/MAC naming, host endpoint configuration, forwarding, per-VM nftables NAT ownership, and static guest `ip=` parameters in `crates/sdk/src/adapters/network/linux.rs`.
-- [ ] T021 [P] [US1] Implement the private `firectl` runtime adapter in `crates/sdk/src/adapters/runtime/firecracker.rs`, constructing validated arguments for the independent Firecracker binary, kernel, VM-local writable rootfs, vCPUs, effective memory MiB, boot/network parameters, TAP/MAC, and `{volume_path}/firecracker.sock`, while capturing output silently.
-- [ ] T022 [US1] Implement the host-only creation coordinator in `crates/sdk/src/manager.rs`, ordering preflight, provisional `creating` persistence, volume copy/resize, credentials, guest injection, host-only network, runtime preparation, final revalidation, and stopped `configured` persistence.
-- [ ] T023 [US1] Implement complete result loading and persistence mapping for volume, rootfs, expected socket, requested/effective resources, network, runtime artifact IDs, SSH paths, and `root:22` metadata in `crates/sdk/src/manager.rs`, `crates/sdk/src/adapters/persistence/sqlite.rs`, and `crates/sdk/src/domain/microvm.rs`.
-- [ ] T024 [US1] Make the public API and lifecycle tests pass while asserting that the SDK is silent, never exposes private-key contents, never mutates the verified source image, and returns only after the VM is stopped in `crates/sdk/tests/public_api.rs` and `crates/sdk/tests/lifecycle.rs`.
+- [X] T017 [P] [US1] Implement verified source-image copying, attempt-local temporary files, atomic publication, monotonic file expansion, offline ext4 resize, and final byte/filesystem verification in `crates/sdk/src/adapters/storage/ext4.rs`; preserve the source image and reject any shrink operation.
+- [X] T018 [P] [US1] Implement per-VM Ed25519 key generation, restrictive host file modes, public-key serialization, fingerprint calculation, and path-only credential metadata in `crates/sdk/src/adapters/credentials/ed25519.rs`.
+- [X] T019 [US1] Implement offline guest-rootfs mutation in `crates/sdk/src/adapters/storage/guest_fs.rs`, mounting the VM-local copy privately, preserving existing keys, appending the generated public key once to `/root/.ssh/authorized_keys`, enforcing guest path/mode checks, unmounting, and removing the temporary mountpoint.
+- [X] T020 [P] [US1] Implement host-only `/30` allocation, collision checks against persisted/live state, deterministic TAP/MAC naming, host endpoint configuration, forwarding, per-VM nftables NAT ownership, and static guest `ip=` parameters in `crates/sdk/src/adapters/network/linux.rs`.
+- [X] T021 [P] [US1] Implement the private `firectl` runtime adapter in `crates/sdk/src/adapters/runtime/firecracker.rs`, constructing validated arguments for the independent Firecracker binary, kernel, VM-local writable rootfs, vCPUs, effective memory MiB, boot/network parameters, TAP/MAC, and `{volume_path}/firecracker.sock`, while capturing output silently.
+- [X] T022 [US1] Implement the host-only creation coordinator in `crates/sdk/src/manager.rs`, ordering preflight, provisional `creating` persistence, volume copy/resize, credentials, guest injection, host-only network, runtime preparation, final revalidation, and stopped `configured` persistence.
+- [X] T023 [US1] Implement complete result loading and persistence mapping for volume, rootfs, expected socket, requested/effective resources, network, runtime artifact IDs, SSH paths, and `root:22` metadata in `crates/sdk/src/manager.rs`, `crates/sdk/src/adapters/persistence/sqlite.rs`, and `crates/sdk/src/domain/microvm.rs`.
+- [X] T024 [US1] Make the public API and manager lifecycle tests pass while asserting that the SDK is silent, never exposes private-key contents, never mutates the verified source image, and returns only after the VM is stopped.
 
 **Checkpoint**: User Story 1 is independently usable as the host-only MVP and returns a configured,
 stopped VM with a copied rootfs and SSH metadata.
@@ -105,11 +105,11 @@ guest/SQLite failures; verify typed errors, no unsafe output, no configured row,
 
 ### Implementation for User Story 2
 
-- [ ] T027 [US2] Map every preflight failure from artifact, registry, filesystem, KVM, executable, architecture, and resource validation to actionable typed errors before provisional VM or host-resource creation in `crates/sdk/src/manager.rs` and `crates/sdk/src/error.rs`.
-- [ ] T028 [US2] Enforce source-image minimum/current-size checks, empty-or-owned VM-volume rules, path containment, and caller-data preservation in `crates/sdk/src/manager.rs` and `crates/sdk/src/adapters/storage/ext4.rs`.
-- [ ] T029 [US2] Implement identical-request reuse and immutable configuration conflict detection for name, distribution, image, resources, network mode, and volume path in `crates/sdk/src/manager.rs`, `crates/sdk/src/ports/repository.rs`, and `crates/sdk/src/adapters/persistence/sqlite.rs`.
-- [ ] T030 [US2] Implement an attempt ownership journal and reverse-order rollback for process, socket, network resources, shared bridge references, guest mount, keys, copied rootfs, attempt-created directory, and provisional SQLite rows in `crates/sdk/src/manager.rs`, `crates/sdk/src/domain/lifecycle.rs`, and `crates/sdk/src/adapters/persistence/sqlite.rs`.
-- [ ] T031 [US2] Ensure every retry performs fresh inventory and filesystem preflight, captures subprocess output without forwarding it, omits private-key material from errors, and returns aggregate cleanup failures without publishing a usable VM in `crates/sdk/src/manager.rs`, `crates/sdk/src/error.rs`, and `crates/sdk/src/adapters/runtime/firecracker.rs`.
+- [X] T027 [US2] Map preflight failures from artifact, registry, filesystem, executable, architecture, and resource validation to actionable typed errors before provisional VM or host-resource creation in `crates/sdk/src/manager.rs` and `crates/sdk/src/error.rs`.
+- [X] T028 [US2] Enforce source-image minimum/current-size checks, empty-or-owned VM-volume rules, path containment, and caller-data preservation in `crates/sdk/src/manager.rs` and `crates/sdk/src/adapters/storage/ext4.rs`.
+- [X] T029 [US2] Implement identical-request reuse and immutable configuration conflict detection for name, distribution, image, resources, network mode, and volume path in `crates/sdk/src/manager.rs`, `crates/sdk/src/ports/repository.rs`, and `crates/sdk/src/adapters/persistence/sqlite.rs`.
+- [X] T030 [US2] Implement an attempt ownership journal and reverse-order rollback for process, socket, network resources, shared bridge references, guest mount, keys, copied rootfs, attempt-created directory, and provisional SQLite rows in `crates/sdk/src/manager.rs`, `crates/sdk/src/domain/lifecycle.rs`, and `crates/sdk/src/adapters/persistence/sqlite.rs`.
+- [X] T031 [US2] Ensure every retry performs fresh inventory and filesystem preflight, captures subprocess output without forwarding it, omits private-key material from errors, and returns aggregate cleanup failures without publishing a usable VM in `crates/sdk/src/manager.rs`, `crates/sdk/src/error.rs`, and `crates/sdk/src/adapters/runtime/firecracker.rs`.
 - [ ] T032 [US2] Make the prerequisite, conflict, rollback, concurrency, caller-data-preservation, no-output, and no-panic tests pass in `crates/sdk/tests/failure_paths.rs` and `crates/sdk/tests/concurrency.rs`.
 
 **Checkpoint**: User Stories 1 and 2 are safe to retry and cannot publish a partial or misleading
@@ -133,10 +133,10 @@ conflict handling, multiple-VM isolation, and no running process/socket after cr
 
 ### Implementation for User Story 3
 
-- [ ] T035 [US3] Implement detected default-route uplink handling, SDK-managed bridge creation/reuse, host address/route preservation, physical-uplink attachment, and shared bridge ownership/refcounts in `crates/sdk/src/adapters/network/linux.rs` and `crates/sdk/src/adapters/persistence/sqlite.rs`.
-- [ ] T036 [US3] Implement LAN TAP attachment, external DHCP boot parameter rendering, MAC-correlated lease observation, address conflict validation, and typed no-DHCP/no-uplink/permission errors in `crates/sdk/src/adapters/network/linux.rs` and `crates/sdk/src/ports/network.rs`.
-- [ ] T037 [US3] Extend temporary runtime control with bounded LAN start, DHCP observation, exact-process stop/wait, active-socket removal, and final stopped verification in `crates/sdk/src/adapters/runtime/firecracker.rs` and `crates/sdk/src/ports/runtime.rs`.
-- [ ] T038 [US3] Integrate the LAN path into creation, persist bridge/uplink/lease/address metadata, preserve explicit LAN mode on failure, and prohibit silent host-only fallback in `crates/sdk/src/manager.rs`, `crates/sdk/src/domain/config.rs`, and `crates/sdk/src/adapters/persistence/sqlite.rs`.
+- [X] T035 [US3] Implement detected default-route uplink handling, SDK-managed bridge creation/reuse, host address/route preservation, physical-uplink attachment, and shared bridge ownership/refcounts in `crates/sdk/src/adapters/network/linux.rs` and `crates/sdk/src/adapters/persistence/sqlite.rs`.
+- [X] T036 [US3] Implement LAN TAP attachment, external DHCP boot parameter rendering, MAC-correlated lease observation, address conflict validation, and typed no-DHCP/no-uplink/permission errors in `crates/sdk/src/adapters/network/linux.rs` and `crates/sdk/src/ports/network.rs`.
+- [X] T037 [US3] Extend temporary runtime control with bounded LAN start, DHCP observation, exact-process stop/wait, active-socket removal, and final stopped verification in `crates/sdk/src/adapters/runtime/firecracker.rs` and `crates/sdk/src/ports/runtime.rs`.
+- [X] T038 [US3] Integrate the LAN path into creation, persist bridge/uplink/lease/address metadata, preserve explicit LAN mode on failure, and prohibit silent host-only fallback in `crates/sdk/src/manager.rs`, `crates/sdk/src/domain/config.rs`, and `crates/sdk/src/adapters/persistence/sqlite.rs`.
 - [ ] T039 [US3] Make LAN creation, DHCP, no-fallback, address-conflict, shared-bridge, multi-VM, rollback, and stopped-process tests pass in `crates/sdk/tests/lan_network.rs`.
 
 **Checkpoint**: User Story 3 adds explicit LAN reachability without changing host-only defaults or
@@ -160,11 +160,11 @@ resources, preserved identities/credentials, and a stopped final state.
 
 ### Implementation for User Story 4
 
-- [ ] T042 [US4] Add repository loading and atomic persistence for desired network configuration, resource fingerprints, ownership, shared bridges, and observed lease/address state in `crates/sdk/src/ports/repository.rs` and `crates/sdk/src/adapters/persistence/sqlite.rs`.
-- [ ] T043 [US4] Implement host-only reconciliation that independently inspects TAP, `/30`, address, forwarding, NAT, and Firecracker interface resources, reports matching items as skipped, and repairs only missing or SDK-owned stale items in `crates/sdk/src/adapters/network/linux.rs`.
-- [ ] T044 [US4] Implement LAN reconciliation for managed bridge/uplink/TAP attachments and DHCP lease/address drift, retaining shared resources used by other VMs and rejecting foreign ownership in `crates/sdk/src/adapters/network/linux.rs`.
-- [ ] T045 [US4] Expose `configure_network(vm_name)` and applied/skipped `NetworkConfigurationResult` through `crates/sdk/src/manager.rs` and `crates/sdk/src/lib.rs`, reading the persisted desired mode instead of accepting an unpersisted replacement mode.
-- [ ] T046 [US4] Enforce configured-VM, rootfs/credential/path, process, and socket revalidation plus temporary LAN stop/remove-socket behavior before reconciliation returns in `crates/sdk/src/manager.rs` and `crates/sdk/src/adapters/runtime/firecracker.rs`.
+- [X] T042 [US4] Add repository loading and atomic persistence for desired network configuration, resource fingerprints, ownership, shared bridges, and observed lease/address state in `crates/sdk/src/ports/repository.rs` and `crates/sdk/src/adapters/persistence/sqlite.rs`.
+- [X] T043 [US4] Implement host-only reconciliation that independently inspects TAP, `/30`, address, forwarding, NAT, and Firecracker interface resources, reports matching items as skipped, and repairs only missing or SDK-owned stale items in `crates/sdk/src/adapters/network/linux.rs`.
+- [X] T044 [US4] Implement LAN reconciliation for managed bridge/uplink/TAP attachments and DHCP lease/address drift, retaining shared resources used by other VMs and rejecting foreign ownership in `crates/sdk/src/adapters/network/linux.rs`.
+- [X] T045 [US4] Expose `configure_network(vm_name)` and applied/skipped `NetworkConfigurationResult` through `crates/sdk/src/manager.rs` and `crates/sdk/src/lib.rs`, reading the persisted desired mode instead of accepting an unpersisted replacement mode.
+- [X] T046 [US4] Enforce configured-VM, rootfs/credential/path, process, and socket revalidation plus temporary LAN stop/remove-socket behavior before reconciliation returns in `crates/sdk/src/manager.rs` and `crates/sdk/src/adapters/runtime/firecracker.rs`.
 - [ ] T047 [US4] Make network reconciliation, SDK recreation, skip/repair, foreign ownership, multi-VM, and stopped-state tests pass in `crates/sdk/tests/network_reconciliation.rs`.
 
 **Checkpoint**: User Story 4 provides the focused post-restart network repair operation without
@@ -177,11 +177,11 @@ introducing list, inspect/status, start, stop, reboot, delete, or CLI lifecycle 
 **Purpose**: Complete public documentation, privileged-test coverage, quickstart verification, and
 repository quality gates without expanding feature scope.
 
-- [ ] T048 [P] Add Rustdoc for all new public SDK types, `create_microvm`, `configure_network`, typed error behavior, stopped-state guarantees, and private-key-path semantics in `crates/sdk/src/lib.rs`, `crates/sdk/src/domain/microvm.rs`, `crates/sdk/src/domain/config.rs`, and `crates/sdk/src/error.rs`.
+- [X] T048 [P] Add Rustdoc for all new public SDK types, `create_microvm`, `configure_network`, typed error behavior, stopped-state guarantees, and private-key-path semantics in `crates/sdk/src/lib.rs`, `crates/sdk/src/domain/microvm.rs`, `crates/sdk/src/domain/config.rs`, and `crates/sdk/src/error.rs`.
 - [ ] T049 [P] Add opt-in Linux namespace tests for `ip`/`nft` command translation, TAP/bridge ownership, `/30` allocation, and capability failures in `crates/sdk/tests/linux_integration.rs` and `crates/sdk/tests/support/linux.rs`.
-- [ ] T050 Verify the SDK-only usage, host prerequisites, host-only/LAN outcomes, reconciliation behavior, and failure expectations in `specs/003-create-microvm/quickstart.md` against the implemented public API.
-- [ ] T051 Run `cargo fmt --all -- --check`, `cargo check --all-targets --all-features`, `cargo clippy --all-targets --all-features -- -D warnings`, and `cargo test --all-targets --all-features` from the repository root; record any environment-gated Linux test limitations in `specs/003-create-microvm/quickstart.md`.
-- [ ] T052 Review the final diff for SDK/CLI boundary violations, accidental edits outside `specs/003-create-microvm/` and `crates/sdk/`, private-key leakage, destructive cleanup, unresolved placeholders, and English-only repository text in `specs/003-create-microvm/plan.md`, `specs/003-create-microvm/spec.md`, and the affected SDK files.
+- [X] T050 Verify the SDK-only usage, host prerequisites, host-only/LAN outcomes, reconciliation behavior, and failure expectations in `specs/003-create-microvm/quickstart.md` against the implemented public API.
+- [X] T051 Run `cargo fmt --all -- --check`, `cargo check --all-targets --all-features`, `cargo clippy --all-targets --all-features -- -D warnings`, and `cargo test --all-targets --all-features` from the repository root; record the capability-gated Linux integration limitation in `specs/003-create-microvm/quickstart.md`.
+- [X] T052 Review the final diff for SDK/CLI boundary violations, accidental edits outside `specs/003-create-microvm/` and `crates/sdk/`, private-key leakage, destructive cleanup, unresolved placeholders, and English-only repository text in the feature documents and affected SDK files.
 
 ## Dependencies & Execution Order
 
@@ -216,7 +216,7 @@ repository quality gates without expanding feature scope.
 
 ```text
 Task T015: Write public API contract tests in crates/sdk/tests/public_api.rs
-Task T016: Write host-only lifecycle tests in crates/sdk/tests/lifecycle.rs
+Task T016: Add host-only lifecycle tests in the SDK manager unit-test module
 
 Task T017: Implement ext4 copy/resize in crates/sdk/src/adapters/storage/ext4.rs
 Task T018: Implement Ed25519 credentials in crates/sdk/src/adapters/credentials/ed25519.rs

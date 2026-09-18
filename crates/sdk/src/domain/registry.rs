@@ -48,7 +48,7 @@ pub struct RegistryMetadata {
 /*                                   COMMON                                   */
 /* -------------------------------------------------------------------------- */
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Architecture {
     X86_64,
@@ -58,14 +58,14 @@ pub enum Architecture {
     X86,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Endianness {
     Little,
     Big,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Linkage {
     Static,

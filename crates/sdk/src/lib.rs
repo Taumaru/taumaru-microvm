@@ -10,11 +10,15 @@ mod manager;
 mod ports;
 
 pub use domain::{
-    Architecture, ArtifactKind, BinaryFile, BinaryPackage, BootConfiguration, Distribution,
-    DistributionImage, DistributionRequirements, DownloadCancellation, DownloadDisposition,
-    DownloadPhase, DownloadProgress, DownloadedBinary, DownloadedDistribution, DownloadedFile,
-    DownloadedKernel, ElfMetadata, Endianness, FilesystemMetadata, InstalledBinary, Kernel,
-    Linkage,
+    Architecture, ArtifactFile, ArtifactKind, BinaryFile, BinaryPackage, BootConfiguration,
+    Distribution, DistributionImage, DistributionRequirements, DownloadCancellation,
+    DownloadDisposition, DownloadPhase, DownloadProgress, DownloadedBinary, DownloadedDistribution,
+    DownloadedFile, DownloadedKernel, ElfMetadata, Endianness, FilesystemMetadata, InstalledBinary,
+    Kernel, Linkage,
+};
+pub use domain::{
+    CreateMicroVmRequest, MicroVmCreationResult, MicroVmState, NetworkConfiguration,
+    NetworkConfigurationResult, NetworkMode, NetworkResource, SshConnectionInfo,
 };
 pub use error::SdkError;
 pub use manager::MicroVmSdk;

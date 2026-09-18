@@ -43,21 +43,23 @@ fn constructor_creates_idempotent_inventory_schema() {
             "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN (
                 'schema_migrations', 'downloads', 'kernels', 'binary_packages',
                 'binary_files', 'distributions', 'distribution_images',
-                'distribution_kernels'
+                'distribution_kernels', 'network_bridges', 'microvms',
+                'vm_networks', 'vm_network_resources', 'vm_credentials',
+                'vm_runtime'
             )",
             [],
             |row| row.get(0),
         )
         .expect("schema table count should be readable");
 
-    assert_eq!(table_count, 8);
+    assert_eq!(table_count, 14);
 
     let migration_count: i64 = connection
         .query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| {
             row.get(0)
         })
         .expect("migration ledger should be readable");
-    assert_eq!(migration_count, 1);
+    assert_eq!(migration_count, 2);
     let preserved_count: i64 = connection
         .query_row(
             "SELECT COUNT(*) FROM downloads WHERE artifact_key = 'kernel:preserved'",
@@ -166,6 +168,13 @@ async fn persists_each_member_and_distribution_relationship_in_normalized_tables
         connection.query_row("SELECT COUNT(*) FROM distribution_images", [], |row| {
             row.get(0)
         })?;
+    let image_minimums: Vec<i64> = {
+        let mut statement = connection
+            .prepare("SELECT minimum_size_bytes FROM distribution_images ORDER BY registry_id")?;
+        statement
+            .query_map([], |row| row.get(0))?
+            .collect::<Result<Vec<_>, _>>()?
+    };
     let distribution_kernel_count: i64 =
         connection.query_row("SELECT COUNT(*) FROM distribution_kernels", [], |row| {
             row.get(0)
@@ -198,6 +207,7 @@ async fn persists_each_member_and_distribution_relationship_in_normalized_tables
     )?;
 
     assert_eq!(image_count, 2);
+    assert_eq!(image_minimums, [22, 15]);
     assert_eq!(distribution_kernel_count, 2);
     assert_eq!(default_kernel_count, 1);
     assert_eq!(boot_args, ["console=ttyS0", "root=/dev/vda", "rw"]);

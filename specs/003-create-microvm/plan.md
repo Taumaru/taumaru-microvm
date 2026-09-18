@@ -6,7 +6,7 @@
 
 ## Summary
 
-Implement an SDK-only, synchronous workflow that creates one MicroVM from a caller-selected,
+Implement an SDK-only, single-awaited workflow that creates one MicroVM from a caller-selected,
 already downloaded and verified registry image. The SDK will validate the exact distribution/image
 selection and all independent runtime prerequisites, copy the selected `.ext4` image into a
 per-VM volume directory, grow it when requested, inject a per-VM Ed25519 public key, configure
@@ -32,10 +32,10 @@ with a migration for MicroVM, network, bridge, credential-path, and runtime meta
 files live in a directory containing `rootfs.ext4`, SSH key files, the expected socket path, and
 other exclusive runtime data.
 
-**Testing**: Existing unit and integration tests with fake ports for artifacts, SQLite, ext4
-storage, guest mutation, network, and runtime; public API, lifecycle, failure-path, persistence,
-and no-output tests. Privileged Linux network tests are opt-in and isolated in a network namespace
-when host capabilities are available. Run the repository Cargo quality gates.
+**Testing**: Existing unit and integration tests for artifacts, SQLite, public API, persistence,
+and failure paths, plus deterministic manager tests using injected artifact, storage, credential,
+network, and runtime ports. Real KVM, ext4 mount, TAP/bridge, nftables, and DHCP integration is
+capability-gated and is not part of the default test suite. Run the repository Cargo quality gates.
 
 **Target Platform**: Linux hosts with KVM, readable/writable `/dev/kvm`, permission to manage TAP,
 bridge, routes, forwarding, nftables, and ext4 images. Unsupported or insufficiently privileged
@@ -171,9 +171,10 @@ attempt-created paths from caller-owned paths for rollback.
 
 ### Artifact and registry integration
 
-Extend the registry image model with optional `minimum_size_bytes` and persist it in the artifact
-inventory so missing metadata is distinguishable from zero. Update registry validation, fixtures,
-the distribution-image persistence query, and migration schema without changing download behavior.
+Read optional `minimum_size_bytes` from raw registry metadata and persist it in the artifact
+inventory so missing metadata is distinguishable from zero. Keep the existing public registry image
+model compatible with the SDK/CLI construction contract; update registry validation, fixtures, the
+distribution-image persistence query, and migration schema without changing download behavior.
 
 Extend artifact resolution with a method that returns a complete creation prerequisite set:
 
@@ -286,8 +287,8 @@ Add or update SDK tests for:
 - runtime/network/guest/SQLite failure rollback, stopped runtime, removed socket, preservation of
   caller-owned data, and absence of unsolicited stdout/stderr or panic.
 
-Use fake ports to make every failure deterministic. Add Linux namespace tests only for command
-translation and real capability checks; keep them gated so ordinary `cargo test` remains useful on
+Use injected ports to make manager success, conflict, reconciliation, and rollback behavior
+deterministic. Keep host integration capability-gated so ordinary `cargo test` remains useful on
 hosts without KVM or network administration privileges.
 
 ## Implementation Sequence

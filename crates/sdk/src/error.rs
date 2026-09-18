@@ -6,6 +6,10 @@ use thiserror::Error;
 /// Errors returned by public SDK operations.
 #[derive(Debug, Error)]
 pub enum SdkError {
+    /// The caller supplied a value that cannot be used for a MicroVM operation.
+    #[error("invalid VM request field {field}: {reason}")]
+    InvalidRequest { field: String, reason: String },
+
     /// The caller supplied a home path that could not be normalized or created.
     #[error("invalid SDK home path {path}: {reason}")]
     InvalidHome { path: PathBuf, reason: String },
@@ -85,6 +89,110 @@ pub enum SdkError {
         component_name: String,
         path: PathBuf,
     },
+
+    /// A required local artifact is absent or cannot be used for creation.
+    #[error("{kind} artifact {id} is not ready at {path}: {reason}")]
+    ArtifactPrerequisite {
+        kind: String,
+        id: String,
+        path: PathBuf,
+        reason: String,
+    },
+
+    /// The requested root disk is smaller than a safe physical or registry floor.
+    #[error(
+        "disk size for image {image_id} is too small: requested {requested_size_bytes} bytes, minimum {minimum_size_bytes:?}, source {source_size_bytes} bytes"
+    )]
+    DiskSizeTooSmall {
+        image_id: String,
+        requested_size_bytes: u64,
+        minimum_size_bytes: Option<u64>,
+        source_size_bytes: u64,
+    },
+
+    /// A runtime component cannot be used with the selected package or host.
+    #[error(
+        "runtime component {component} from package {package_id} ({version}, {architecture}) is incompatible: {reason}"
+    )]
+    RuntimeIncompatible {
+        component: String,
+        package_id: String,
+        version: String,
+        architecture: String,
+        reason: String,
+    },
+
+    /// A VM name or volume is already owned by another record or caller.
+    #[error("volume {volume_path} for VM {vm_name} conflicts with {owner}: {reason}")]
+    StorageConflict {
+        vm_name: String,
+        volume_path: PathBuf,
+        owner: String,
+        reason: String,
+    },
+
+    /// An operation conflicts with a durable VM lifecycle state.
+    #[error("VM {name} is in state {state} and cannot perform {operation}")]
+    LifecycleConflict {
+        name: String,
+        state: String,
+        operation: String,
+    },
+
+    /// A repeated creation request conflicts with an immutable VM setting.
+    #[error(
+        "VM {name} configuration conflicts for {field}: existing {existing}, requested {requested}"
+    )]
+    ConfigurationConflict {
+        name: String,
+        field: String,
+        existing: String,
+        requested: String,
+    },
+
+    /// A network resource could not be inspected, created, or repaired.
+    #[error("{mode} network operation {operation} failed for {resource}: {reason}")]
+    Network {
+        mode: String,
+        operation: String,
+        resource: String,
+        reason: String,
+    },
+
+    /// A guest filesystem operation failed without exposing guest secrets.
+    #[error("guest filesystem operation {operation} failed for {path}: {reason}")]
+    GuestFilesystem {
+        operation: String,
+        path: PathBuf,
+        reason: String,
+    },
+
+    /// A credential operation failed without exposing key material.
+    #[error("credential operation {operation} failed for {path}: {reason}")]
+    Credential {
+        operation: String,
+        path: PathBuf,
+        reason: String,
+    },
+
+    /// A temporary runtime could not start, become ready, or stop cleanly.
+    #[error("temporary runtime {component} failed: {reason}; stopped={stopped}")]
+    TemporaryRuntime {
+        component: String,
+        reason: String,
+        stopped: bool,
+    },
+
+    /// The primary operation failed and one or more owned cleanup actions also failed.
+    #[error("operation failed: {primary}; cleanup failures: {failures:?}")]
+    Cleanup {
+        primary: String,
+        failures: Vec<String>,
+    },
+
+    /// A local process command could not be executed safely.
+    #[error("host command {program} failed: {reason}")]
+    HostCommand { program: String, reason: String },
 
     /// A registry artifact is valid JSON but cannot be used by the requested operation.
     #[error("artifact {artifact} is incompatible: {reason}")]

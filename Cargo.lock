@@ -1586,8 +1586,11 @@ dependencies = [
 name = "taumaru-microvm"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "reqwest",
+ "ring",
  "rusqlite",
+ "semver",
  "serde",
  "serde_json",
  "sha2",

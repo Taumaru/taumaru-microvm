@@ -1,6 +1,9 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use reqwest::{Client, Response, Url};
+use serde::Deserialize;
 
 use crate::domain::artifact::{is_valid_sha256, validate_registry_path};
 use crate::domain::registry::{
@@ -12,11 +15,33 @@ use crate::ports::artifacts::{ArtifactSource, RegistryFuture};
 
 const SUPPORTED_SCHEMA_VERSION: u32 = 1;
 
+#[derive(Debug, Deserialize)]
+struct RawRegistry {
+    distributions: Vec<RawDistribution>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawDistribution {
+    id: String,
+    images: Vec<RawImage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawImage {
+    id: String,
+    size_bytes: u64,
+    #[serde(default)]
+    minimum_size_bytes: Option<u64>,
+}
+
+type ImageMinimums = Arc<Mutex<HashMap<(String, String), Option<u64>>>>;
+
 /// Asynchronous client for the public Taumaru Artifacts Registry.
 #[derive(Clone, Debug)]
 pub(crate) struct TaumaruRegistryClient {
     client: Client,
     base_url: Url,
+    image_minimums: ImageMinimums,
 }
 
 impl TaumaruRegistryClient {
@@ -33,11 +58,30 @@ impl TaumaruRegistryClient {
         Ok(Self {
             client,
             base_url: parsed,
+            image_minimums: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
     fn manifest_url(&self) -> Url {
         self.base_url.clone()
+    }
+
+    pub(crate) fn minimum_size_bytes(
+        &self,
+        distribution_id: &str,
+        image_id: &str,
+    ) -> Result<Option<u64>, SdkError> {
+        self.image_minimums
+            .lock()
+            .map_err(|_| SdkError::Concurrency {
+                target: PathBuf::from("registry image metadata"),
+            })
+            .map(|minimums| {
+                minimums
+                    .get(&(distribution_id.to_owned(), image_id.to_owned()))
+                    .copied()
+                    .flatten()
+            })
     }
 }
 
@@ -45,6 +89,7 @@ impl ArtifactSource for TaumaruRegistryClient {
     fn fetch_manifest(&self) -> RegistryFuture<'_, TaumaruRegistry> {
         let client = self.client.clone();
         let url = self.manifest_url();
+        let image_minimums = Arc::clone(&self.image_minimums);
         Box::pin(async move {
             let response = client.get(url.clone()).send().await?;
             let response = response.error_for_status().map_err(|error| {
@@ -58,9 +103,12 @@ impl ArtifactSource for TaumaruRegistryClient {
                 }
             })?;
             let bytes = response.bytes().await?;
+            let raw_metadata: RawRegistry =
+                serde_json::from_slice(&bytes).map_err(SdkError::RegistryDecode)?;
             let manifest: TaumaruRegistry =
                 serde_json::from_slice(&bytes).map_err(SdkError::RegistryDecode)?;
             validate_manifest(&manifest)?;
+            validate_and_cache_image_minimums(&raw_metadata, &manifest, &image_minimums)?;
             Ok(manifest)
         })
     }
@@ -88,6 +136,59 @@ impl ArtifactSource for TaumaruRegistryClient {
             })
         })
     }
+
+    fn minimum_size_bytes(
+        &self,
+        distribution_id: &str,
+        image_id: &str,
+    ) -> Result<Option<u64>, SdkError> {
+        TaumaruRegistryClient::minimum_size_bytes(self, distribution_id, image_id)
+    }
+}
+
+fn validate_and_cache_image_minimums(
+    raw: &RawRegistry,
+    manifest: &TaumaruRegistry,
+    cache: &ImageMinimums,
+) -> Result<(), SdkError> {
+    let mut values = HashMap::new();
+    for distribution in &raw.distributions {
+        for image in &distribution.images {
+            if let Some(minimum_size_bytes) = image.minimum_size_bytes
+                && (minimum_size_bytes == 0 || minimum_size_bytes > image.size_bytes)
+            {
+                return Err(SdkError::InvalidMetadata {
+                    artifact: format!("{}/{}", distribution.id, image.id),
+                    reason: "minimum_size_bytes must be positive and no larger than size_bytes"
+                        .to_owned(),
+                });
+            }
+            values.insert(
+                (distribution.id.clone(), image.id.clone()),
+                image.minimum_size_bytes,
+            );
+        }
+    }
+    if values.len()
+        != manifest
+            .distributions
+            .iter()
+            .map(|d| d.images.len())
+            .sum::<usize>()
+    {
+        return Err(SdkError::InvalidMetadata {
+            artifact: "registry images".to_owned(),
+            reason: "image minimum-size metadata does not match the decoded manifest".to_owned(),
+        });
+    }
+    cache
+        .lock()
+        .map_err(|_| SdkError::Concurrency {
+            target: PathBuf::from("registry image metadata"),
+        })
+        .map(|mut cached| {
+            *cached = values;
+        })
 }
 
 pub(crate) fn validate_manifest(manifest: &TaumaruRegistry) -> Result<(), SdkError> {
@@ -278,11 +379,23 @@ fn validate_image(distribution: &Distribution, image: &DistributionImage) -> Res
     validate_required_text(&image.description, &artifact, "description")?;
     validate_required_text(&image.variant, &artifact, "variant")?;
     validate_required_text(&image.format, &artifact, "format")?;
+    if image.format != "ext4" {
+        return Err(SdkError::invalid_metadata(
+            artifact.clone(),
+            "distribution images must use the ext4 format",
+        ));
+    }
     validate_required_text(
         &image.filesystem.filesystem_type,
         &artifact,
         "filesystem.type",
     )?;
+    if image.filesystem.filesystem_type != "ext4" {
+        return Err(SdkError::invalid_metadata(
+            artifact.clone(),
+            "distribution images must declare an ext4 filesystem",
+        ));
+    }
     validate_required_text(&image.filesystem.uuid, &artifact, "filesystem.uuid")?;
     validate_required_text(&image.mime_type, &artifact, "mime_type")?;
     validate_required_text(&image.modified_at, &artifact, "modified_at")?;

@@ -192,6 +192,10 @@ fn fixture_response(
         firecracker_payload,
     );
     payloads.insert(
+        "/v1/binaries/firectl-test/0.1.0/x86_64/firectl",
+        include_bytes!("../fixtures/jailer-fixture").as_slice(),
+    );
+    payloads.insert(
         "/v1/images/alpine/1.0/alpine-test-minimal.ext4",
         include_bytes!("../fixtures/rootfs-fixture").as_slice(),
     );

@@ -1,4 +1,10 @@
+use std::net::IpAddr;
+use std::path::{Path, PathBuf};
+
 use crate::domain::artifact::{DownloadSpec, FileIntegrity, InstalledBinary};
+use crate::domain::microvm::{
+    MicroVmRecord, NetworkConfiguration, PersistedCredential, PersistedNetwork, PersistedRuntime,
+};
 use crate::domain::registry::{BinaryFile, BinaryPackage, Distribution, DistributionImage, Kernel};
 use crate::error::SdkError;
 
@@ -38,6 +44,7 @@ pub(crate) trait ArtifactRepository: Send + Sync {
         distribution: &Distribution,
         image: &DistributionImage,
         kernels: &[Kernel],
+        minimum_size_bytes: Option<u64>,
         spec: &DownloadSpec,
         integrity: &FileIntegrity,
     ) -> Result<(), SdkError>;
@@ -47,4 +54,79 @@ pub(crate) trait ArtifactRepository: Send + Sync {
         package_id: &str,
         component_name: &str,
     ) -> Result<InstalledBinary, SdkError>;
+
+    fn resolve_kernel(&self, kernel_id: &str) -> Result<LocalArtifact, SdkError>;
+
+    fn resolve_distribution_image(
+        &self,
+        distribution_id: &str,
+        image_id: &str,
+    ) -> Result<LocalArtifact, SdkError>;
+
+    #[allow(dead_code)]
+    fn list_installed_binaries(&self) -> Result<Vec<InstalledBinary>, SdkError>;
 }
+
+/// A verified artifact relationship loaded from the local inventory.
+#[derive(Clone, Debug)]
+pub(crate) struct LocalArtifact {
+    pub path: PathBuf,
+    pub size_bytes: u64,
+    pub sha256: String,
+}
+
+/// Durable VM state and its child records loaded from SQLite.
+#[derive(Clone, Debug)]
+pub(crate) struct StoredMicroVm {
+    pub record: MicroVmRecord,
+    pub network: PersistedNetwork,
+    pub credential: PersistedCredential,
+    pub runtime: PersistedRuntime,
+}
+
+/// Local inventory and lifecycle persistence for MicroVM records.
+pub(crate) trait MicroVmRepository: Send + Sync {
+    fn find_microvm(&self, name: &str) -> Result<Option<StoredMicroVm>, SdkError>;
+
+    fn find_volume_owner(&self, volume_path: &Path) -> Result<Option<String>, SdkError>;
+
+    fn list_host_only_networks(&self) -> Result<Vec<(String, IpAddr, String)>, SdkError>;
+
+    fn insert_creating(&self, record: &MicroVmRecord) -> Result<i64, SdkError>;
+
+    fn persist_network(&self, vm_id: i64, network: &PersistedNetwork) -> Result<(), SdkError>;
+
+    fn persist_credential(
+        &self,
+        vm_id: i64,
+        credential: &PersistedCredential,
+    ) -> Result<(), SdkError>;
+
+    fn persist_runtime(&self, vm_id: i64, runtime: &PersistedRuntime) -> Result<(), SdkError>;
+
+    fn update_state(
+        &self,
+        vm_id: i64,
+        state: crate::domain::lifecycle::MicroVmState,
+    ) -> Result<(), SdkError>;
+
+    fn delete_microvm(&self, vm_id: i64) -> Result<(), SdkError>;
+
+    fn update_network(&self, vm_id: i64, network: &PersistedNetwork) -> Result<(), SdkError>;
+
+    fn bridge_has_other_references(
+        &self,
+        vm_id: i64,
+        bridge_name: &str,
+        uplink_name: &str,
+    ) -> Result<bool, SdkError>;
+
+    fn bridge_is_managed(&self, bridge_name: &str, uplink_name: &str) -> Result<bool, SdkError>;
+
+    #[allow(dead_code)]
+    fn load_network(&self, vm_id: i64) -> Result<NetworkConfiguration, SdkError>;
+}
+
+pub(crate) trait LocalRepository: ArtifactRepository + MicroVmRepository {}
+
+impl<T> LocalRepository for T where T: ArtifactRepository + MicroVmRepository {}

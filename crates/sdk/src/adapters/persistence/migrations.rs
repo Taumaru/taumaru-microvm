@@ -12,11 +12,18 @@ struct Migration {
     sql: &'static str,
 }
 
-const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    name: "0001_artifact_inventory.sql",
-    sql: include_str!("../../../migrations/0001_artifact_inventory.sql"),
-}];
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        name: "0001_artifact_inventory.sql",
+        sql: include_str!("../../../migrations/0001_artifact_inventory.sql"),
+    },
+    Migration {
+        version: 2,
+        name: "0002_microvm_creation.sql",
+        sql: include_str!("../../../migrations/0002_microvm_creation.sql"),
+    },
+];
 
 pub(crate) fn apply_pending(connection: &mut Connection) -> Result<(), SdkError> {
     connection.execute_batch(
@@ -134,7 +141,13 @@ fn verify_required_schema(connection: &Connection) -> Result<(), SdkError> {
         ),
         (
             "distribution_images",
-            &["id", "distribution_id", "download_id", "registry_id"],
+            &[
+                "id",
+                "distribution_id",
+                "download_id",
+                "registry_id",
+                "minimum_size_bytes",
+            ],
         ),
         (
             "distribution_kernels",
@@ -159,6 +172,103 @@ fn verify_required_schema(connection: &Connection) -> Result<(), SdkError> {
         (
             "image_capabilities",
             &["distribution_image_id", "position", "capability"],
+        ),
+        (
+            "network_bridges",
+            &[
+                "id",
+                "bridge_name",
+                "uplink_name",
+                "ownership",
+                "reference_count",
+                "created_at",
+                "updated_at",
+            ],
+        ),
+        (
+            "microvms",
+            &[
+                "id",
+                "name",
+                "state",
+                "distribution_id",
+                "image_id",
+                "kernel_id",
+                "firecracker_package_id",
+                "firectl_package_id",
+                "disk_size_bytes",
+                "memory_requested_bytes",
+                "memory_effective_mib",
+                "vcpu_count",
+                "volume_path",
+                "rootfs_path",
+                "socket_path",
+                "expose_on_lan",
+            ],
+        ),
+        (
+            "vm_networks",
+            &[
+                "id",
+                "microvm_id",
+                "mode",
+                "guest_ip",
+                "prefix_length",
+                "gateway_ip",
+                "host_ip",
+                "tap_name",
+                "guest_mac",
+                "bridge_id",
+                "uplink_name",
+                "dhcp_lease_reference",
+                "desired_boot_parameters",
+                "bridge_created_by_sdk",
+                "uplink_attached_by_sdk",
+                "forwarding_enabled_by_sdk",
+                "nat_table_created_by_sdk",
+                "nat_chain_created_by_sdk",
+                "host_address_specs",
+                "default_route_specs",
+            ],
+        ),
+        (
+            "vm_network_resources",
+            &[
+                "id",
+                "microvm_id",
+                "resource_kind",
+                "resource_identity",
+                "desired_fingerprint",
+                "ownership",
+                "adapter_handle",
+                "last_observed",
+            ],
+        ),
+        (
+            "vm_credentials",
+            &[
+                "microvm_id",
+                "private_key_path",
+                "public_key_path",
+                "guest_authorized_keys_path",
+                "key_type",
+                "ssh_user",
+                "ssh_port",
+                "public_key_fingerprint",
+                "file_mode",
+            ],
+        ),
+        (
+            "vm_runtime",
+            &[
+                "microvm_id",
+                "firecracker_path",
+                "firectl_path",
+                "socket_path",
+                "process_id",
+                "process_state",
+                "updated_at",
+            ],
         ),
     ];
 

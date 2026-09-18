@@ -120,6 +120,30 @@
           "modified_at": "2026-09-17T12:00:00Z"
         }
       ]
+    },
+    {
+      "id": "firectl-test-0.1.0-x86_64",
+      "name": "firectl-test",
+      "display_name": "firectl Test 0.1.0 (x86_64)",
+      "description": "Fixture firectl package.",
+      "version": "0.1.0",
+      "architecture": "x86_64",
+      "files": [
+        {
+          "name": "firectl",
+          "path": "binaries/firectl-test/0.1.0/x86_64/firectl",
+          "url": "http://fixture.invalid/v1/binaries/firectl-test/0.1.0/x86_64/firectl",
+          "filename": "firectl",
+          "size_bytes": 15,
+          "sha256": "95949ec91bdfc742bda3ae2bf053c0821f76dae41577e34ccaa47da742fbf3b0",
+          "mime_type": "application/x-pie-executable",
+          "executable": true,
+          "mode": "755",
+          "permissions": "-rwxr-xr-x",
+          "format": "elf",
+          "modified_at": "2026-09-17T12:00:00Z"
+        }
+      ]
     }
   ],
   "distributions": [
@@ -166,7 +190,8 @@
             "features": ["has_journal", "extent"]
           },
           "size_bytes": 15,
-          "sha256": "2a8035a6be213e14ae659c4fa51badeb83f5607126820d0a8c01fd424f8a6f6d",
+      "sha256": "2a8035a6be213e14ae659c4fa51badeb83f5607126820d0a8c01fd424f8a6f6d",
+          "minimum_size_bytes": 15,
           "capabilities": ["networking"],
           "mime_type": "application/octet-stream",
           "modified_at": "2026-09-17T12:00:00Z"
@@ -193,6 +218,7 @@
           },
           "size_bytes": 22,
           "sha256": "a91400813428b09e010c6c4c4ba09efea7896be81d94d558fa88455b101be8d3",
+          "minimum_size_bytes": 22,
           "capabilities": ["networking", "debug"],
           "mime_type": "application/octet-stream",
           "modified_at": "2026-09-17T12:00:00Z"

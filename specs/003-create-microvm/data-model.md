@@ -127,11 +127,13 @@ need to match.
 
 ## Registry additions used by creation
 
-`DistributionImage` gains an optional `minimum_size_bytes` field in the Rust registry model and
-the corresponding inventory column. The field is optional at decode/persistence time so existing
-registry records remain representable, but creation treats `NULL` as a typed missing-prerequisite
-error. The physical `size_bytes` remains the verified current image size and is an additional
-floor. No registry service or download behavior is changed by this feature.
+The registry adapter reads optional `minimum_size_bytes` metadata from the raw registry response
+and persists it in the corresponding inventory column. The existing public `DistributionImage`
+Rust model remains unchanged to preserve the current SDK/CLI construction contract; the adapter's
+side metadata keeps the value optional so existing registry records remain representable. Creation
+treats `NULL` as a typed missing-prerequisite error. The physical `size_bytes` remains the verified
+current image size and is an additional floor. No registry service or download behavior is changed
+by this feature.
 
 The image validation path also requires `format == "ext4"` and
 `filesystem.type == "ext4"`. The distribution's existing boot configuration and default kernel
