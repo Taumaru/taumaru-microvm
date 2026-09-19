@@ -75,8 +75,12 @@ pub(crate) struct NewArgs {
     /// Disable prompts and require the complete explicit set.
     #[arg(long = "non-interactive")]
     pub(crate) non_interactive: bool,
-}
 
+    /// Trust already-validated values and skip registry revalidation.
+    /// Internal only: set by privilege escalation for the elevated child.
+    #[arg(long = "trusted-values", hide = true)]
+    pub(crate) trusted_values: bool,
+}
 #[cfg(test)]
 mod tests {
     use clap::Parser;

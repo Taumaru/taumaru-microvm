@@ -1,5 +1,12 @@
 use std::process::{Command, Output};
 
+unsafe fn libc_geteuid() -> u32 {
+    unsafe extern "C" {
+        fn geteuid() -> u32;
+    }
+    unsafe { geteuid() }
+}
+
 fn run_microvm(arguments: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_microvm"))
         .args(arguments)
@@ -101,6 +108,73 @@ fn new_help_exposes_creation_options_without_lifecycle_flags() {
     assert!(!stdout.contains("--kernel"));
     assert!(!stdout.contains("--volume-path"));
     assert!(!stdout.contains("--lan-address"));
+}
+
+#[test]
+fn trusted_child_skips_catalog_discovery() {
+    let home = tempfile::tempdir().expect("temporary home should be created");
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_microvm"))
+        .args([
+            "new",
+            "web-01",
+            "--non-interactive",
+            "--image",
+            "distro-a=image-a",
+            "--disk-gb",
+            "20",
+            "--memory",
+            "2GB",
+            "--vcpus",
+            "2",
+            "--trusted-values",
+        ])
+        .env("TAUMARU_HOME", home.path())
+        .env("TAUMARU_ESCALATED", "1")
+        .env("TAUMARU_NEW_KERNEL", "kernel-a")
+        .env("TAUMARU_NEW_KERNEL_SIZE", "13")
+        .env("TAUMARU_NEW_RUNTIME", "runtime-new:42")
+        .env("TAUMARU_NEW_IMAGE_BYTES", "37")
+        .env("TAUMARU_NEW_MIN_MEMORY_MB", "128")
+        .env("TAUMARU_NEW_MIN_VCPUS", "1")
+        .output()
+        .expect("failed to execute microvm");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(!stderr.contains("Checking artifact registry"));
+    assert!(!stderr.contains("Registry ready"));
+    assert!(!stdout.contains("Checking artifact registry"));
+    assert!(!stdout.contains("Registry ready"));
+}
+
+#[test]
+fn non_interactive_new_without_root_reports_privilege_error() {
+    let home = tempfile::tempdir().expect("temporary home should be created");
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_microvm"))
+        .args([
+            "new",
+            "web-01",
+            "--non-interactive",
+            "--image",
+            "distro-a=image-a",
+            "--disk-gb",
+            "20",
+            "--memory",
+            "2GB",
+            "--vcpus",
+            "2",
+        ])
+        .env("TAUMARU_HOME", home.path())
+        .env_remove("TAUMARU_ESCALATED")
+        .output()
+        .expect("failed to execute microvm");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    if unsafe { libc_geteuid() } == 0 {
+        return;
+    }
+    assert!(!output.status.success());
+    assert!(stderr.to_ascii_lowercase().contains("elevated rights"));
 }
 
 #[test]

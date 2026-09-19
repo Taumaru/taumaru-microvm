@@ -246,6 +246,27 @@ pub(crate) fn format_gb(bytes: u64) -> String {
     }
 }
 
+pub(crate) fn format_gb_flag(bytes: u64) -> String {
+    let value = bytes as f64 / BYTES_PER_GIB;
+    if value.fract() == 0.0 {
+        format!("{}", value as u64)
+    } else {
+        format!("{value:.1}")
+    }
+}
+
+pub(crate) fn format_memory_flag(bytes: u64) -> String {
+    if bytes >= BYTES_PER_GIB as u64 && bytes.is_multiple_of(BYTES_PER_GIB as u64) {
+        return format!("{}GB", (bytes as f64 / BYTES_PER_GIB) as u64);
+    }
+    let value = bytes as f64 / BYTES_PER_MIB_F64;
+    if value.fract() == 0.0 {
+        format!("{}MB", value as u64)
+    } else {
+        format!("{value:.1}MB")
+    }
+}
+
 pub(crate) fn format_mb_gb(bytes: u64) -> String {
     if bytes >= BYTES_PER_GIB as u64 && bytes.is_multiple_of(BYTES_PER_GIB as u64) {
         return format_gb(bytes);
@@ -566,6 +587,19 @@ pub(crate) async fn run(context: &CliContext, arguments: NewArgs) -> Result<u8, 
                 "Pass --vcpus 2 with --non-interactive",
             ));
         }
+        if let Some(exit) = crate::privilege::require_privileged(
+            &crate::privilege::SystemPrivilege,
+            context.terminal,
+            true,
+            crate::context::resolve_home().ok(),
+            &[],
+            Vec::new(),
+            "Run the same command with sudo or as root",
+        )
+        .await?
+        {
+            return Ok(exit);
+        }
     }
 
     let name = if explicit || arguments.name.is_some() || arguments.explicit_name.is_some() {
@@ -577,6 +611,11 @@ pub(crate) async fn run(context: &CliContext, arguments: NewArgs) -> Result<u8, 
         None
     };
 
+    let trusted = arguments.trusted_values
+        && crate::privilege::Privilege::escalated_marker(&crate::privilege::SystemPrivilege);
+    if trusted {
+        return run_trusted_child(context, &arguments).await;
+    }
     let client = SdkArtifactClient::new(&context.sdk);
     let catalog_spinner = crate::output::human::CatalogSpinner::new(context.terminal);
     let catalog_result = load_catalog(&client).await;
@@ -707,8 +746,8 @@ pub(crate) async fn run(context: &CliContext, arguments: NewArgs) -> Result<u8, 
         expose_on_lan,
     )?;
 
+    let plan = build_provisioning_plan(&catalog, choice.clone())?;
     if !explicit {
-        let plan = build_provisioning_plan(&catalog, choice.clone())?;
         crate::output::human::write_new_review(
             &request,
             &choice,
@@ -729,7 +768,385 @@ pub(crate) async fn run(context: &CliContext, arguments: NewArgs) -> Result<u8, 
         }
     }
 
+    if let Some(exit) = escalate_for_creation(context, &request, &choice, &plan).await? {
+        return Ok(exit);
+    }
+
     execute_request(context, &request, &choice).await
+}
+
+fn trusted_env(name: &str) -> Result<String, CliError> {
+    std::env::var(name).map_err(|_| {
+        CliError::creation(
+            "Trusted escalation values are missing",
+            format!("escalated child requires {name} from its parent"),
+            "Run microvm new again without internal flags",
+        )
+    })
+}
+
+/// Elevated child path: the parent already validated everything, so the child
+/// trusts the resolved kernel, image size, and minimums from its environment
+/// and goes straight to provisioning with no registry catalog load, no spinner,
+/// and no second readiness line.
+async fn run_trusted_child(context: &CliContext, arguments: &NewArgs) -> Result<u8, CliError> {
+    let image = arguments.image.as_deref().ok_or_else(|| {
+        CliError::missing_value(
+            "image selection",
+            "--image DISTRIBUTION=IMAGE",
+            "Run microvm new again without internal flags",
+        )
+    })?;
+    let (distribution_id, image_id) = parse_single_image(image).map_err(|_| {
+        CliError::creation(
+            "Image selection is invalid",
+            format!("image selection {image:?} must use DISTRIBUTION_ID=IMAGE_ID"),
+            "Pass --image DISTRIBUTION=IMAGE exactly once",
+        )
+    })?;
+    let name = resolve_name(
+        arguments.name.as_deref(),
+        arguments.explicit_name.as_deref(),
+    )?;
+    let disk_size_bytes = parse_disk_gb(arguments.disk_gb.as_deref().ok_or_else(|| {
+        CliError::missing_value(
+            "disk size",
+            "--disk-gb <GB>",
+            "Run microvm new again without internal flags",
+        )
+    })?)?;
+    let memory_bytes = parse_memory(arguments.memory.as_deref().ok_or_else(|| {
+        CliError::missing_value(
+            "memory size",
+            "--memory <xMB|xGB>",
+            "Run microvm new again without internal flags",
+        )
+    })?)?;
+    let vcpu_count = parse_vcpus(arguments.vcpus.as_deref().ok_or_else(|| {
+        CliError::missing_value(
+            "vCPU count",
+            "--vcpus <N>",
+            "Run microvm new again without internal flags",
+        )
+    })?)?;
+    let kernel_id = trusted_env(TRUSTED_KERNEL_ENV)?;
+    let image_bytes: u64 = trusted_env(TRUSTED_IMAGE_BYTES_ENV)?.parse().map_err(|_| {
+        CliError::creation(
+            "Trusted escalation values are invalid",
+            "escalated image size is not a number",
+            "Run microvm new again without internal flags",
+        )
+    })?;
+    let min_memory_mb: u64 = trusted_env(TRUSTED_MIN_MEMORY_MB_ENV)?
+        .parse()
+        .map_err(|_| {
+            CliError::creation(
+                "Trusted escalation values are invalid",
+                "escalated memory minimum is not a number",
+                "Run microvm new again without internal flags",
+            )
+        })?;
+    let min_vcpus: u32 = trusted_env(TRUSTED_MIN_VCPUS_ENV)?.parse().map_err(|_| {
+        CliError::creation(
+            "Trusted escalation values are invalid",
+            "escalated vCPU minimum is not a number",
+            "Run microvm new again without internal flags",
+        )
+    })?;
+    check_disk_minimum(disk_size_bytes, image_bytes)?;
+    check_memory_minimum(memory_bytes, min_memory_mb.saturating_mul(1024 * 1024))?;
+    check_vcpu_minimum(vcpu_count, min_vcpus, &distribution_id)?;
+    let request = NewVmRequest {
+        name,
+        distribution_id: distribution_id.clone(),
+        image_id: image_id.clone(),
+        disk_size_bytes,
+        memory_bytes,
+        vcpu_count,
+        expose_on_lan: arguments.expose_lan,
+    };
+    let runtime: Vec<(String, u64)> = trusted_env(TRUSTED_RUNTIME_ENV)?
+        .split(',')
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| {
+            entry.split_once(':').ok_or_else(|| {
+                CliError::creation(
+                    "Trusted escalation values are invalid",
+                    "escalated runtime entry must use ID:SIZE",
+                    "Run microvm new again without internal flags",
+                )
+            })
+        })
+        .map(|result| {
+            result.and_then(|(id, size)| {
+                size.parse::<u64>()
+                    .map_err(|_| {
+                        CliError::creation(
+                            "Trusted escalation values are invalid",
+                            "escalated runtime size is not a number",
+                            "Run microvm new again without internal flags",
+                        )
+                    })
+                    .map(|size| (id.to_owned(), size))
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let kernel_size: u64 = trusted_env(TRUSTED_KERNEL_SIZE_ENV)?.parse().map_err(|_| {
+        CliError::creation(
+            "Trusted escalation values are invalid",
+            "escalated kernel size is not a number",
+            "Run microvm new again without internal flags",
+        )
+    })?;
+    execute_trusted_request(
+        context,
+        &request,
+        TrustedInputs {
+            distribution_id: &distribution_id,
+            image_id: &image_id,
+            kernel_id: &kernel_id,
+            image_bytes,
+            kernel_size,
+            runtime: &runtime,
+        },
+    )
+    .await
+}
+
+struct TrustedInputs<'a> {
+    distribution_id: &'a str,
+    image_id: &'a str,
+    kernel_id: &'a str,
+    image_bytes: u64,
+    kernel_size: u64,
+    runtime: &'a [(String, u64)],
+}
+
+async fn execute_trusted_request(
+    context: &CliContext,
+    request: &NewVmRequest,
+    inputs: TrustedInputs<'_>,
+) -> Result<u8, CliError> {
+    let client = SdkArtifactClient::new(&context.sdk);
+    let cancellation = DownloadCancellation::new();
+    let total: u64 = inputs
+        .runtime
+        .iter()
+        .map(|(_, size)| *size)
+        .chain([inputs.kernel_size, inputs.image_bytes])
+        .fold(0, |total, size| total.saturating_add(size));
+    let mut renderer = crate::output::human::NewProgressRenderer::new(total, context.terminal);
+    for (package_id, package_bytes) in inputs.runtime {
+        let label = format!("runtime/{package_id}");
+        renderer.begin_member(&label, *package_bytes);
+        let mut forward = super::download::ProgressForwarder::new(&mut renderer, 0, *package_bytes);
+        let call = client.download_binary(package_id, &cancellation, |progress| {
+            forward.forward(progress);
+        });
+        let result = call_with_signal(call, &cancellation, tokio::signal::ctrl_c()).await?;
+        if let Some(error) = forward.take_error() {
+            return Err(error);
+        }
+        match result {
+            OperationResult::Finished(Ok(_)) => {}
+            OperationResult::Finished(Err(error)) => {
+                return Err(map_provisioning_error(&label, error));
+            }
+            OperationResult::Cancelled => {
+                return Err(CliError::cancelled());
+            }
+        }
+    }
+    {
+        let label = format!("kernel/{}", inputs.kernel_id);
+        renderer.begin_member(&label, inputs.kernel_size);
+        let mut forward =
+            super::download::ProgressForwarder::new(&mut renderer, 0, inputs.kernel_size);
+        let call = client.download_kernel(inputs.kernel_id, &cancellation, |progress| {
+            forward.forward(progress);
+        });
+        let result = call_with_signal(call, &cancellation, tokio::signal::ctrl_c()).await?;
+        if let Some(error) = forward.take_error() {
+            return Err(error);
+        }
+        match result {
+            OperationResult::Finished(Ok(_)) => {}
+            OperationResult::Finished(Err(error)) => {
+                return Err(map_provisioning_error(&label, error));
+            }
+            OperationResult::Cancelled => {
+                return Err(CliError::cancelled());
+            }
+        }
+    }
+    {
+        let label = format!("image/{}/{}", inputs.distribution_id, inputs.image_id);
+        renderer.begin_member(&label, inputs.image_bytes);
+        let mut forward =
+            super::download::ProgressForwarder::new(&mut renderer, 0, inputs.image_bytes);
+        let call = client.download_distribution_image(
+            inputs.distribution_id,
+            inputs.image_id,
+            &cancellation,
+            |progress| forward.forward(progress),
+        );
+        let result = call_with_signal(call, &cancellation, tokio::signal::ctrl_c()).await?;
+        if let Some(error) = forward.take_error() {
+            return Err(error);
+        }
+        match result {
+            OperationResult::Finished(Ok(_)) => {}
+            OperationResult::Finished(Err(error)) => {
+                return Err(map_provisioning_error(&label, error));
+            }
+            OperationResult::Cancelled => {
+                return Err(CliError::cancelled());
+            }
+        }
+    }
+    renderer.finish_all(context.terminal);
+    run_creation(context, request).await
+}
+
+async fn run_creation(context: &CliContext, request: &NewVmRequest) -> Result<u8, CliError> {
+    let sdk_request = creation_sdk_request(request);
+    let interrupted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let interrupted_flag = std::sync::Arc::clone(&interrupted);
+    let signal_task = tokio::spawn(async move {
+        let _ = tokio::signal::ctrl_c().await;
+        interrupted_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+    });
+    let mut creation_renderer =
+        crate::output::human::CreationProgressRenderer::new(context.terminal);
+    let creation_result = context
+        .sdk
+        .create_microvm(
+            sdk_request,
+            Some(|progress: CreationProgress| {
+                creation_renderer.on_creation_progress(progress);
+            }),
+        )
+        .await;
+    signal_task.abort();
+    creation_renderer.finish();
+    let was_interrupted = interrupted.load(std::sync::atomic::Ordering::SeqCst);
+    match creation_result {
+        Ok(result) => {
+            crate::output::human::write_new_result(
+                &result,
+                request,
+                was_interrupted,
+                context.terminal,
+            )
+            .map_err(CliError::from)?;
+            if !matches!(result.state, MicroVmState::Configured) {
+                return Err(CliError::Sdk(SdkError::Migration(
+                    "creation returned without reaching the configured state".to_owned(),
+                )));
+            }
+            Ok(0)
+        }
+        Err(error) => {
+            if matches!(
+                error,
+                SdkError::ConfigurationConflict { .. } | SdkError::LifecycleConflict { .. }
+            ) {
+                return Err(CliError::conflict(
+                    "MicroVM name is already in use",
+                    error.to_string(),
+                    "Choose another --name or remove the existing VM",
+                ));
+            }
+            Err(map_creation_error(error, was_interrupted))
+        }
+    }
+}
+
+pub(crate) fn escalated_child_command(
+    request: &NewVmRequest,
+    choice: &NewImageChoice,
+) -> Vec<std::ffi::OsString> {
+    let mut command = vec![
+        std::ffi::OsString::from("new"),
+        std::ffi::OsString::from(&request.name),
+        std::ffi::OsString::from("--non-interactive"),
+        std::ffi::OsString::from("--image"),
+        std::ffi::OsString::from(format!("{}={}", choice.distribution.id, choice.image.id)),
+        std::ffi::OsString::from("--disk-gb"),
+        std::ffi::OsString::from(format_gb_flag(request.disk_size_bytes)),
+        std::ffi::OsString::from("--memory"),
+        std::ffi::OsString::from(format_memory_flag(request.memory_bytes)),
+        std::ffi::OsString::from("--vcpus"),
+        std::ffi::OsString::from(request.vcpu_count.to_string()),
+    ];
+    if request.expose_on_lan {
+        command.push(std::ffi::OsString::from("--expose-lan"));
+    }
+    command.push(std::ffi::OsString::from("--trusted-values"));
+    command
+}
+
+pub(crate) const TRUSTED_KERNEL_ENV: &str = "TAUMARU_NEW_KERNEL";
+pub(crate) const TRUSTED_IMAGE_BYTES_ENV: &str = "TAUMARU_NEW_IMAGE_BYTES";
+pub(crate) const TRUSTED_MIN_MEMORY_MB_ENV: &str = "TAUMARU_NEW_MIN_MEMORY_MB";
+pub(crate) const TRUSTED_MIN_VCPUS_ENV: &str = "TAUMARU_NEW_MIN_VCPUS";
+pub(crate) const TRUSTED_KERNEL_SIZE_ENV: &str = "TAUMARU_NEW_KERNEL_SIZE";
+pub(crate) const TRUSTED_RUNTIME_ENV: &str = "TAUMARU_NEW_RUNTIME";
+
+async fn escalate_for_creation(
+    context: &CliContext,
+    request: &NewVmRequest,
+    choice: &NewImageChoice,
+    plan: &NewProvisioningPlan,
+) -> Result<Option<u8>, CliError> {
+    let home = crate::context::resolve_home().ok();
+    let command = escalated_child_command(request, choice);
+    let runtime = plan
+        .runtime_packages
+        .iter()
+        .map(|package| {
+            binary_package_size(package)
+                .map(|size| format!("{}:{size}", package.id))
+                .map_err(|_| {
+                    CliError::creation(
+                        "Runtime packages are invalid",
+                        "runtime package size exceeds the supported range",
+                        "Run microvm new again without internal flags",
+                    )
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .join(",");
+    let extra_env = vec![
+        (TRUSTED_KERNEL_ENV.to_owned(), choice.kernel.id.clone()),
+        (
+            TRUSTED_KERNEL_SIZE_ENV.to_owned(),
+            choice.kernel.size_bytes.to_string(),
+        ),
+        (TRUSTED_RUNTIME_ENV.to_owned(), runtime),
+        (
+            TRUSTED_IMAGE_BYTES_ENV.to_owned(),
+            choice.image.size_bytes.to_string(),
+        ),
+        (
+            TRUSTED_MIN_MEMORY_MB_ENV.to_owned(),
+            choice.distribution.requirements.min_memory_mb.to_string(),
+        ),
+        (
+            TRUSTED_MIN_VCPUS_ENV.to_owned(),
+            choice.distribution.requirements.min_vcpus.to_string(),
+        ),
+    ];
+    crate::privilege::require_privileged(
+        &crate::privilege::SystemPrivilege,
+        context.terminal,
+        false,
+        home,
+        &extra_env,
+        command,
+        "Run the same command with sudo or as root",
+    )
+    .await
 }
 
 fn reject_out_of_scope_flags(arguments: &NewArgs) -> Result<(), CliError> {
@@ -833,59 +1250,7 @@ async fn execute_request(
     }
 
     renderer.finish_all(context.terminal);
-
-    let sdk_request = creation_sdk_request(request);
-    let interrupted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let interrupted_flag = std::sync::Arc::clone(&interrupted);
-    let signal_task = tokio::spawn(async move {
-        let _ = tokio::signal::ctrl_c().await;
-        interrupted_flag.store(true, std::sync::atomic::Ordering::SeqCst);
-    });
-    let mut creation_renderer =
-        crate::output::human::CreationProgressRenderer::new(context.terminal);
-    let creation_result = context
-        .sdk
-        .create_microvm(
-            sdk_request,
-            Some(|progress: CreationProgress| {
-                creation_renderer.on_creation_progress(progress);
-            }),
-        )
-        .await;
-    signal_task.abort();
-    creation_renderer.finish();
-    let was_interrupted = interrupted.load(std::sync::atomic::Ordering::SeqCst);
-
-    match creation_result {
-        Ok(result) => {
-            crate::output::human::write_new_result(
-                &result,
-                request,
-                was_interrupted,
-                context.terminal,
-            )
-            .map_err(CliError::from)?;
-            if !matches!(result.state, MicroVmState::Configured) {
-                return Err(CliError::Sdk(SdkError::Migration(
-                    "creation returned without reaching the configured state".to_owned(),
-                )));
-            }
-            Ok(0)
-        }
-        Err(error) => {
-            if matches!(
-                error,
-                SdkError::ConfigurationConflict { .. } | SdkError::LifecycleConflict { .. }
-            ) {
-                return Err(CliError::conflict(
-                    "MicroVM name is already in use",
-                    error.to_string(),
-                    "Choose another --name or remove the existing VM",
-                ));
-            }
-            Err(map_creation_error(error, was_interrupted))
-        }
-    }
+    run_creation(context, request).await
 }
 
 fn map_provisioning_error(label: &str, error: SdkError) -> CliError {
@@ -912,9 +1277,88 @@ fn map_creation_error(error: SdkError, was_interrupted: bool) -> CliError {
 #[cfg(test)]
 mod tests {
     use super::{
-        check_disk_minimum, check_memory_minimum, check_vcpu_minimum, format_gb, format_mb_gb,
-        parse_disk_gb, parse_memory, parse_single_image, parse_vcpus, resolve_name, validate_name,
+        check_disk_minimum, check_memory_minimum, check_vcpu_minimum, format_gb, format_gb_flag,
+        format_mb_gb, format_memory_flag, parse_disk_gb, parse_memory, parse_single_image,
+        parse_vcpus, resolve_name, validate_name,
     };
+    use taumaru_microvm::{
+        Architecture, BootConfiguration, Distribution, DistributionImage, DistributionRequirements,
+        FilesystemMetadata, Kernel,
+    };
+
+    fn test_distribution() -> Distribution {
+        Distribution {
+            id: "distro-a".to_owned(),
+            name: "distro-a".to_owned(),
+            display_name: "distro-a".to_owned(),
+            description: "distro-a".to_owned(),
+            distribution: "distro-a".to_owned(),
+            version: "1.0".to_owned(),
+            codename: "test".to_owned(),
+            architecture: Architecture::X86_64,
+            vendor: "Taumaru".to_owned(),
+            homepage: "https://example.invalid".to_owned(),
+            default_kernel: "kernel-a".to_owned(),
+            supported_kernels: vec!["kernel-a".to_owned()],
+            boot: BootConfiguration {
+                root_device: "/dev/vda".to_owned(),
+                kernel_args: Vec::new(),
+            },
+            requirements: DistributionRequirements {
+                min_memory_mb: 128,
+                min_vcpus: 1,
+            },
+            images: Vec::new(),
+        }
+    }
+
+    fn test_image() -> DistributionImage {
+        DistributionImage {
+            id: "image-a".to_owned(),
+            name: "image-a".to_owned(),
+            display_name: "image-a".to_owned(),
+            description: "image-a".to_owned(),
+            variant: "minimal".to_owned(),
+            path: "images/image-a".to_owned(),
+            url: "https://example.invalid/image-a".to_owned(),
+            filename: "image-a.ext4".to_owned(),
+            format: "ext4".to_owned(),
+            filesystem: FilesystemMetadata {
+                filesystem_type: "ext4".to_owned(),
+                uuid: "uuid-image-a".to_owned(),
+                block_size: 4096,
+                block_count: 1,
+                free_blocks: 0,
+                inode_count: 1,
+                free_inodes: 0,
+                features: Vec::new(),
+            },
+            size_bytes: 37,
+            sha256: "0".repeat(64),
+            capabilities: Vec::new(),
+            mime_type: "application/octet-stream".to_owned(),
+            modified_at: "2026-01-01T00:00:00Z".to_owned(),
+        }
+    }
+
+    fn test_kernel() -> Kernel {
+        Kernel {
+            id: "kernel-a".to_owned(),
+            name: "kernel-a".to_owned(),
+            display_name: "kernel-a".to_owned(),
+            version: "6.2.0".to_owned(),
+            architecture: Architecture::X86_64,
+            path: "kernels/kernel-a/vmlinux".to_owned(),
+            url: "https://example.invalid/kernel-a".to_owned(),
+            filename: "vmlinux".to_owned(),
+            size_bytes: 13,
+            sha256: "0".repeat(64),
+            format: "elf".to_owned(),
+            mime_type: "application/octet-stream".to_owned(),
+            elf: None,
+            modified_at: "2026-01-01T00:00:00Z".to_owned(),
+        }
+    }
 
     #[test]
     fn name_rules_reject_invalid_values() {
@@ -1177,6 +1621,68 @@ mod tests {
         assert!(message.contains("MicroVM creation cancelled"));
         assert!(!message.contains("Download"));
         assert!(!message.contains("artifacts download"));
+    }
+
+    #[test]
+    fn flag_formatters_round_trip_through_parsers() {
+        use super::{parse_disk_gb, parse_memory};
+        assert_eq!(
+            parse_disk_gb(&format_gb_flag(20 * 1024 * 1024 * 1024)).expect("disk flag"),
+            20 * 1024 * 1024 * 1024
+        );
+        assert_eq!(
+            parse_memory(&format_memory_flag(2 * 1024 * 1024 * 1024)).expect("memory flag"),
+            2 * 1024 * 1024 * 1024
+        );
+        assert_eq!(
+            parse_memory(&format_memory_flag(512 * 1024 * 1024)).expect("mb flag"),
+            512 * 1024 * 1024
+        );
+    }
+
+    #[test]
+    fn escalated_child_replays_collected_values_non_interactively() {
+        use super::escalated_child_command;
+        use super::{NewImageChoice, NewVmRequest};
+
+        let request = NewVmRequest {
+            name: "web-01".to_owned(),
+            distribution_id: "distro-a".to_owned(),
+            image_id: "image-a".to_owned(),
+            disk_size_bytes: 20 * 1024 * 1024 * 1024,
+            memory_bytes: 2 * 1024 * 1024 * 1024,
+            vcpu_count: 2,
+            expose_on_lan: true,
+        };
+        let choice = NewImageChoice {
+            distribution: test_distribution(),
+            image: test_image(),
+            kernel: test_kernel(),
+            expected_bytes: 37,
+        };
+        let command = escalated_child_command(&request, &choice);
+        let rendered: Vec<String> = command
+            .iter()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            rendered,
+            vec![
+                "new",
+                "web-01",
+                "--non-interactive",
+                "--image",
+                "distro-a=image-a",
+                "--disk-gb",
+                format_gb_flag(request.disk_size_bytes).as_str(),
+                "--memory",
+                format_memory_flag(request.memory_bytes).as_str(),
+                "--vcpus",
+                "2",
+                "--expose-lan",
+                "--trusted-values",
+            ]
+        );
     }
 
     #[test]

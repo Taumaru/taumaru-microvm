@@ -3,6 +3,7 @@ mod commands;
 mod context;
 mod error;
 mod output;
+mod privilege;
 
 use std::process::ExitCode;
 

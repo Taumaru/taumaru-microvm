@@ -15,7 +15,7 @@ clap.workspace = true
 indicatif.workspace = true
 inquire.workspace = true
 semver.workspace = true
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal"] }
+tokio = { workspace = true, features = ["macros", "process", "rt-multi-thread", "signal"] }
 taumaru-microvm = { path = "../sdk" }
 
 [dev-dependencies]

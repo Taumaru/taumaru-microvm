@@ -25,7 +25,9 @@ cargo run -p taumaru-microvm-cli -- new
 ```
 
 The command collects values in a fixed order, prompting only for what is
-missing:
+missing. Creation needs root: after confirmation a non-root terminal re-runs
+itself elevated (sudo, pkexec fallback) with the collected values; without a
+TTY or with `--non-interactive`, run the same command with sudo or as root.
 
 ```text
 cargo run -p taumaru-microvm-cli -- new web-01 --disk-gb 20 --memory 2GB

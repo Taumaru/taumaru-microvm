@@ -86,6 +86,20 @@ impl CliError {
         Self::Cancelled
     }
 
+    pub(crate) fn privileged(retry_hint: impl Into<String>) -> Self {
+        Self::Creation(format!(
+            "Elevated rights are required\u{1f}MicroVM creation configures host networking and storage\u{1f}{}",
+            retry_hint.into()
+        ))
+    }
+
+    pub(crate) fn escalation_unavailable() -> Self {
+        Self::Creation(
+            "Elevated rights are required\u{1f}neither sudo nor pkexec is available on this host\u{1f}Install sudo or polkit, or run the command as root"
+                .to_string(),
+        )
+    }
+
     pub(crate) fn exit_code(&self) -> u8 {
         match self {
             Self::Prompt(message) if message == "cancelled" => 130,

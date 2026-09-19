@@ -101,6 +101,31 @@ missing explicit values are rejected with the required flag form and an
 example. The command performs no prompts at all in `--non-interactive` mode
 and reports the first missing or invalid value with usage guidance.
 
+## Privilege escalation
+
+MicroVM creation configures host networking and storage, which requires root.
+After confirmation (or non-interactive validation) and before any provisioning,
+the command checks the effective user ID:
+
+- already root: proceeds with no change;
+- interactive without root: re-executes itself elevated (`sudo` preferred,
+  `pkexec` fallback) as `microvm new <name> --non-interactive --image
+  DISTRIBUTION=IMAGE --disk-gb <N> --memory <xMB|xGB> --vcpus <N>
+  [--expose-lan] --trusted-values` with `TAUMARU_HOME`, a
+  `TAUMARU_ESCALATED=1` guard, and the parent-validated kernel, image size,
+  minimums, and runtime list carried into the child, then exits with the
+  child's status (signal death maps to `130`). The child skips registry
+  discovery output and goes straight to provisioning; Ctrl-C while elevated
+  kills the child tree and reports `130`;
+- non-interactive without root, or no TTY: fails with an elevated-rights error
+  and no prompt;
+- neither `sudo` nor `pkexec` available: fails with an actionable error;
+- the escalated child (`TAUMARU_ESCALATED=1`) never re-escalates.
+
+The escalation helper lives in `crates/cli/src/privilege.rs` and is reusable by
+future commands: backend choice, argv building with the home carried inline,
+exit mapping, and the non-interactive/TTY guards.
+
 ## Collection and execution
 
 The command builds one immutable request from the SDK listing results. It
