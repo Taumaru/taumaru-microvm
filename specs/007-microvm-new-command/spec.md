@@ -161,7 +161,7 @@ As a host operator, I want a failed creation to explain what happened, what rema
 - The resolved default kernel for the image's distribution is the same kernel creation resolves, so provisioning it during this flow always leaves creation satisfiable for the downloaded image.
 - Runtime bundle selection keeps the existing policy: highest published version per required component on the host architecture, reusing one package when it provides both components.
 - GB means gibibytes (1024 cubed bytes) and MB means mebibytes (1024 squared bytes) for both disk and memory inputs; memory matching is case-insensitive with optional spacing and fractional disk and memory values are accepted, with fractional byte results rounded up.
-- The per-image downloaded marker reflects the existing local-state behavior for that image; kernel and runtime readiness are resolved silently during provisioning rather than shown per image.
+- The per-image downloaded marker is an optimistic presence hint from one local inventory query with no registry access and no file hashing; a stale or corrupted file can still show as downloaded, and provisioning revalidates integrity and repairs it before creation. Kernel and runtime readiness are resolved silently during provisioning rather than shown per image.
 - Host-only networking is the default; LAN exposure is explicit opt-in with automatic addressing and no caller-supplied address in this feature.
 - The VM directory always uses the managed default location for the given name; no custom volume path is offered in this feature.
 - The CLI keeps the existing home policy: a custom base directory only through the environment, defaulting to the user-home path otherwise, passed explicitly to the SDK operations.

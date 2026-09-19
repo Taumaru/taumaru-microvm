@@ -547,6 +547,22 @@ impl MicroVmSdk {
         Ok(binary)
     }
 
+    /// Lists locally present distribution images for display markers.
+    ///
+    /// Returns the `(distribution_id, image_id)` pairs whose inventory relationship
+    /// exists with a verified download row. Presence is optimistic: it answers from
+    /// the local inventory in one query without registry access, file hashing, or
+    /// download. A stale or corrupted file can still be listed here; provisioning
+    /// revalidates integrity and repairs it before creation. The query performs no
+    /// download, mutation, repair, or persistence write, and emits no output, logs,
+    /// or global state.
+    pub async fn list_present_distribution_images(
+        &self,
+    ) -> Result<Vec<(String, String)>, SdkError> {
+        self.run_repository(|repository| repository.list_ready_distribution_images())
+            .await
+    }
+
     /// Reports whether a distribution image is verified locally.
     ///
     /// Returns `true` only when the per-image inventory relationship exists and the

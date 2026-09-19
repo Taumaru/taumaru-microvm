@@ -102,9 +102,8 @@ remains stable:
 
 Create this MicroVM? [y/N]
 
-↓  runtime/firecracker-1.14.1-x86_64  Downloading  8.0 MiB / 8.0 MiB
-✓  kernel/linux-6.8-x86_64  Already available  16.0 MiB / 16.0 MiB
-↓  image/ubuntu-24.04/ubuntu-24.04-docker  Downloading  4.0 GiB / 4.0 GiB
+⠋ ━━━━━━━━━━━━━━━━━━━━━━━━━━━ 4.0 GiB/4.0 GiB image/ubuntu-24.04/ubuntu-24.04-docker · Downloading
+✓  Prerequisites ready
 ◆  creation/validation  Finished  1/6
 ◆  creation/volume_preparation  InProgress  512 MiB / 4.0 GiB
 ✓  MicroVM web-01 created · host-only 192.168.127.2 · 20 GB · 2 GB · 2 vCPUs

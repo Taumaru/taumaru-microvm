@@ -7,9 +7,9 @@ use taumaru_microvm::{
 };
 
 use super::download::{
-    ArtifactClient, OperationResult, RegistryCatalog, SdkArtifactClient, availability_for_files,
-    binary_package_size, call_with_signal, checked_size_add, format_image_bytes, host_architecture,
-    load_catalog, parse_image_selections, prompt_error, prompt_render_config, same_architecture,
+    ArtifactClient, OperationResult, RegistryCatalog, SdkArtifactClient, binary_package_size,
+    call_with_signal, checked_size_add, format_image_bytes, host_architecture, load_catalog,
+    parse_image_selections, prompt_render_config, same_architecture,
 };
 use crate::cli::NewArgs;
 use crate::context::{CliContext, TerminalCapabilities};
@@ -84,6 +84,20 @@ pub(crate) fn validate_name(name: &str) -> Result<String, CliError> {
     }
 }
 
+fn new_prompt_error(error: inquire::InquireError) -> CliError {
+    let message = error.to_string();
+    let normalized = message.to_ascii_lowercase();
+    if normalized.contains("cancel") || normalized.contains("interrupt") {
+        CliError::cancelled()
+    } else {
+        CliError::creation(
+            "MicroVM creation input could not be completed",
+            message,
+            "Check terminal input and try again",
+        )
+    }
+}
+
 fn invalid_name(name: &str) -> CliError {
     CliError::creation(
         "Machine name is invalid",
@@ -96,7 +110,9 @@ fn invalid_name(name: &str) -> CliError {
 
 pub(crate) fn parse_disk_gb(value: &str) -> Result<u64, CliError> {
     let trimmed = value.trim();
-    let amount: f64 = trimmed.parse().unwrap_or(f64::NAN);
+    let lower = trimmed.to_ascii_lowercase();
+    let amount_text = lower.strip_suffix("gb").map(str::trim).unwrap_or(trimmed);
+    let amount: f64 = amount_text.parse().unwrap_or(f64::NAN);
     if !amount.is_finite() || amount <= 0.0 {
         return Err(CliError::creation(
             "Disk size is invalid",
@@ -123,7 +139,7 @@ pub(crate) fn parse_memory(value: &str) -> Result<u64, CliError> {
     } else if let Some(amount) = lower.strip_suffix("mb") {
         (amount.trim(), BYTES_PER_MIB_F64)
     } else {
-        return Err(invalid_memory(value));
+        (trimmed, BYTES_PER_MIB_F64)
     };
     let amount: f64 = amount_text.parse().unwrap_or(f64::NAN);
     if amount_text.is_empty() || !amount.is_finite() || amount <= 0.0 {
@@ -375,7 +391,7 @@ async fn prompt_name(terminal: TerminalCapabilities) -> Result<String, CliError>
         .with_help_message("1-64 ASCII, starts alphanumeric, letters/digits/-/_")
         .with_render_config(prompt_render_config(terminal.color))
         .prompt()
-        .map_err(prompt_error)?;
+        .map_err(new_prompt_error)?;
     validate_name(answer.trim())
 }
 
@@ -392,11 +408,12 @@ async fn prompt_image(
             "Check registry access and host architecture support",
         ));
     }
+    let present = sdk.list_present_distribution_images().await?;
     let mut options: Vec<(String, String, ImageOption)> = Vec::with_capacity(pairs.len());
     for (distribution, image) in &pairs {
-        let downloaded = sdk
-            .is_distribution_image_ready(&distribution.id, &image.id)
-            .await?;
+        let downloaded = present.iter().any(|(ready_distribution, ready_image)| {
+            ready_distribution == &distribution.id && ready_image == &image.id
+        });
         let marker = if downloaded {
             "downloaded"
         } else {
@@ -433,7 +450,7 @@ async fn prompt_image(
         .with_page_size(10)
         .with_render_config(prompt_render_config(terminal.color))
         .prompt()
-        .map_err(prompt_error)?;
+        .map_err(new_prompt_error)?;
     let (distribution_id, image_id) = options
         .into_iter()
         .find(|(_, _, option)| option.id == selected.id)
@@ -453,7 +470,7 @@ async fn prompt_disk(minimum_bytes: u64, preset: Option<&str>) -> Result<(String
         .with_help_message("positive number in GB, for example 20 or 20.5")
         .with_render_config(prompt_render_config(TerminalCapabilities::detect().color))
         .prompt()
-        .map_err(prompt_error)?;
+        .map_err(new_prompt_error)?;
     let bytes = parse_disk_gb(answer.trim())?;
     check_disk_minimum(bytes, minimum_bytes)?;
     Ok((answer.trim().to_owned(), bytes))
@@ -473,7 +490,7 @@ async fn prompt_memory(
         .with_help_message("xMB or xGB, for example 512MB or 1.5GB")
         .with_render_config(prompt_render_config(TerminalCapabilities::detect().color))
         .prompt()
-        .map_err(prompt_error)?;
+        .map_err(new_prompt_error)?;
     let bytes = parse_memory(answer.trim())?;
     check_memory_minimum(bytes, minimum_bytes)?;
     Ok((answer.trim().to_owned(), bytes))
@@ -488,7 +505,7 @@ async fn prompt_vcpus(minimum: u32, preset: Option<&str>) -> Result<u32, CliErro
         .with_help_message("positive integer count")
         .with_render_config(prompt_render_config(TerminalCapabilities::detect().color))
         .prompt()
-        .map_err(prompt_error)?;
+        .map_err(new_prompt_error)?;
     parse_vcpus(answer.trim())
 }
 
@@ -607,10 +624,6 @@ pub(crate) async fn run(context: &CliContext, arguments: NewArgs) -> Result<u8, 
                 "Pass --image DISTRIBUTION=IMAGE exactly once",
             )
         })?;
-        let _ = context
-            .sdk
-            .is_distribution_image_ready(&distribution_id, &image_id)
-            .await?;
         resolve_choice(&catalog, &distribution_id, &image_id)?
     } else if explicit && arguments.non_interactive {
         return Err(CliError::missing_value(
@@ -682,7 +695,7 @@ pub(crate) async fn run(context: &CliContext, arguments: NewArgs) -> Result<u8, 
             .with_help_message("No keeps the VM host-only  ·  Ctrl-C cancels")
             .with_render_config(prompt_render_config(context.terminal.color))
             .prompt()
-            .map_err(prompt_error)?
+            .map_err(new_prompt_error)?
     };
 
     let request = build_request(
@@ -710,7 +723,7 @@ pub(crate) async fn run(context: &CliContext, arguments: NewArgs) -> Result<u8, 
             .with_help_message("Enter creates the MicroVM  ·  Ctrl-C cancels")
             .with_render_config(prompt_render_config(context.terminal.color))
             .prompt()
-            .map_err(prompt_error)?;
+            .map_err(new_prompt_error)?;
         if !confirmed {
             return Err(CliError::cancelled());
         }
@@ -745,13 +758,12 @@ async fn execute_request(
     let cancellation = DownloadCancellation::new();
     let mut renderer =
         crate::output::human::NewProgressRenderer::new(plan.provision_bytes, context.terminal);
-
     for package in &plan.runtime_packages {
         let package_id = package.id.clone();
         let package_bytes = binary_package_size(package)?;
-        let completed = renderer.completed_bytes();
-        let mut forward =
-            super::download::ProgressForwarder::new(&mut renderer, completed, plan.provision_bytes);
+        let label = format!("runtime/{package_id}");
+        renderer.begin_member(&label, package_bytes);
+        let mut forward = super::download::ProgressForwarder::new(&mut renderer, 0, package_bytes);
         let call = client.download_binary(&package_id, &cancellation, |progress| {
             forward.forward(progress);
         });
@@ -760,23 +772,11 @@ async fn execute_request(
             return Err(error);
         }
         match result {
-            OperationResult::Finished(Ok(downloaded)) => {
-                let availability = availability_for_files(&downloaded.files);
-                renderer.finish_member(
-                    &format!("runtime/{package_id}"),
-                    package_bytes,
-                    availability_label(&availability),
-                )?;
-            }
+            OperationResult::Finished(Ok(_)) => {}
             OperationResult::Finished(Err(error)) => {
-                renderer.finish();
-                return Err(map_provisioning_error(
-                    &format!("runtime/{package_id}"),
-                    error,
-                ));
+                return Err(map_provisioning_error(&label, error));
             }
             OperationResult::Cancelled => {
-                renderer.finish();
                 return Err(CliError::cancelled());
             }
         }
@@ -784,9 +784,10 @@ async fn execute_request(
 
     let kernel_id = plan.kernel.id.clone();
     {
-        let completed = renderer.completed_bytes();
+        let label = format!("kernel/{kernel_id}");
+        renderer.begin_member(&label, plan.kernel.size_bytes);
         let mut forward =
-            super::download::ProgressForwarder::new(&mut renderer, completed, plan.provision_bytes);
+            super::download::ProgressForwarder::new(&mut renderer, 0, plan.kernel.size_bytes);
         let call = client.download_kernel(&kernel_id, &cancellation, |progress| {
             forward.forward(progress);
         });
@@ -795,23 +796,11 @@ async fn execute_request(
             return Err(error);
         }
         match result {
-            OperationResult::Finished(Ok(downloaded)) => {
-                let availability = availability_for_files(std::slice::from_ref(&downloaded.file));
-                renderer.finish_member(
-                    &format!("kernel/{kernel_id}"),
-                    plan.kernel.size_bytes,
-                    availability_label(&availability),
-                )?;
-            }
+            OperationResult::Finished(Ok(_)) => {}
             OperationResult::Finished(Err(error)) => {
-                renderer.finish();
-                return Err(map_provisioning_error(
-                    &format!("kernel/{kernel_id}"),
-                    error,
-                ));
+                return Err(map_provisioning_error(&label, error));
             }
             OperationResult::Cancelled => {
-                renderer.finish();
                 return Err(CliError::cancelled());
             }
         }
@@ -819,9 +808,9 @@ async fn execute_request(
 
     {
         let label = format!("image/{}/{}", choice.distribution.id, choice.image.id);
-        let completed = renderer.completed_bytes();
+        renderer.begin_member(&label, choice.expected_bytes);
         let mut forward =
-            super::download::ProgressForwarder::new(&mut renderer, completed, plan.provision_bytes);
+            super::download::ProgressForwarder::new(&mut renderer, 0, choice.expected_bytes);
         let call = client.download_distribution_image(
             &choice.distribution.id,
             &choice.image.id,
@@ -833,24 +822,17 @@ async fn execute_request(
             return Err(error);
         }
         match result {
-            OperationResult::Finished(Ok(downloaded)) => {
-                let availability = availability_for_files(std::slice::from_ref(&downloaded.file));
-                renderer.finish_member(
-                    &label,
-                    choice.expected_bytes,
-                    availability_label(&availability),
-                )?;
-            }
+            OperationResult::Finished(Ok(_)) => {}
             OperationResult::Finished(Err(error)) => {
-                renderer.finish();
                 return Err(map_provisioning_error(&label, error));
             }
             OperationResult::Cancelled => {
-                renderer.finish();
                 return Err(CliError::cancelled());
             }
         }
     }
+
+    renderer.finish_all(context.terminal);
 
     let sdk_request = creation_sdk_request(request);
     let interrupted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -927,15 +909,6 @@ fn map_creation_error(error: SdkError, was_interrupted: bool) -> CliError {
     )
 }
 
-fn availability_label(availability: &super::download::Availability) -> &'static str {
-    match availability {
-        super::download::Availability::Downloaded => "Downloaded",
-        super::download::Availability::Adopted => "Adopted",
-        super::download::Availability::AlreadyAvailable => "Already available",
-        super::download::Availability::Mixed => "Verified",
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
@@ -961,6 +934,16 @@ mod tests {
         );
         assert!(resolve_name(Some("web-01"), Some("db-01")).is_err());
         assert!(resolve_name(None, None).is_err());
+    }
+
+    #[test]
+    fn disk_values_accept_optional_gb_suffix() {
+        let gib = 1024 * 1024 * 1024;
+        assert_eq!(parse_disk_gb("10GB").expect("upper"), 10 * gib);
+        assert_eq!(parse_disk_gb("10Gb").expect("mixed"), 10 * gib);
+        assert_eq!(parse_disk_gb("10gb").expect("lower"), 10 * gib);
+        assert_eq!(parse_disk_gb("10 GB").expect("spaced"), 10 * gib);
+        assert!(parse_disk_gb("10MB").is_err());
     }
 
     #[test]
@@ -996,7 +979,14 @@ mod tests {
             fractional,
             (1.5_f64 * 1024.0 * 1024.0 * 1024.0).ceil() as u64
         );
-        assert!(parse_memory("512").is_err());
+        assert_eq!(
+            parse_memory("512").expect("bare means MB"),
+            512 * 1024 * 1024
+        );
+        assert_eq!(
+            parse_memory(" 512 ").expect("trimmed bare"),
+            512 * 1024 * 1024
+        );
         assert!(parse_memory("2TB").is_err());
         assert!(parse_memory("0MB").is_err());
     }
@@ -1175,6 +1165,18 @@ mod tests {
         let message = provisioned.user_message(false).to_ascii_lowercase();
         assert!(message.contains("kernel/kernel-a"));
         assert!(message.contains("verified prerequisites will be reused"));
+    }
+
+    #[test]
+    fn prompt_cancellation_reports_creation_not_download() {
+        use super::new_prompt_error;
+
+        let cancelled = new_prompt_error(inquire::InquireError::OperationCanceled);
+        assert_eq!(cancelled.exit_code(), 130);
+        let message = cancelled.user_message(false);
+        assert!(message.contains("MicroVM creation cancelled"));
+        assert!(!message.contains("Download"));
+        assert!(!message.contains("artifacts download"));
     }
 
     #[test]

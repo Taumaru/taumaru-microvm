@@ -148,19 +148,22 @@ No download plan table is rendered at any point.
 
 ## Progress and output
 
-Provisioning progress uses a compact aggregate view plus a current-member
-line. Creation progress uses a percent bar driven by `overall_percent` plus
-a current-stage line. Displayed content:
+Provisioning shows exactly one reused progress bar: each member resets it to
+that member's expected bytes and updates the message to the current member
+(`runtime/{package}`, `kernel/{id}`, or `image/{distribution}/{image}`) with
+its `Downloading`/`Verifying` stage. No per-member completion lines are
+printed. When provisioning ends, the bar is cleared and exactly one
+`Prerequisites ready` check line is printed. Creation progress then uses a
+percent bar driven by `overall_percent` plus a current-stage line. Displayed
+content:
 
-- artifact identity: `runtime/{package}[/{file}]`, `kernel/{id}`,
+- artifact identity: `runtime/{package}`, `kernel/{id}`,
   `image/{distribution}/{image}`, or `creation/{stage}`;
 - `Downloading`, `Verifying`, `Started`, `InProgress`, `Finished`, or
   terminal stage;
 - current and expected member bytes where applicable;
-- aggregate current and expected provisioning bytes during provisioning;
 - step counters (`N/6`) and outcome (`Completed`, `AlreadyConfigured`,
-  `Failed`) during creation;
-- terminal cache disposition for reused prerequisites.
+  `Failed`) during creation.
 
 Progress and diagnostics go to stderr. The final creation summary goes to
 stdout: identity, network mode with address, volume location, resource

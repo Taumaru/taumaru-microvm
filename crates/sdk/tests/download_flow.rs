@@ -475,3 +475,43 @@ async fn image_readiness_tracks_download_repair_and_rejection()
     assert_eq!(server.artifact_request_count(), requests_after_download);
     Ok(())
 }
+
+#[tokio::test]
+async fn present_images_list_reports_inventory_without_registry_or_hashing()
+-> Result<(), Box<dyn Error + Send + Sync>> {
+    let server = FixtureServer::start().await?;
+    let home = tempdir()?;
+    let sdk = MicroVmSdk::with_registry_base_url(home.path(), server.base_url())?;
+
+    assert!(sdk.list_present_distribution_images().await?.is_empty());
+
+    sdk.download_distribution_image("alpine-test-1.0", "alpine-test-minimal", |_| {})
+        .await?;
+    let requests_after_download = server.artifact_request_count();
+    let present = sdk.list_present_distribution_images().await?;
+    assert_eq!(
+        present,
+        vec![(
+            "alpine-test-1.0".to_owned(),
+            "alpine-test-minimal".to_owned()
+        )]
+    );
+
+    let image_path = home
+        .path()
+        .join("artifacts/rootfs/alpine-test-1.0/alpine-test-minimal/alpine-test-minimal.ext4");
+    std::fs::write(&image_path, b"stale-bytes")?;
+    assert!(
+        !sdk.is_distribution_image_ready("alpine-test-1.0", "alpine-test-minimal")
+            .await?
+    );
+    assert_eq!(
+        sdk.list_present_distribution_images().await?,
+        vec![(
+            "alpine-test-1.0".to_owned(),
+            "alpine-test-minimal".to_owned()
+        )]
+    );
+    assert_eq!(server.artifact_request_count(), requests_after_download);
+    Ok(())
+}

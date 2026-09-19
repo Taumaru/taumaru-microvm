@@ -534,8 +534,6 @@ pub(crate) fn write_new_review(
 
 pub(crate) struct NewProgressRenderer {
     bar: ProgressBar,
-    completed: u64,
-    total: u64,
     capabilities: TerminalCapabilities,
 }
 
@@ -561,23 +559,22 @@ impl NewProgressRenderer {
             Err(_) => ProgressStyle::default_bar().progress_chars("=>-"),
         };
         bar.set_style(style);
-        Self {
-            bar,
-            completed: 0,
-            total,
-            capabilities,
-        }
+        Self { bar, capabilities }
     }
 
-    pub(crate) fn completed_bytes(&self) -> u64 {
-        self.completed
+    pub(crate) fn begin_member(&self, label: &str, member_bytes: u64) {
+        self.bar.reset();
+        self.bar.set_length(member_bytes);
+        self.bar.set_position(0);
+        self.bar.set_message(label.to_owned());
     }
 
     pub(crate) fn on_progress(&mut self, progress: DownloadProgressView) {
-        let position = progress
-            .aggregate_current_bytes
-            .min(progress.plan_total_bytes);
-        self.bar.set_position(position);
+        self.bar.set_position(
+            progress
+                .aggregate_current_bytes
+                .min(progress.aggregate_expected_bytes),
+        );
         self.bar.set_message(format!(
             "{} · {}",
             new_artifact_label(&progress),
@@ -588,31 +585,13 @@ impl NewProgressRenderer {
         }
     }
 
-    pub(crate) fn finish_member(
-        &mut self,
-        label: &str,
-        member_bytes: u64,
-        disposition: &str,
-    ) -> Result<(), io::Error> {
-        self.completed = self.completed.saturating_add(member_bytes);
-        self.bar.set_position(self.completed.min(self.total));
-        self.bar.set_message(label.to_owned());
-        if self.capabilities.interactive {
-            eprintln!(
-                "{}  {}  {}  {}",
-                paint("\u{2713}", ANSI_GREEN, self.capabilities.color),
-                label,
-                paint(disposition, ANSI_DIM, self.capabilities.color),
-                format_bytes(member_bytes),
-            );
-        }
-        Ok(())
-    }
-
-    pub(crate) fn finish(self) {
-        if self.capabilities.interactive {
-            self.bar.finish_and_clear();
-        }
+    pub(crate) fn finish_all(&self, capabilities: TerminalCapabilities) {
+        self.bar.finish_and_clear();
+        eprintln!(
+            "{}  {}",
+            paint("\u{2713}", ANSI_GREEN, capabilities.color),
+            paint("Prerequisites ready", ANSI_BOLD, capabilities.color),
+        );
     }
 }
 

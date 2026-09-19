@@ -53,9 +53,12 @@ Alternatives considered:
 
 ### 2. One additive SDK read-only query for the image marker
 
-Decision: add a single public read-only SDK method that reports whether the
-selected image is already verified locally, reusing the existing private
-`resolve_distribution_image` plus file-integrity recheck path:
+Decision: add public read-only SDK presence queries. The per-image
+`is_distribution_image_ready` reuses the existing private
+`resolve_distribution_image` plus file-integrity recheck path, and the batch
+`list_present_distribution_images` answers from verified inventory rows in one
+local query with no registry access and no file hashing (optimistic marker;
+provisioning revalidates before creation):
 
 ```rust
 impl MicroVmSdk {

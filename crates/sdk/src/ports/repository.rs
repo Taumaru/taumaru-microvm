@@ -62,6 +62,8 @@ pub(crate) trait ArtifactRepository: Send + Sync {
         image_id: &str,
     ) -> Result<LocalArtifact, SdkError>;
 
+    fn list_ready_distribution_images(&self) -> Result<Vec<(String, String)>, SdkError>;
+
     #[allow(dead_code)]
     fn list_installed_binaries(&self) -> Result<Vec<InstalledBinary>, SdkError>;
 }

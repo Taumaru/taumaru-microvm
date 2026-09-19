@@ -5,9 +5,16 @@ contains no CLI command, shell command, SQLite statement, or registry HTTP
 implementation detail. All existing acquisition, persistence, and creation
 behavior is unchanged.
 
-## New public operation
+## New public operations
 
 ```rust
+impl MicroVmSdk {
+    /// Lists locally present distribution images for display markers.
+    pub async fn list_present_distribution_images(
+        &self,
+    ) -> Result<Vec<(String, String)>, SdkError>;
+}
+
 impl MicroVmSdk {
     /// Reports whether a distribution image is verified locally.
     pub async fn is_distribution_image_ready(
@@ -43,6 +50,11 @@ Required behavior:
 7. Stay silent: no stdout/stderr, logging subscriber, tracing event, process
    exit, or global mutable state. All expected failures are typed `SdkError`
    values.
+
+The presence list is optimistic: pairs come from verified inventory rows in one
+local query with no registry access and no file hashing. A stale or corrupted file
+can still be listed; provisioning revalidates integrity and repairs it before
+creation, so the marker is a display hint, never a readiness guarantee.
 
 ## Preserved behavior
 

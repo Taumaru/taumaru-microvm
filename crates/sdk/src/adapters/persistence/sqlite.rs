@@ -634,6 +634,23 @@ impl ArtifactRepository for SqliteRepository {
         local_artifact_from_row(row, "distribution image", image_id)
     }
 
+    fn list_ready_distribution_images(&self) -> Result<Vec<(String, String)>, SdkError> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT dist.registry_id, di.registry_id
+             FROM distribution_images di
+             JOIN distributions dist ON dist.id = di.distribution_id
+             JOIN downloads d ON d.id = di.download_id
+             WHERE d.verification_status = 'verified'
+               AND d.actual_size_bytes = d.expected_size_bytes
+               AND d.actual_sha256 = d.expected_sha256",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(SdkError::from)
+    }
+
     fn list_installed_binaries(&self) -> Result<Vec<InstalledBinary>, SdkError> {
         let connection = self.connection()?;
         let mut statement = connection.prepare(

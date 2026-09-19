@@ -59,7 +59,7 @@ The single operator-chosen image with its resolved context.
 | `distribution` | `Distribution` | Host-compatible published distribution owning the image |
 | `image` | `DistributionImage` | Host-compatible (via distribution) published image |
 | `kernel` | `Kernel` | That distribution's published default kernel, host-compatible |
-| `downloaded` | `bool` | SDK-reported readiness: verified locally or still needs fetching |
+| `downloaded` | `bool` | Optimistic presence from one local inventory query, or still needs fetching |
 | `expected_bytes` | `u64` | `image.size_bytes` (checked into the provisioning total) |
 
 Choices are ordered by `(distribution.id, image.id)` in the selector. There
@@ -204,9 +204,10 @@ Transition rules:
 - The runtime packages match the host architecture and collectively provide
   both required components (`firecracker`, `firectl`); a package containing
   both is selected only once.
-- The downloaded marker is `true` only from an `Ok(true)` SDK readiness
-  result; SDK errors abort the flow rather than rendering a marker.
+- The downloaded marker is `true` for pairs in the SDK presence list (verified
+  inventory rows, no file hashing); SDK errors abort the flow rather than
+  rendering a marker.
 - A request is never reported ready merely because a local path exists.
-  Readiness comes only from verified SDK results.
+  Creation readiness comes only from verified SDK results during provisioning.
 - Every registry ID is displayed and executed as data; it is never turned
   into a filesystem path by the CLI.
