@@ -2886,7 +2886,7 @@ mod tests {
                     guest_mac: request.guest_mac.clone(),
                     dhcp_lease_reference: None,
                     desired_boot_parameters: format!(
-                        "ip={guest}::{host}:255.255.255.252::{tap_name}:off"
+                        "ip={guest}::{host}:255.255.255.252::eth0:off"
                     ),
                     resources,
                     bridge_created_by_sdk: false,

@@ -14,6 +14,8 @@ const PRIVATE_POOL_START: u32 = (172_u32 << 24) | (30_u32 << 16);
 const PRIVATE_POOL_END: u32 = (172_u32 << 24) | (31_u32 << 16) | 0xff00;
 const SDK_OWNERSHIP: &str = "sdk:taumaru";
 const PRIVILEGE_HINT: &str = "the operation requires elevated network privileges (CAP_NET_ADMIN); run as root or grant the capability";
+/// Interface name inside the guest for Firecracker's network device.
+const GUEST_INTERFACE: &str = "eth0";
 
 /// Linux host-network adapter using `ip`, `sysctl`, and `nft` argument vectors.
 #[derive(Clone, Copy, Debug, Default)]
@@ -205,9 +207,11 @@ impl LinuxNetworkController {
             bridge_name: None,
             uplink_name: None,
         };
+        // The device field of `ip=` is resolved inside the guest, where the host TAP
+        // name is unknown.
         let desired_boot_parameters = format!(
-            "ip={}::{}:{}::{}:off",
-            guest, gateway, "255.255.255.252", tap_name
+            "ip={}::{}:{}::{GUEST_INTERFACE}:off",
+            guest, gateway, "255.255.255.252"
         );
         let mut applied = Vec::new();
         let forwarding_was_enabled = forwarding_enabled()?;
@@ -1659,8 +1663,8 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr};
 
     use super::{
-        allocate_subnet, bridge_name, guest_mac, is_nft_missing, is_privilege_denied,
-        route_with_device, tap_name,
+        GUEST_INTERFACE, allocate_subnet, bridge_name, guest_mac, is_nft_missing,
+        is_privilege_denied, route_with_device, tap_name,
     };
 
     #[test]
@@ -1731,5 +1735,10 @@ mod tests {
         assert!(!is_nft_missing(
             "Error: Operation not permitted (perhaps you must be root?)"
         ));
+    }
+
+    #[test]
+    fn host_only_boot_device_is_the_guest_interface() {
+        assert_eq!(GUEST_INTERFACE, "eth0");
     }
 }
