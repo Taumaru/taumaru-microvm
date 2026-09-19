@@ -996,6 +996,13 @@ impl MicroVmSdk {
         let outcome = self
             .network
             .configure(&network_request, None, &used_addresses)?;
+        if let (std::net::IpAddr::V4(guest_address), Some(std::net::IpAddr::V4(gateway))) = (
+            outcome.persisted.config.guest_address,
+            outcome.persisted.config.gateway,
+        ) {
+            self.storage
+                .write_guest_network_config(&prepared.path, guest_address, gateway)?;
+        }
         journal.network = Some(outcome.persisted.clone());
         let credential = PersistedCredential {
             private_key_path: generated.private_key_path,
@@ -2627,6 +2634,22 @@ mod tests {
             if !rootfs_path.is_file() {
                 return Err(SdkError::GuestFilesystem {
                     operation: "inject test public key".to_owned(),
+                    path: rootfs_path.to_path_buf(),
+                    reason: "test rootfs is missing".to_owned(),
+                });
+            }
+            Ok(())
+        }
+
+        fn write_guest_network_config(
+            &self,
+            rootfs_path: &Path,
+            _guest_address: std::net::Ipv4Addr,
+            _gateway: std::net::Ipv4Addr,
+        ) -> Result<(), SdkError> {
+            if !rootfs_path.is_file() {
+                return Err(SdkError::GuestFilesystem {
+                    operation: "write test network unit".to_owned(),
                     path: rootfs_path.to_path_buf(),
                     reason: "test rootfs is missing".to_owned(),
                 });

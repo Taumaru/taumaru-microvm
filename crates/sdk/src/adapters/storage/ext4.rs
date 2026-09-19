@@ -110,6 +110,15 @@ impl GuestStorage for Ext4Storage {
     fn inject_public_key(&self, rootfs_path: &Path, public_key: &str) -> Result<(), SdkError> {
         guest_fs::inject_public_key(rootfs_path, public_key)
     }
+
+    fn write_guest_network_config(
+        &self,
+        rootfs_path: &Path,
+        guest_address: std::net::Ipv4Addr,
+        gateway: std::net::Ipv4Addr,
+    ) -> Result<(), SdkError> {
+        guest_fs::write_guest_network_config(rootfs_path, guest_address, gateway)
+    }
 }
 
 fn verify_ext4_filesystem(path: &Path) -> Result<(), SdkError> {

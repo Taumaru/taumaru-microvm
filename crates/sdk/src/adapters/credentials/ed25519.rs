@@ -119,8 +119,7 @@ fn encode_private_key(
     }
 
     let mut encoded = Vec::new();
-    append_ssh_string(&mut encoded, b"openssh-key-v1\0")
-        .map_err(|_| PrivateKeyEncodingError::TooLarge)?;
+    encoded.extend_from_slice(b"openssh-key-v1\0");
     append_ssh_string(&mut encoded, b"none").map_err(|_| PrivateKeyEncodingError::TooLarge)?;
     append_ssh_string(&mut encoded, b"none").map_err(|_| PrivateKeyEncodingError::TooLarge)?;
     append_ssh_string(&mut encoded, b"").map_err(|_| PrivateKeyEncodingError::TooLarge)?;
@@ -241,5 +240,32 @@ mod tests {
                 .starts_with(b"-----BEGIN OPENSSH PRIVATE KEY-----")
         );
         assert!(!credential.fingerprint.is_empty());
+    }
+
+    #[test]
+    fn generated_private_key_loads_with_ssh_keygen() {
+        use std::process::{Command, Stdio};
+
+        let directory = tempdir().expect("temporary directory should exist");
+        let credential = Ed25519CredentialStore
+            .generate(directory.path())
+            .expect("key generation should succeed");
+        let output = Command::new("ssh-keygen")
+            .args(["-y", "-f"])
+            .arg(&credential.private_key_path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output();
+        let Ok(output) = output else {
+            return;
+        };
+        assert!(
+            output.status.success(),
+            "ssh-keygen should load the private key: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let derived = String::from_utf8(output.stdout).expect("public key should be UTF-8");
+        assert_eq!(derived.trim(), credential.public_key.trim());
     }
 }

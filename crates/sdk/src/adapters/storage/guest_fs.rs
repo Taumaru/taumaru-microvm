@@ -203,6 +203,67 @@ fn generate_host_key(
     chmod_guest(rootfs_path, &public_guest_path, "0100644")
 }
 
+pub(crate) fn write_guest_network_config(
+    rootfs_path: &Path,
+    guest_address: std::net::Ipv4Addr,
+    gateway: std::net::Ipv4Addr,
+) -> Result<(), SdkError> {
+    for parent in ["etc", "etc/systemd"] {
+        ensure_guest_directory(
+            rootfs_path,
+            parent,
+            "inspect guest network parent",
+            "verify guest network parent",
+            "create guest network parent",
+            "the expected parent directory is unavailable",
+        )?;
+    }
+    ensure_guest_directory(
+        rootfs_path,
+        "etc/systemd/network",
+        "inspect guest network directory",
+        "verify guest network directory",
+        "create guest network directory",
+        "the expected /etc/systemd/network directory is unavailable",
+    )?;
+    let contents = format!(
+        "[Match]\nName=eth0\n\n[Network]\nAddress={guest_address}/30\nGateway={gateway}\nDNS=1.1.1.1\nDNS=8.8.8.8\nDHCP=no\n"
+    );
+    match stat_guest(
+        rootfs_path,
+        "etc/systemd/network/10-taumaru.network",
+        "inspect guest network unit",
+    )? {
+        Some(stat) => {
+            if stat.is_symlink || !stat.is_regular {
+                return Err(SdkError::GuestFilesystem {
+                    operation: "verify guest network unit".to_owned(),
+                    path: rootfs_path.to_path_buf(),
+                    reason: "the expected 10-taumaru.network path is not a regular file".to_owned(),
+                });
+            }
+            replace_guest_file(
+                rootfs_path,
+                "etc/systemd/network/10-taumaru.network",
+                contents.as_bytes(),
+            )?;
+        }
+        None => {
+            write_guest_file(
+                rootfs_path,
+                "etc/systemd/network/10-taumaru.network",
+                contents.as_bytes(),
+                "inject guest network unit",
+            )?;
+        }
+    }
+    chmod_guest(
+        rootfs_path,
+        "etc/systemd/network/10-taumaru.network",
+        "0100644",
+    )
+}
+
 struct GuestStat {
     is_symlink: bool,
     is_directory: bool,
@@ -786,6 +847,65 @@ mod tests {
         assert_eq!(
             quote_host_path(&PathBuf::from("/tmp/dir with space/payload.tmp")),
             "\"/tmp/dir with space/payload.tmp\""
+        );
+    }
+
+    #[test]
+    fn writes_a_static_network_unit_with_allocated_addresses() {
+        use std::net::Ipv4Addr;
+
+        if !e2fsprogs_available() {
+            return;
+        }
+        let directory = tempdir().expect("temporary directory should exist");
+        let image = directory.path().join("rootfs.ext4");
+        create_ext4_image(&image);
+        let guest = Ipv4Addr::new(172, 30, 0, 6);
+        let gateway = Ipv4Addr::new(172, 30, 0, 5);
+
+        super::write_guest_network_config(&image, guest, gateway)
+            .expect("network unit should be written");
+        super::write_guest_network_config(&image, guest, gateway)
+            .expect("repeated write should overwrite");
+
+        assert_eq!(
+            guest_file_content(&image, "etc/systemd/network/10-taumaru.network"),
+            "[Match]\nName=eth0\n\n[Network]\nAddress=172.30.0.6/30\nGateway=172.30.0.5\nDNS=1.1.1.1\nDNS=8.8.8.8\nDHCP=no\n"
+        );
+        assert!(
+            guest_stat(&image, "etc/systemd/network/10-taumaru.network").contains("0644"),
+            "network unit should be readable"
+        );
+    }
+
+    #[test]
+    fn rejects_a_symlinked_network_unit_without_following_it() {
+        use std::net::Ipv4Addr;
+
+        if !e2fsprogs_available() {
+            return;
+        }
+        let directory = tempdir().expect("temporary directory should exist");
+        let image = directory.path().join("rootfs.ext4");
+        create_ext4_image(&image);
+        debugfs_exec(&image, "mkdir etc");
+        debugfs_exec(&image, "mkdir etc/systemd");
+        debugfs_exec(&image, "mkdir etc/systemd/network");
+        debugfs_exec(
+            &image,
+            "symlink etc/systemd/network/10-taumaru.network some-target",
+        );
+
+        let error = super::write_guest_network_config(
+            &image,
+            Ipv4Addr::new(172, 30, 0, 6),
+            Ipv4Addr::new(172, 30, 0, 5),
+        )
+        .expect_err("symlink unit should fail");
+
+        assert!(
+            matches!(error, SdkError::GuestFilesystem { .. }),
+            "unexpected error: {error}"
         );
     }
 }
