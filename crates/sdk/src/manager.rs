@@ -2803,7 +2803,8 @@ mod tests {
                 NetworkResource::Forwarding,
                 "net.ipv4.ip_forward".to_owned(),
             ),
-            (NetworkResource::Nat, tap_name.clone()),
+            (NetworkResource::ForwardRule, format!("{tap_name}:forward")),
+            (NetworkResource::IptablesNat, tap_name.clone()),
             (
                 NetworkResource::FirecrackerInterface,
                 format!("{tap_name}:{}", request.guest_mac),
@@ -2832,8 +2833,8 @@ mod tests {
                 bridge_created_by_sdk: false,
                 uplink_attached_by_sdk: false,
                 forwarding_enabled_by_sdk: true,
-                nat_table_created_by_sdk: true,
-                nat_chain_created_by_sdk: true,
+                nat_table_created_by_sdk: false,
+                nat_chain_created_by_sdk: false,
                 host_route_created_by_sdk: false,
                 proxy_arp_entry_created_by_sdk: false,
                 host_address_specs: Vec::new(),
@@ -2843,7 +2844,8 @@ mod tests {
                 NetworkResource::Tap,
                 NetworkResource::TapAddress,
                 NetworkResource::Forwarding,
-                NetworkResource::Nat,
+                NetworkResource::ForwardRule,
+                NetworkResource::IptablesNat,
                 NetworkResource::FirecrackerInterface,
             ],
             skipped: Vec::new(),
@@ -3307,7 +3309,7 @@ mod tests {
         assert_eq!(result.state, MicroVmState::Configured);
         assert!(result.applied.is_empty());
         assert!(result.skipped.contains(&NetworkResource::Tap));
-        assert!(result.skipped.contains(&NetworkResource::Nat));
+        assert!(result.skipped.contains(&NetworkResource::IptablesNat));
         assert_eq!(runtime.verify_calls.load(Ordering::Relaxed), 2);
     }
 

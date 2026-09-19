@@ -261,7 +261,64 @@ pub(crate) fn write_guest_network_config(
         rootfs_path,
         "etc/systemd/network/10-taumaru.network",
         "0100644",
-    )
+    )?;
+    write_guest_resolv_conf(rootfs_path)
+}
+
+/// Replaces the `systemd-resolved` stub symlink with a static resolver file.
+///
+/// Ubuntu images ship `/etc/resolv.conf` as a symlink to the resolved stub
+/// (`127.0.0.53`). The stub only answers once `systemd-resolved` learns the
+/// uplink DNS, which may never happen on a static TAP network. A static file
+/// with public resolvers makes name resolution work on first boot.
+fn write_guest_resolv_conf(rootfs_path: &Path) -> Result<(), SdkError> {
+    const CONTENTS: &[u8] =
+        b"nameserver 1.1.1.1\nnameserver 8.8.8.8\noptions single-request-reopen\n";
+    match stat_guest(rootfs_path, "etc/resolv.conf", "inspect guest resolv.conf")? {
+        Some(stat) if stat.is_symlink => {
+            let output = run_debugfs(rootfs_path, "rm etc/resolv.conf", true)?;
+            if !output.status.success() {
+                return Err(SdkError::GuestFilesystem {
+                    operation: "remove guest resolv.conf symlink".to_owned(),
+                    path: rootfs_path.to_path_buf(),
+                    reason: format!("debugfs exited with {}", output.status),
+                });
+            }
+            let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+            if debugfs_failed(&stderr) {
+                return Err(SdkError::GuestFilesystem {
+                    operation: "remove guest resolv.conf symlink".to_owned(),
+                    path: rootfs_path.to_path_buf(),
+                    reason: guest_debugfs_reason(&stderr),
+                });
+            }
+            write_guest_file(
+                rootfs_path,
+                "etc/resolv.conf",
+                CONTENTS,
+                "inject guest resolv.conf",
+            )?;
+        }
+        Some(stat) => {
+            if !stat.is_regular {
+                return Err(SdkError::GuestFilesystem {
+                    operation: "verify guest resolv.conf".to_owned(),
+                    path: rootfs_path.to_path_buf(),
+                    reason: "the expected resolv.conf path is not a regular file".to_owned(),
+                });
+            }
+            replace_guest_file(rootfs_path, "etc/resolv.conf", CONTENTS)?;
+        }
+        None => {
+            write_guest_file(
+                rootfs_path,
+                "etc/resolv.conf",
+                CONTENTS,
+                "inject guest resolv.conf",
+            )?;
+        }
+    }
+    chmod_guest(rootfs_path, "etc/resolv.conf", "0100644")
 }
 
 struct GuestStat {
@@ -876,6 +933,14 @@ mod tests {
             guest_stat(&image, "etc/systemd/network/10-taumaru.network").contains("0644"),
             "network unit should be readable"
         );
+        assert_eq!(
+            guest_file_content(&image, "etc/resolv.conf"),
+            "nameserver 1.1.1.1\nnameserver 8.8.8.8\noptions single-request-reopen\n"
+        );
+        assert!(
+            guest_stat(&image, "etc/resolv.conf").contains("0644"),
+            "resolv.conf should be readable"
+        );
     }
 
     #[test]
@@ -906,6 +971,33 @@ mod tests {
         assert!(
             matches!(error, SdkError::GuestFilesystem { .. }),
             "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn replaces_a_resolv_conf_symlink_with_a_static_file() {
+        if !e2fsprogs_available() {
+            return;
+        }
+        let directory = tempdir().expect("temporary directory should exist");
+        let image = directory.path().join("rootfs.ext4");
+        create_ext4_image(&image);
+        debugfs_exec(&image, "mkdir etc");
+        debugfs_exec(
+            &image,
+            "symlink etc/resolv.conf ../run/systemd/resolve/stub-resolv.conf",
+        );
+
+        super::write_guest_network_config(
+            &image,
+            std::net::Ipv4Addr::new(172, 30, 0, 6),
+            std::net::Ipv4Addr::new(172, 30, 0, 5),
+        )
+        .expect("resolv.conf replacement should succeed");
+
+        assert_eq!(
+            guest_file_content(&image, "etc/resolv.conf"),
+            "nameserver 1.1.1.1\nnameserver 8.8.8.8\noptions single-request-reopen\n"
         );
     }
 }

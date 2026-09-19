@@ -159,7 +159,7 @@ impl LinuxNetworkController {
             ensure_tap(&tap_name, &mut applied, NetworkMode::HostOnly)?;
             ensure_tap_address(&tap_name, gateway, &mut applied)?;
             ensure_forwarding(&mut applied)?;
-            ensure_iptables_host_only(&tap_name, private_network, &mut applied)?;
+            ensure_iptables_host_only(&tap_name, private_network, guest, &mut applied)?;
             applied.push(NetworkResource::FirecrackerInterface);
             let resources = vec![
                 resource(NetworkResource::Tap, &tap_name, &tap_name),
@@ -172,6 +172,11 @@ impl LinuxNetworkController {
                     NetworkResource::Forwarding,
                     "net.ipv4.ip_forward",
                     "net.ipv4.ip_forward=1",
+                ),
+                resource(
+                    NetworkResource::ForwardRule,
+                    &format!("{tap_name}:forward"),
+                    &format!("{SDK_OWNERSHIP}:{tap_name}:forward"),
                 ),
                 resource(
                     NetworkResource::IptablesNat,
@@ -216,6 +221,7 @@ impl LinuxNetworkController {
                 let cleanup_failures = cleanup_host_only_attempt(
                     &tap_name,
                     private_network,
+                    guest,
                     &applied,
                     forwarding_was_enabled,
                 );
@@ -436,6 +442,7 @@ impl LinuxNetworkController {
                 &mut skipped,
             )?;
             reconcile_forwarding(&mut applied, &mut skipped)?;
+            reconcile_forward_rules(&network.config.tap_name, guest, &mut applied, &mut skipped)?;
             reconcile_iptables_nat(
                 &network.config.tap_name,
                 private_network,
@@ -455,6 +462,7 @@ impl LinuxNetworkController {
                     &network.config.tap_name,
                     gateway,
                     private_network,
+                    guest,
                     tap_existed,
                     &applied,
                     forwarding_was_enabled,
@@ -795,10 +803,18 @@ fn live_ipv4_addresses() -> Result<Vec<(String, IpAddr, String)>, SdkError> {
 fn cleanup_host_only_attempt(
     tap: &str,
     private_network: Ipv4Addr,
+    private_guest: Ipv4Addr,
     applied: &[NetworkResource],
     forwarding_was_enabled: bool,
 ) -> Vec<String> {
     let mut failures = Vec::new();
+    if applied.contains(&NetworkResource::ForwardRule) {
+        for spec in host_only_forward_specs(tap, private_guest) {
+            if let Err(error) = delete_iptables_spec(&spec) {
+                failures.push(error.to_string());
+            }
+        }
+    }
     if applied.contains(&NetworkResource::IptablesNat)
         && let Err(error) = delete_iptables_spec(&host_only_nat_spec(tap, private_network))
     {
@@ -822,11 +838,19 @@ fn cleanup_reconciled_host_only(
     tap: &str,
     gateway: Ipv4Addr,
     private_network: Ipv4Addr,
+    private_guest: Ipv4Addr,
     tap_existed: bool,
     applied: &[NetworkResource],
     forwarding_was_enabled: bool,
 ) -> Vec<String> {
     let mut failures = Vec::new();
+    if applied.contains(&NetworkResource::ForwardRule) {
+        for spec in host_only_forward_specs(tap, private_guest) {
+            if let Err(error) = delete_iptables_spec(&spec) {
+                failures.push(error.to_string());
+            }
+        }
+    }
     if applied.contains(&NetworkResource::IptablesNat)
         && let Err(error) = delete_iptables_spec(&host_only_nat_spec(tap, private_network))
     {
@@ -869,11 +893,49 @@ fn host_only_nat_spec(tap: &str, private_network: Ipv4Addr) -> Vec<String> {
     ]
 }
 
+fn host_only_forward_specs(tap: &str, private_guest: Ipv4Addr) -> Vec<Vec<String>> {
+    vec![
+        vec![
+            "FORWARD".to_owned(),
+            "-i".to_owned(),
+            tap.to_owned(),
+            "-j".to_owned(),
+            "ACCEPT".to_owned(),
+            "-m".to_owned(),
+            "comment".to_owned(),
+            "--comment".to_owned(),
+            iptables_comment(tap, "forward-out"),
+        ],
+        vec![
+            "FORWARD".to_owned(),
+            "-o".to_owned(),
+            tap.to_owned(),
+            "-d".to_owned(),
+            format!("{private_guest}/32"),
+            "-m".to_owned(),
+            "conntrack".to_owned(),
+            "--ctstate".to_owned(),
+            "RELATED,ESTABLISHED".to_owned(),
+            "-j".to_owned(),
+            "ACCEPT".to_owned(),
+            "-m".to_owned(),
+            "comment".to_owned(),
+            "--comment".to_owned(),
+            iptables_comment(tap, "forward-in"),
+        ],
+    ]
+}
+
 fn ensure_iptables_host_only(
     tap: &str,
     private_network: Ipv4Addr,
+    private_guest: Ipv4Addr,
     applied: &mut Vec<NetworkResource>,
 ) -> Result<(), SdkError> {
+    for spec in host_only_forward_specs(tap, private_guest) {
+        run_iptables_spec(&spec)?;
+        applied.push(NetworkResource::ForwardRule);
+    }
     run_iptables_spec(&host_only_nat_spec(tap, private_network))?;
     applied.push(NetworkResource::IptablesNat);
     Ok(())
@@ -1340,8 +1402,10 @@ fn iptables_add_rule(spec: &[&str]) -> Result<(), SdkError> {
     if iptables_rule_exists(spec)? {
         return Ok(());
     }
-    let mut arguments = vec!["-A"];
-    arguments.extend(spec.iter().copied());
+    // Insert at the top so SDK rules are evaluated before terminal UFW rules.
+    // Existence is still checked with `-C`, which is position-independent.
+    let mut arguments = vec!["-I", spec[0], "1"];
+    arguments.extend(spec.iter().skip(1).copied());
     run_command("iptables", &arguments)?;
     Ok(())
 }
@@ -1432,8 +1496,8 @@ fn routed_nat_spec(uplink: &str, tap: &str, private_network: Ipv4Addr) -> Vec<St
 fn run_iptables_spec(spec: &[String]) -> Result<(), SdkError> {
     let arguments = spec.iter().map(String::as_str).collect::<Vec<_>>();
     if arguments.first() == Some(&"POSTROUTING") {
-        let mut with_table = vec!["-t", "nat", "-A"];
-        with_table.extend(arguments.iter().copied());
+        let mut with_table = vec!["-t", "nat", "-I", "POSTROUTING", "1"];
+        with_table.extend(arguments.iter().skip(1).copied());
         run_command("iptables", &with_table)?;
     } else {
         iptables_add_rule(&arguments)?;
@@ -1703,6 +1767,24 @@ fn reconcile_forwarding(
     } else {
         run_command("sysctl", &["-w", "net.ipv4.ip_forward=1"])?;
         applied.push(NetworkResource::Forwarding);
+    }
+    Ok(())
+}
+
+fn reconcile_forward_rules(
+    tap: &str,
+    private_guest: Ipv4Addr,
+    applied: &mut Vec<NetworkResource>,
+    skipped: &mut Vec<NetworkResource>,
+) -> Result<(), SdkError> {
+    for spec in host_only_forward_specs(tap, private_guest) {
+        let arguments = spec.iter().map(String::as_str).collect::<Vec<_>>();
+        if iptables_rule_exists(&arguments)? {
+            skipped.push(NetworkResource::ForwardRule);
+        } else {
+            run_iptables_spec(&spec)?;
+            applied.push(NetworkResource::ForwardRule);
+        }
     }
     Ok(())
 }
