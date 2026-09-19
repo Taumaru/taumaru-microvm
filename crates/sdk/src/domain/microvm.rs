@@ -164,6 +164,126 @@ pub struct MicroVmCreationResult {
     pub ssh: SshConnectionInfo,
 }
 
+/// Total number of creation stages reported through the progress observer.
+///
+/// Every observed `create_microvm` operation reports step counters out of this fixed
+/// total: each finished stage reports `N` of `TOTAL_CREATION_STEPS`, and the terminal
+/// event repeats the finished-step count out of the same total plus its outcome.
+pub const TOTAL_CREATION_STEPS: u64 = 6;
+
+/// One named discrete phase of MicroVM creation, in fixed emission order.
+///
+/// The SDK emits exactly one event when each stage finishes. Stage identities are
+/// stable and lowercase through [`std::fmt::Display`] so callers can render labels
+/// without additional SDK information.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CreationStage {
+    /// Request validation plus the existing-VM lookup decision.
+    Validation,
+    /// Artifact, kernel, and runtime resolution with volume availability checks.
+    PrerequisiteResolution,
+    /// VM-local `rootfs.ext4` copy, grown to the requested size when needed.
+    VolumePreparation,
+    /// Ed25519 key generation plus public-key injection into the VM-local copy.
+    CredentialSetup,
+    /// Network port configuration plus guest network config writes.
+    NetworkConfiguration,
+    /// Runtime verification, metadata persistence, and the state commit.
+    Finalization,
+}
+
+impl CreationStage {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Validation => "validation",
+            Self::PrerequisiteResolution => "prerequisite_resolution",
+            Self::VolumePreparation => "volume_preparation",
+            Self::CredentialSetup => "credential_setup",
+            Self::NetworkConfiguration => "network_configuration",
+            Self::Finalization => "finalization",
+        }
+    }
+    #[allow(dead_code)]
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        match value {
+            "validation" => Some(Self::Validation),
+            "prerequisite_resolution" => Some(Self::PrerequisiteResolution),
+            "volume_preparation" => Some(Self::VolumePreparation),
+            "credential_setup" => Some(Self::CredentialSetup),
+            "network_configuration" => Some(Self::NetworkConfiguration),
+            "finalization" => Some(Self::Finalization),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for CreationStage {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// The single closing state of an observed `create_microvm` operation.
+///
+/// Every observed operation ends with exactly one terminal event carrying one of
+/// these outcomes. Terminal events accompany, never replace, the operation's typed
+/// `Result`: `Completed` accompanies `Ok`, while `AlreadyConfigured` accompanies the
+/// returned existing VM and `Failed` accompanies the unchanged typed error.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CreationOutcome {
+    /// A new VM was configured and stopped.
+    Completed,
+    /// An identical already-configured VM was returned unchanged.
+    AlreadyConfigured,
+    /// The operation failed at the named stage.
+    Failed {
+        /// Stage that observed the error.
+        stage: CreationStage,
+    },
+}
+
+/// Transient progress notification emitted while `create_microvm` runs.
+///
+/// Events are emitted in real time: each stage emits a `Started` event when it
+/// begins, byte-moving work emits `InProgress` ticks as bytes advance, and each
+/// stage emits a `Finished` event when it completes. Terminal events carry
+/// `outcome: Some(_)` and repeat the finished-step count plus the closing outcome.
+/// `overall_percent` always reflects total creation work (completed plus fractional
+/// stage progress, scaled to 0–100), so a caller can drive a single progress bar
+/// from this field alone. Events are never persisted and cannot change the
+/// operation's outcome.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CreationProgress {
+    /// Stage this event belongs to, or the failed stage for a `Failed` terminal.
+    pub stage: CreationStage,
+    /// Finished stages so far, out of [`TOTAL_CREATION_STEPS`].
+    pub completed_steps: u64,
+    /// Always [`TOTAL_CREATION_STEPS`].
+    pub total_steps: u64,
+    /// Overall creation progress in percent (0–100), derived from completed stages
+    /// plus fractional progress inside the current stage.
+    pub overall_percent: u64,
+    /// What happened inside the stage for this event.
+    pub phase: CreationEventPhase,
+    /// Finished bytes for byte-moving work. `None` on steps-only events.
+    pub bytes_completed: Option<u64>,
+    /// Expected bytes for byte-moving work. `None` on steps-only events.
+    pub expected_bytes: Option<u64>,
+    /// `None` for stage events; the closing outcome for terminal events.
+    pub outcome: Option<CreationOutcome>,
+}
+
+/// What happened inside a creation stage for one progress event.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CreationEventPhase {
+    /// The stage started; no work inside it is finished yet.
+    Started,
+    /// Byte-moving work inside the stage advanced.
+    InProgress,
+    /// The stage finished.
+    Finished,
+}
+
 /// Result returned by the independent network reconciliation operation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NetworkConfigurationResult {
@@ -269,4 +389,29 @@ pub(crate) struct PersistedRuntime {
 
 pub(crate) fn unspecified_address() -> IpAddr {
     IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CreationStage;
+
+    #[test]
+    fn creation_stages_render_stable_snake_case_labels() {
+        let cases = [
+            (CreationStage::Validation, "validation"),
+            (
+                CreationStage::PrerequisiteResolution,
+                "prerequisite_resolution",
+            ),
+            (CreationStage::VolumePreparation, "volume_preparation"),
+            (CreationStage::CredentialSetup, "credential_setup"),
+            (CreationStage::NetworkConfiguration, "network_configuration"),
+            (CreationStage::Finalization, "finalization"),
+        ];
+        for (stage, label) in cases {
+            assert_eq!(stage.to_string(), label);
+            assert_eq!(CreationStage::parse(label), Some(stage));
+        }
+        assert_eq!(CreationStage::parse("unknown"), None);
+    }
 }

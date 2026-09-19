@@ -17,8 +17,9 @@ pub use domain::{
     FilesystemMetadata, InstalledBinary, Kernel, Linkage,
 };
 pub use domain::{
-    CreateMicroVmRequest, MicroVmCreationResult, MicroVmState, NetworkConfiguration,
-    NetworkConfigurationResult, NetworkMode, NetworkResource, SshConnectionInfo,
+    CreateMicroVmRequest, CreationEventPhase, CreationOutcome, CreationProgress, CreationStage,
+    MicroVmCreationResult, MicroVmState, NetworkConfiguration, NetworkConfigurationResult,
+    NetworkMode, NetworkResource, SshConnectionInfo, TOTAL_CREATION_STEPS,
 };
 pub use error::SdkError;
 pub use manager::MicroVmSdk;

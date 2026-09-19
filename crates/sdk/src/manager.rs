@@ -25,8 +25,9 @@ use crate::domain::artifact::{
 use crate::domain::config::minimum_memory_bytes;
 use crate::domain::lifecycle::{MicroVmState, NetworkMode};
 use crate::domain::microvm::{
-    CreateMicroVmRequest, MicroVmCreationResult, MicroVmRecord, NetworkConfigurationResult,
-    PersistedCredential, PersistedNetwork, PersistedRuntime, SshConnectionInfo,
+    CreateMicroVmRequest, CreationEventPhase, CreationOutcome, CreationProgress, CreationStage,
+    MicroVmCreationResult, MicroVmRecord, NetworkConfigurationResult, PersistedCredential,
+    PersistedNetwork, PersistedRuntime, SshConnectionInfo, TOTAL_CREATION_STEPS,
     unspecified_address,
 };
 use crate::domain::registry::{
@@ -118,6 +119,90 @@ struct CreationJournal {
     private_key_path: Option<PathBuf>,
     public_key_path: Option<PathBuf>,
     network: Option<PersistedNetwork>,
+}
+fn emit_creation_progress<F>(observer: &mut Option<&mut F>, event: CreationProgress)
+where
+    F: FnMut(CreationProgress) + Send,
+{
+    if let Some(observe) = observer.as_deref_mut() {
+        observe(event);
+    }
+}
+
+/// Overall percent for an event: completed stages contribute their full share and
+/// byte-moving work contributes its fraction of the current stage's share.
+fn overall_percent(completed_steps: u64, stage_bytes: Option<(u64, u64)>) -> u64 {
+    let base = completed_steps.saturating_mul(100) / TOTAL_CREATION_STEPS;
+    let Some((done, total)) = stage_bytes else {
+        return base.min(100);
+    };
+    if total == 0 {
+        return base.min(100);
+    }
+    let clamped = done.min(total);
+    let share = clamped.saturating_mul(100) / (total * TOTAL_CREATION_STEPS);
+    base.saturating_add(share).min(100)
+}
+
+fn creation_started_event(stage: CreationStage, completed_steps: u64) -> CreationProgress {
+    CreationProgress {
+        stage,
+        completed_steps,
+        total_steps: TOTAL_CREATION_STEPS,
+        overall_percent: overall_percent(completed_steps, None),
+        phase: CreationEventPhase::Started,
+        bytes_completed: None,
+        expected_bytes: None,
+        outcome: None,
+    }
+}
+
+fn creation_tick_event(
+    stage: CreationStage,
+    completed_steps: u64,
+    bytes_completed: u64,
+    expected_bytes: u64,
+) -> CreationProgress {
+    CreationProgress {
+        stage,
+        completed_steps,
+        total_steps: TOTAL_CREATION_STEPS,
+        overall_percent: overall_percent(completed_steps, Some((bytes_completed, expected_bytes))),
+        phase: CreationEventPhase::InProgress,
+        bytes_completed: Some(bytes_completed),
+        expected_bytes: Some(expected_bytes),
+        outcome: None,
+    }
+}
+
+fn creation_stage_event(stage: CreationStage, completed_steps: u64) -> CreationProgress {
+    CreationProgress {
+        stage,
+        completed_steps,
+        total_steps: TOTAL_CREATION_STEPS,
+        overall_percent: overall_percent(completed_steps, None),
+        phase: CreationEventPhase::Finished,
+        bytes_completed: None,
+        expected_bytes: None,
+        outcome: None,
+    }
+}
+
+fn creation_terminal_event(
+    stage: CreationStage,
+    completed_steps: u64,
+    outcome: CreationOutcome,
+) -> CreationProgress {
+    CreationProgress {
+        stage,
+        completed_steps,
+        total_steps: TOTAL_CREATION_STEPS,
+        overall_percent: overall_percent(completed_steps, None),
+        phase: CreationEventPhase::Finished,
+        bytes_completed: None,
+        expected_bytes: None,
+        outcome: Some(outcome),
+    }
 }
 
 impl std::fmt::Debug for MicroVmSdk {
@@ -469,17 +554,77 @@ impl MicroVmSdk {
     /// injects one Ed25519 public key, reconciles the selected network, and records every path
     /// needed for a later start. LAN mode may start the exact selected runtime temporarily to
     /// observe DHCP; the process and socket are stopped before this method returns.
-    pub async fn create_microvm(
+    ///
+    /// When `on_progress` is `Some`, the SDK invokes the observer synchronously in the
+    /// caller's task with one event per finished stage plus exactly one terminal event.
+    /// The observer is caller-owned, infallible, and non-blocking, and cannot change
+    /// integrity, persistence, or error decisions. When `None`, no events are emitted
+    /// and behavior is identical to an unobserved creation.
+    pub async fn create_microvm<F>(
         &self,
         request: CreateMicroVmRequest,
-    ) -> Result<MicroVmCreationResult, SdkError> {
-        let validated = request.validate(&self.home)?;
+        mut on_progress: Option<F>,
+    ) -> Result<MicroVmCreationResult, SdkError>
+    where
+        F: FnMut(CreationProgress) + Send,
+    {
+        let mut observer = on_progress.as_mut();
+        emit_creation_progress(
+            &mut observer,
+            creation_started_event(CreationStage::Validation, 0),
+        );
+        let validated = match request.validate(&self.home) {
+            Ok(validated) => validated,
+            Err(error) => {
+                emit_creation_progress(
+                    &mut observer,
+                    creation_terminal_event(
+                        CreationStage::Validation,
+                        0,
+                        CreationOutcome::Failed {
+                            stage: CreationStage::Validation,
+                        },
+                    ),
+                );
+                return Err(error);
+            }
+        };
         let volume_path = validated.volume_path.clone();
         let name_lock_path = self.home.join("vms").join(&validated.request.name);
-        let name_lock = self.target_lock(&name_lock_path)?;
+        let name_lock = match self.target_lock(&name_lock_path) {
+            Ok(lock) => lock,
+            Err(error) => {
+                emit_creation_progress(
+                    &mut observer,
+                    creation_terminal_event(
+                        CreationStage::Validation,
+                        0,
+                        CreationOutcome::Failed {
+                            stage: CreationStage::Validation,
+                        },
+                    ),
+                );
+                return Err(error);
+            }
+        };
         let _name_guard = name_lock.lock().await;
         let volume_lock = if volume_path != name_lock_path {
-            Some(self.target_lock(&volume_path)?)
+            match self.target_lock(&volume_path) {
+                Ok(lock) => Some(lock),
+                Err(error) => {
+                    emit_creation_progress(
+                        &mut observer,
+                        creation_terminal_event(
+                            CreationStage::Validation,
+                            0,
+                            CreationOutcome::Failed {
+                                stage: CreationStage::Validation,
+                            },
+                        ),
+                    );
+                    return Err(error);
+                }
+            }
         } else {
             None
         };
@@ -489,25 +634,105 @@ impl MicroVmSdk {
         };
 
         let existing_name = validated.request.name.clone();
-        if let Some(existing) = self
+        let existing = match self
             .run_repository(move |repository| repository.find_microvm(&existing_name))
-            .await?
+            .await
         {
+            Ok(existing) => existing,
+            Err(error) => {
+                emit_creation_progress(
+                    &mut observer,
+                    creation_terminal_event(
+                        CreationStage::Validation,
+                        0,
+                        CreationOutcome::Failed {
+                            stage: CreationStage::Validation,
+                        },
+                    ),
+                );
+                return Err(error);
+            }
+        };
+        if let Some(existing) = existing {
             return self
-                .return_or_reject_existing_creation(&validated, existing)
+                .return_or_reject_existing_creation(&validated, existing, &mut observer)
                 .await;
         }
-
-        let prerequisites = self
-            .resolve_creation_prerequisites(&validated.request)
-            .await?;
-        self.runtime.validate_host()?;
-        self.ensure_volume_available(&validated.request.name, &volume_path)
-            .await?;
+        emit_creation_progress(
+            &mut observer,
+            creation_stage_event(CreationStage::Validation, 1),
+        );
+        emit_creation_progress(
+            &mut observer,
+            creation_started_event(CreationStage::PrerequisiteResolution, 1),
+        );
+        let prerequisites = match self
+            .resolve_creation_prerequisites(&validated.request, &mut observer)
+            .await
+        {
+            Ok(prerequisites) => prerequisites,
+            Err(error) => {
+                emit_creation_progress(
+                    &mut observer,
+                    creation_terminal_event(
+                        CreationStage::PrerequisiteResolution,
+                        1,
+                        CreationOutcome::Failed {
+                            stage: CreationStage::PrerequisiteResolution,
+                        },
+                    ),
+                );
+                return Err(error);
+            }
+        };
+        if let Err(error) = self.runtime.validate_host() {
+            emit_creation_progress(
+                &mut observer,
+                creation_terminal_event(
+                    CreationStage::PrerequisiteResolution,
+                    1,
+                    CreationOutcome::Failed {
+                        stage: CreationStage::PrerequisiteResolution,
+                    },
+                ),
+            );
+            return Err(error);
+        }
+        if let Err(error) = self
+            .ensure_volume_available(&validated.request.name, &volume_path)
+            .await
+        {
+            emit_creation_progress(
+                &mut observer,
+                creation_terminal_event(
+                    CreationStage::PrerequisiteResolution,
+                    1,
+                    CreationOutcome::Failed {
+                        stage: CreationStage::PrerequisiteResolution,
+                    },
+                ),
+            );
+            return Err(error);
+        }
 
         let rootfs_path = volume_path.join("rootfs.ext4");
         let socket_path = volume_path.join("firecracker.sock");
-        let now = unix_timestamp()?;
+        let now = match unix_timestamp() {
+            Ok(now) => now,
+            Err(error) => {
+                emit_creation_progress(
+                    &mut observer,
+                    creation_terminal_event(
+                        CreationStage::PrerequisiteResolution,
+                        1,
+                        CreationOutcome::Failed {
+                            stage: CreationStage::PrerequisiteResolution,
+                        },
+                    ),
+                );
+                return Err(error);
+            }
+        };
         let mut record = MicroVmRecord {
             id: 0,
             name: validated.request.name.clone(),
@@ -530,11 +755,31 @@ impl MicroVmSdk {
         let insert_record = record.clone();
         let record_name = record.name.clone();
         let record_volume = record.volume_path.clone();
-        let vm_id = self
+        let vm_id = match self
             .run_repository(move |repository| repository.insert_creating(&insert_record))
             .await
-            .map_err(|error| map_insert_creation_error(error, &record_name, &record_volume))?;
+            .map_err(|error| map_insert_creation_error(error, &record_name, &record_volume))
+        {
+            Ok(vm_id) => vm_id,
+            Err(error) => {
+                emit_creation_progress(
+                    &mut observer,
+                    creation_terminal_event(
+                        CreationStage::PrerequisiteResolution,
+                        1,
+                        CreationOutcome::Failed {
+                            stage: CreationStage::PrerequisiteResolution,
+                        },
+                    ),
+                );
+                return Err(error);
+            }
+        };
         record.id = vm_id;
+        emit_creation_progress(
+            &mut observer,
+            creation_stage_event(CreationStage::PrerequisiteResolution, 2),
+        );
         let mut journal = CreationJournal {
             vm_id: Some(vm_id),
             volume_path,
@@ -547,10 +792,26 @@ impl MicroVmSdk {
         };
 
         let result = self
-            .create_claimed_microvm(&validated, &prerequisites, &record, &mut journal)
+            .create_claimed_microvm(
+                &validated,
+                &prerequisites,
+                &record,
+                &mut journal,
+                &mut observer,
+            )
             .await;
         match result {
-            Ok(result) => Ok(result),
+            Ok(result) => {
+                emit_creation_progress(
+                    &mut observer,
+                    creation_terminal_event(
+                        CreationStage::Finalization,
+                        6,
+                        CreationOutcome::Completed,
+                    ),
+                );
+                Ok(result)
+            }
             Err(primary) => {
                 let cleanup_failures = self.rollback_creation(&journal).await;
                 if cleanup_failures.is_empty() {
@@ -653,12 +914,26 @@ impl MicroVmSdk {
         })
     }
 
-    async fn return_or_reject_existing_creation(
+    async fn return_or_reject_existing_creation<F>(
         &self,
         validated: &crate::domain::config::ValidatedCreateRequest,
         existing: StoredMicroVm,
-    ) -> Result<MicroVmCreationResult, SdkError> {
+        observer: &mut Option<&mut F>,
+    ) -> Result<MicroVmCreationResult, SdkError>
+    where
+        F: FnMut(CreationProgress) + Send,
+    {
         if existing.record.state != MicroVmState::Configured {
+            emit_creation_progress(
+                observer,
+                creation_terminal_event(
+                    CreationStage::Validation,
+                    0,
+                    CreationOutcome::Failed {
+                        stage: CreationStage::Validation,
+                    },
+                ),
+            );
             return Err(SdkError::LifecycleConflict {
                 name: existing.record.name,
                 state: existing.record.state.to_string(),
@@ -718,6 +993,16 @@ impl MicroVmSdk {
         ];
         for (field, current, requested) in comparisons {
             if current != requested {
+                emit_creation_progress(
+                    observer,
+                    creation_terminal_event(
+                        CreationStage::Validation,
+                        0,
+                        CreationOutcome::Failed {
+                            stage: CreationStage::Validation,
+                        },
+                    ),
+                );
                 return Err(SdkError::ConfigurationConflict {
                     name: existing.record.name,
                     field: field.to_owned(),
@@ -726,7 +1011,32 @@ impl MicroVmSdk {
                 });
             }
         }
-        self.load_creation_result(existing)
+        match self.load_creation_result(existing) {
+            Ok(result) => {
+                emit_creation_progress(
+                    observer,
+                    creation_terminal_event(
+                        CreationStage::Validation,
+                        0,
+                        CreationOutcome::AlreadyConfigured,
+                    ),
+                );
+                Ok(result)
+            }
+            Err(error) => {
+                emit_creation_progress(
+                    observer,
+                    creation_terminal_event(
+                        CreationStage::Validation,
+                        0,
+                        CreationOutcome::Failed {
+                            stage: CreationStage::Validation,
+                        },
+                    ),
+                );
+                Err(error)
+            }
+        }
     }
 
     fn load_creation_result(
@@ -738,10 +1048,14 @@ impl MicroVmSdk {
         Ok(build_creation_result(&stored))
     }
 
-    async fn resolve_creation_prerequisites(
+    async fn resolve_creation_prerequisites<F>(
         &self,
         request: &CreateMicroVmRequest,
-    ) -> Result<CreationPrerequisites, SdkError> {
+        observer: &mut Option<&mut F>,
+    ) -> Result<CreationPrerequisites, SdkError>
+    where
+        F: FnMut(CreationProgress) + Send,
+    {
         let host_architecture = host_architecture()?;
         let manifest = self.fetch_manifest().await?;
         let distribution = manifest
@@ -841,7 +1155,7 @@ impl MicroVmSdk {
                     self.home.join("artifacts/rootfs"),
                 )
             })?;
-        verify_local_artifact(
+        verify_local_artifact_with_progress(
             &self.home,
             &image_local.path,
             image_local.size_bytes,
@@ -850,6 +1164,17 @@ impl MicroVmSdk {
             &image.sha256,
             "distribution image",
             &image.id,
+            &mut |bytes_done: u64, expected: u64| {
+                emit_creation_progress(
+                    observer,
+                    creation_tick_event(
+                        CreationStage::PrerequisiteResolution,
+                        1,
+                        bytes_done,
+                        expected.max(1),
+                    ),
+                );
+            },
         )
         .await?;
         let kernel_local = self
@@ -866,7 +1191,7 @@ impl MicroVmSdk {
                     self.home.join("artifacts/kernels"),
                 )
             })?;
-        verify_local_artifact(
+        verify_local_artifact_with_progress(
             &self.home,
             &kernel_local.path,
             kernel_local.size_bytes,
@@ -875,6 +1200,17 @@ impl MicroVmSdk {
             &kernel.sha256,
             "kernel",
             &kernel.id,
+            &mut |bytes_done: u64, expected: u64| {
+                emit_creation_progress(
+                    observer,
+                    creation_tick_event(
+                        CreationStage::PrerequisiteResolution,
+                        1,
+                        bytes_done,
+                        expected.max(1),
+                    ),
+                );
+            },
         )
         .await?;
 
@@ -1023,28 +1359,106 @@ impl MicroVmSdk {
         Ok(())
     }
 
-    async fn create_claimed_microvm(
+    async fn create_claimed_microvm<F>(
         &self,
         validated: &crate::domain::config::ValidatedCreateRequest,
         prerequisites: &CreationPrerequisites,
         record: &MicroVmRecord,
         journal: &mut CreationJournal,
-    ) -> Result<MicroVmCreationResult, SdkError> {
-        let prepared = self.storage.prepare_rootfs(
+        observer: &mut Option<&mut F>,
+    ) -> Result<MicroVmCreationResult, SdkError>
+    where
+        F: FnMut(CreationProgress) + Send,
+    {
+        emit_creation_progress(
+            observer,
+            creation_started_event(CreationStage::VolumePreparation, 2),
+        );
+        let disk_size_bytes = validated.request.disk_size_bytes;
+        let prepared = match self.storage.prepare_rootfs(
             &prerequisites.image_path,
             &record.volume_path,
-            validated.request.disk_size_bytes,
-        )?;
+            disk_size_bytes,
+            &mut |bytes_copied: u64, expected_bytes: u64| {
+                emit_creation_progress(
+                    observer,
+                    creation_tick_event(
+                        CreationStage::VolumePreparation,
+                        2,
+                        bytes_copied,
+                        expected_bytes.max(1),
+                    ),
+                );
+            },
+        ) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                emit_creation_progress(
+                    observer,
+                    creation_terminal_event(
+                        CreationStage::VolumePreparation,
+                        2,
+                        CreationOutcome::Failed {
+                            stage: CreationStage::VolumePreparation,
+                        },
+                    ),
+                );
+                return Err(error);
+            }
+        };
         journal.volume_created = prepared.created_volume;
         journal.rootfs_path = Some(prepared.path.clone());
-
+        emit_creation_progress(
+            observer,
+            creation_stage_event(CreationStage::VolumePreparation, 3),
+        );
+        emit_creation_progress(
+            observer,
+            creation_started_event(CreationStage::CredentialSetup, 3),
+        );
         journal.ssh_directory = Some(record.volume_path.join("ssh"));
-        let generated = self.credentials.generate(&record.volume_path)?;
+        let generated = match self.credentials.generate(&record.volume_path) {
+            Ok(generated) => generated,
+            Err(error) => {
+                emit_creation_progress(
+                    observer,
+                    creation_terminal_event(
+                        CreationStage::CredentialSetup,
+                        3,
+                        CreationOutcome::Failed {
+                            stage: CreationStage::CredentialSetup,
+                        },
+                    ),
+                );
+                return Err(error);
+            }
+        };
         journal.private_key_path = Some(generated.private_key_path.clone());
         journal.public_key_path = Some(generated.public_key_path.clone());
-        self.storage
-            .inject_public_key(&prepared.path, &generated.public_key)?;
-
+        if let Err(error) = self
+            .storage
+            .inject_public_key(&prepared.path, &generated.public_key)
+        {
+            emit_creation_progress(
+                observer,
+                creation_terminal_event(
+                    CreationStage::CredentialSetup,
+                    3,
+                    CreationOutcome::Failed {
+                        stage: CreationStage::CredentialSetup,
+                    },
+                ),
+            );
+            return Err(error);
+        }
+        emit_creation_progress(
+            observer,
+            creation_stage_event(CreationStage::CredentialSetup, 4),
+        );
+        emit_creation_progress(
+            observer,
+            creation_started_event(CreationStage::NetworkConfiguration, 4),
+        );
         let guest_mac = crate::adapters::network::linux::guest_mac(&record.name);
         let network_request = NetworkRequest {
             vm_name: record.name.clone(),
@@ -1056,16 +1470,66 @@ impl MicroVmSdk {
             guest_mac,
             lan_address_override: validated.request.lan_address,
         };
-        let used_addresses = self
+        let used_addresses = match self
             .run_repository(|repository| repository.list_host_only_networks())
-            .await?;
-        let used_lan_addresses = self
+            .await
+        {
+            Ok(used_addresses) => used_addresses,
+            Err(error) => {
+                emit_creation_progress(
+                    observer,
+                    creation_terminal_event(
+                        CreationStage::NetworkConfiguration,
+                        4,
+                        CreationOutcome::Failed {
+                            stage: CreationStage::NetworkConfiguration,
+                        },
+                    ),
+                );
+                return Err(error);
+            }
+        };
+        let used_lan_addresses = match self
             .run_repository(|repository| repository.list_lan_addresses())
-            .await?;
-        let outcome =
-            self.network
-                .configure(&network_request, None, &used_addresses, &used_lan_addresses)?;
-        match (
+            .await
+        {
+            Ok(used_lan_addresses) => used_lan_addresses,
+            Err(error) => {
+                emit_creation_progress(
+                    observer,
+                    creation_terminal_event(
+                        CreationStage::NetworkConfiguration,
+                        4,
+                        CreationOutcome::Failed {
+                            stage: CreationStage::NetworkConfiguration,
+                        },
+                    ),
+                );
+                return Err(error);
+            }
+        };
+        let outcome = match self.network.configure(
+            &network_request,
+            None,
+            &used_addresses,
+            &used_lan_addresses,
+        ) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                emit_creation_progress(
+                    observer,
+                    creation_terminal_event(
+                        CreationStage::NetworkConfiguration,
+                        4,
+                        CreationOutcome::Failed {
+                            stage: CreationStage::NetworkConfiguration,
+                        },
+                    ),
+                );
+                return Err(error);
+            }
+        };
+        let guest_config_result = match (
             outcome.persisted.config.guest_address,
             outcome.persisted.config.gateway,
             outcome.persisted.config.lan_address,
@@ -1074,21 +1538,38 @@ impl MicroVmSdk {
                 std::net::IpAddr::V4(guest_address),
                 Some(std::net::IpAddr::V4(gateway)),
                 Some(std::net::IpAddr::V4(lan_address)),
-            ) => {
-                self.storage.write_guest_lan_config(
-                    &prepared.path,
-                    guest_address,
-                    gateway,
-                    lan_address,
-                )?;
-            }
-            (std::net::IpAddr::V4(guest_address), Some(std::net::IpAddr::V4(gateway)), _) => {
-                self.storage
-                    .write_guest_network_config(&prepared.path, guest_address, gateway)?;
-            }
-            _ => {}
+            ) => self
+                .storage
+                .write_guest_lan_config(&prepared.path, guest_address, gateway, lan_address)
+                .map(|_| ()),
+            (std::net::IpAddr::V4(guest_address), Some(std::net::IpAddr::V4(gateway)), _) => self
+                .storage
+                .write_guest_network_config(&prepared.path, guest_address, gateway)
+                .map(|_| ()),
+            _ => Ok(()),
+        };
+        if let Err(error) = guest_config_result {
+            emit_creation_progress(
+                observer,
+                creation_terminal_event(
+                    CreationStage::NetworkConfiguration,
+                    4,
+                    CreationOutcome::Failed {
+                        stage: CreationStage::NetworkConfiguration,
+                    },
+                ),
+            );
+            return Err(error);
         }
         journal.network = Some(outcome.persisted.clone());
+        emit_creation_progress(
+            observer,
+            creation_stage_event(CreationStage::NetworkConfiguration, 5),
+        );
+        emit_creation_progress(
+            observer,
+            creation_started_event(CreationStage::Finalization, 5),
+        );
         let credential = PersistedCredential {
             private_key_path: generated.private_key_path,
             public_key_path: generated.public_key_path,
@@ -1102,11 +1583,25 @@ impl MicroVmSdk {
         let vm_id = record.id;
         let initial_network = outcome.persisted.clone();
         let initial_credential = credential.clone();
-        self.run_repository(move |repository| {
-            repository.persist_network(vm_id, &initial_network)?;
-            repository.persist_credential(vm_id, &initial_credential)
-        })
-        .await?;
+        if let Err(error) = self
+            .run_repository(move |repository| {
+                repository.persist_network(vm_id, &initial_network)?;
+                repository.persist_credential(vm_id, &initial_credential)
+            })
+            .await
+        {
+            emit_creation_progress(
+                observer,
+                creation_terminal_event(
+                    CreationStage::Finalization,
+                    5,
+                    CreationOutcome::Failed {
+                        stage: CreationStage::Finalization,
+                    },
+                ),
+            );
+            return Err(error);
+        }
 
         let runtime_record = PersistedRuntime {
             firecracker_path: prerequisites.firecracker.path.clone(),
@@ -1115,13 +1610,43 @@ impl MicroVmSdk {
             process_id: None,
             process_state: "stopped".to_owned(),
         };
-        self.runtime.verify_stopped(&record.socket_path)?;
+        if let Err(error) = self.runtime.verify_stopped(&record.socket_path) {
+            emit_creation_progress(
+                observer,
+                creation_terminal_event(
+                    CreationStage::Finalization,
+                    5,
+                    CreationOutcome::Failed {
+                        stage: CreationStage::Finalization,
+                    },
+                ),
+            );
+            return Err(error);
+        }
         let persisted_runtime = runtime_record.clone();
-        self.run_repository(move |repository| {
-            repository.persist_runtime(vm_id, &persisted_runtime)?;
-            repository.update_state(vm_id, MicroVmState::Configured)
-        })
-        .await?;
+        if let Err(error) = self
+            .run_repository(move |repository| {
+                repository.persist_runtime(vm_id, &persisted_runtime)?;
+                repository.update_state(vm_id, MicroVmState::Configured)
+            })
+            .await
+        {
+            emit_creation_progress(
+                observer,
+                creation_terminal_event(
+                    CreationStage::Finalization,
+                    5,
+                    CreationOutcome::Failed {
+                        stage: CreationStage::Finalization,
+                    },
+                ),
+            );
+            return Err(error);
+        }
+        emit_creation_progress(
+            observer,
+            creation_stage_event(CreationStage::Finalization, 6),
+        );
         Ok(MicroVmCreationResult {
             name: record.name.clone(),
             state: MicroVmState::Configured,
@@ -1840,7 +2365,7 @@ fn path_entry_exists(path: &Path) -> Result<bool, SdkError> {
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn verify_local_artifact(
+async fn verify_local_artifact_with_progress(
     home: &Path,
     path: &Path,
     inventory_size: u64,
@@ -1849,6 +2374,7 @@ async fn verify_local_artifact(
     expected_sha256: &str,
     kind: &str,
     id: &str,
+    on_read_progress: &mut dyn FnMut(u64, u64),
 ) -> Result<(), SdkError> {
     if !path_is_below_home(home, path) {
         return Err(SdkError::ArtifactPrerequisite {
@@ -1866,7 +2392,10 @@ async fn verify_local_artifact(
             reason: "the local inventory does not match the selected registry metadata".to_owned(),
         });
     }
-    let Some(integrity) = calculate_file_integrity(path).await? else {
+    let Some(integrity) =
+        calculate_file_integrity_with_progress(path, expected_size.max(1), on_read_progress)
+            .await?
+    else {
         return Err(SdkError::ArtifactPrerequisite {
             kind: kind.to_owned(),
             id: id.to_owned(),
@@ -2197,6 +2726,54 @@ async fn calculate_file_integrity(path: &Path) -> Result<Option<FileIntegrity>, 
         sha256: hex_digest(hasher.finalize()),
     }))
 }
+async fn calculate_file_integrity_with_progress(
+    path: &Path,
+    expected_bytes: u64,
+    on_read_progress: &mut dyn FnMut(u64, u64),
+) -> Result<Option<FileIntegrity>, SdkError> {
+    let metadata = match async_fs::symlink_metadata(path).await {
+        Ok(metadata) => metadata,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(SdkError::filesystem("inspect artifact file", path, source));
+        }
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Ok(None);
+    }
+    let mut file = async_fs::File::open(path)
+        .await
+        .map_err(|source| SdkError::filesystem("open artifact file", path, source))?;
+    let mut hasher = Sha256::new();
+    let mut size_bytes = 0_u64;
+    let mut buffer = vec![0_u8; 64 * 1024];
+    let expected = expected_bytes.max(1);
+    loop {
+        let bytes_read = file
+            .read(&mut buffer)
+            .await
+            .map_err(|source| SdkError::filesystem("read artifact file", path, source))?;
+        if bytes_read == 0 {
+            break;
+        }
+        let bytes_read = u64::try_from(bytes_read)
+            .map_err(|_| SdkError::Migration("file read size exceeds u64 range".to_owned()))?;
+        size_bytes = size_bytes.checked_add(bytes_read).ok_or_else(|| {
+            SdkError::Migration("artifact file size exceeds u64 range".to_owned())
+        })?;
+        hasher.update(
+            &buffer[..usize::try_from(bytes_read).map_err(|_| {
+                SdkError::Migration("file read size cannot be represented as usize".to_owned())
+            })?],
+        );
+        on_read_progress(size_bytes.min(expected), expected);
+    }
+    on_read_progress(expected, expected);
+    Ok(Some(FileIntegrity {
+        size_bytes,
+        sha256: hex_digest(hasher.finalize()),
+    }))
+}
 
 async fn remove_invalid_target_if_exists(path: &Path) -> Result<(), SdkError> {
     let metadata = match async_fs::symlink_metadata(path).await {
@@ -2363,8 +2940,9 @@ mod tests {
     use crate::domain::artifact::{ArtifactKind, DownloadSpec, FileIntegrity};
     use crate::domain::lifecycle::{MicroVmState, NetworkMode};
     use crate::domain::microvm::{
-        CreateMicroVmRequest, NetworkConfiguration, NetworkResource, PersistedNetwork,
-        PersistedNetworkResource,
+        CreateMicroVmRequest, CreationEventPhase, CreationOutcome, CreationProgress, CreationStage,
+        NetworkConfiguration, NetworkResource, PersistedNetwork, PersistedNetworkResource,
+        TOTAL_CREATION_STEPS,
     };
     use crate::domain::registry::TaumaruRegistry;
     use crate::error::SdkError;
@@ -2493,6 +3071,7 @@ mod tests {
             source: &Path,
             volume_path: &Path,
             requested_size_bytes: u64,
+            on_copy_progress: &mut dyn FnMut(u64, u64),
         ) -> Result<PreparedRootfs, SdkError> {
             self.prepare_calls.fetch_add(1, Ordering::Relaxed);
             let created_volume = !volume_path.exists();
@@ -2500,13 +3079,37 @@ mod tests {
                 SdkError::filesystem("create test VM volume", volume_path, error)
             })?;
             let rootfs_path = volume_path.join("rootfs.ext4");
-            fs::copy(source, &rootfs_path)
-                .map_err(|error| SdkError::filesystem("copy test rootfs", &rootfs_path, error))?;
-            OpenOptions::new()
+            let source_file = fs::File::open(source)
+                .map_err(|error| SdkError::filesystem("open test source rootfs", source, error))?;
+            let source_len = source_file
+                .metadata()
+                .map_err(|error| SdkError::filesystem("inspect test source rootfs", source, error))?
+                .len();
+            let mut output = OpenOptions::new()
                 .write(true)
+                .create_new(true)
                 .open(&rootfs_path)
-                .and_then(|file| file.set_len(requested_size_bytes))
+                .map_err(|error| SdkError::filesystem("create test rootfs", &rootfs_path, error))?;
+            let mut copied = 0_u64;
+            let mut reader = std::io::BufReader::new(source_file);
+            let mut buffer = [0_u8; 8 * 1024];
+            loop {
+                let read = std::io::Read::read(&mut reader, &mut buffer).map_err(|error| {
+                    SdkError::filesystem("copy test rootfs", &rootfs_path, error)
+                })?;
+                if read == 0 {
+                    break;
+                }
+                std::io::Write::write_all(&mut output, &buffer[..read]).map_err(|error| {
+                    SdkError::filesystem("copy test rootfs", &rootfs_path, error)
+                })?;
+                copied += read as u64;
+                on_copy_progress(copied.min(source_len), requested_size_bytes.max(source_len));
+            }
+            output
+                .set_len(requested_size_bytes)
                 .map_err(|error| SdkError::filesystem("resize test rootfs", &rootfs_path, error))?;
+            on_copy_progress(requested_size_bytes, requested_size_bytes);
             Ok(PreparedRootfs {
                 path: rootfs_path,
                 created_volume,
@@ -3084,6 +3687,365 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn streams_stage_starts_ticks_and_completion_with_monotonic_percent() {
+        if std::env::consts::ARCH != "x86_64" {
+            return;
+        }
+        let (sdk, _directory, _storage, _credentials, _network, _runtime) = test_sdk(false);
+        let request = test_request();
+        let expected_bytes = request.disk_size_bytes;
+        let mut events = Vec::new();
+        let created = sdk
+            .create_microvm(request, Some(|event: CreationProgress| events.push(event)))
+            .await
+            .expect("test VM should be created");
+
+        assert!(
+            events.len() >= 13,
+            "expected starts + ticks + finishes, got {}",
+            events.len()
+        );
+        let expected_stages = [
+            CreationStage::Validation,
+            CreationStage::PrerequisiteResolution,
+            CreationStage::VolumePreparation,
+            CreationStage::CredentialSetup,
+            CreationStage::NetworkConfiguration,
+            CreationStage::Finalization,
+        ];
+        for stage in expected_stages {
+            let started = events
+                .iter()
+                .filter(|event| event.stage == stage && event.phase == CreationEventPhase::Started)
+                .count();
+            let finished = events
+                .iter()
+                .filter(|event| {
+                    event.stage == stage
+                        && event.phase == CreationEventPhase::Finished
+                        && event.outcome.is_none()
+                })
+                .count();
+            assert_eq!(started, 1, "stage {stage} should start exactly once");
+            assert_eq!(finished, 1, "stage {stage} should finish exactly once");
+        }
+        let volume_ticks = events
+            .iter()
+            .filter(|event| {
+                event.stage == CreationStage::VolumePreparation
+                    && event.phase == CreationEventPhase::InProgress
+            })
+            .count();
+        assert!(
+            volume_ticks >= 1,
+            "volume copy should emit at least one realtime tick"
+        );
+        let prerequisite_ticks = events
+            .iter()
+            .filter(|event| {
+                event.stage == CreationStage::PrerequisiteResolution
+                    && event.phase == CreationEventPhase::InProgress
+            })
+            .count();
+        assert!(
+            prerequisite_ticks >= 2,
+            "artifact verification should emit realtime ticks"
+        );
+        let mut previous_percent = 0;
+        let mut previous_steps = 0;
+        for event in &events {
+            assert!(event.overall_percent >= previous_percent);
+            assert!(event.overall_percent <= 100);
+            assert!(event.completed_steps >= previous_steps);
+            assert!(event.completed_steps <= TOTAL_CREATION_STEPS);
+            assert_eq!(event.total_steps, TOTAL_CREATION_STEPS);
+            previous_percent = event.overall_percent;
+            previous_steps = event.completed_steps;
+        }
+        assert_eq!(
+            events
+                .first()
+                .expect("stream should not be empty")
+                .overall_percent,
+            0
+        );
+        let terminal = events.last().expect("terminal event should exist");
+        assert_eq!(terminal.stage, CreationStage::Finalization);
+        assert_eq!(terminal.completed_steps, TOTAL_CREATION_STEPS);
+        assert_eq!(terminal.overall_percent, 100);
+        assert_eq!(terminal.outcome, Some(CreationOutcome::Completed));
+        let volume_tick = events
+            .iter()
+            .find(|event| {
+                event.stage == CreationStage::VolumePreparation
+                    && event.phase == CreationEventPhase::InProgress
+            })
+            .expect("volume tick should exist");
+        let (done, total) = (
+            volume_tick
+                .bytes_completed
+                .expect("tick should carry bytes"),
+            volume_tick
+                .expected_bytes
+                .expect("tick should carry a total"),
+        );
+        assert!(done <= total);
+        assert_eq!(created.state, MicroVmState::Configured);
+        assert_eq!(expected_bytes, test_request().disk_size_bytes);
+    }
+
+    #[tokio::test]
+    async fn routes_each_creation_stream_to_its_own_observer() {
+        if std::env::consts::ARCH != "x86_64" {
+            return;
+        }
+        let (sdk, _directory, _storage, _credentials, _network, _runtime) = test_sdk(false);
+        let mut first_request = test_request();
+        first_request.name = "isolated_a".to_owned();
+        let mut second_request = test_request();
+        second_request.name = "isolated_b".to_owned();
+        let mut first_events = Vec::new();
+        let first = sdk
+            .create_microvm(
+                first_request,
+                Some(|event: CreationProgress| first_events.push(event)),
+            )
+            .await
+            .expect("first VM should be created");
+        let mut second_events = Vec::new();
+        let second = sdk
+            .create_microvm(
+                second_request,
+                Some(|event: CreationProgress| second_events.push(event)),
+            )
+            .await
+            .expect("second VM should be created");
+
+        assert_eq!(first.name, "isolated_a");
+        assert_eq!(second.name, "isolated_b");
+        for events in [&first_events, &second_events] {
+            assert!(!events.is_empty());
+            assert_eq!(
+                events.last().expect("terminal event should exist").outcome,
+                Some(CreationOutcome::Completed)
+            );
+            assert!(
+                events
+                    .windows(2)
+                    .all(|pair| pair[1].overall_percent >= pair[0].overall_percent)
+            );
+        }
+        assert_ne!(first.network.tap_name, second.network.tap_name);
+    }
+
+    #[tokio::test]
+    async fn ends_invalid_requests_with_a_validation_start_plus_failed_terminal() {
+        let directory = tempdir().expect("temporary directory should be created");
+        let sdk = MicroVmSdk::new(directory.path()).expect("test SDK should initialize");
+        let mut request = test_request();
+        request.name = "not path friendly".to_owned();
+        let mut events = Vec::new();
+        let error = sdk
+            .create_microvm(request, Some(|event: CreationProgress| events.push(event)))
+            .await
+            .expect_err("invalid request should fail");
+
+        assert!(matches!(error, SdkError::InvalidRequest { .. }));
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].phase, CreationEventPhase::Started);
+        assert_eq!(events[0].overall_percent, 0);
+        assert_eq!(events[1].stage, CreationStage::Validation);
+        assert_eq!(events[1].completed_steps, 0);
+        assert_eq!(events[1].total_steps, TOTAL_CREATION_STEPS);
+        assert_eq!(
+            events[1].outcome,
+            Some(CreationOutcome::Failed {
+                stage: CreationStage::Validation,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn ends_idempotent_repeats_with_a_validation_start_plus_configured_terminal() {
+        if std::env::consts::ARCH != "x86_64" {
+            return;
+        }
+        let (sdk, _directory, _storage, _credentials, _network, _runtime) = test_sdk(false);
+        sdk.create_microvm(test_request(), None::<fn(CreationProgress)>)
+            .await
+            .expect("test VM should be created");
+        let mut events = Vec::new();
+        let repeated = sdk
+            .create_microvm(
+                test_request(),
+                Some(|event: CreationProgress| events.push(event)),
+            )
+            .await
+            .expect("identical creation should be idempotent");
+
+        assert_eq!(repeated.state, MicroVmState::Configured);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].phase, CreationEventPhase::Started);
+        assert_eq!(events[1].stage, CreationStage::Validation);
+        assert_eq!(events[1].completed_steps, 0);
+        assert_eq!(events[1].outcome, Some(CreationOutcome::AlreadyConfigured));
+    }
+
+    #[tokio::test]
+    async fn ends_conflicts_with_a_validation_start_plus_failed_terminal() {
+        if std::env::consts::ARCH != "x86_64" {
+            return;
+        }
+        let (sdk, _directory, _storage, _credentials, _network, _runtime) = test_sdk(false);
+        sdk.create_microvm(test_request(), None::<fn(CreationProgress)>)
+            .await
+            .expect("test VM should be created");
+        let mut conflicting_request = test_request();
+        conflicting_request.disk_size_bytes = 17;
+        let mut events = Vec::new();
+        let error = sdk
+            .create_microvm(
+                conflicting_request,
+                Some(|event: CreationProgress| events.push(event)),
+            )
+            .await
+            .expect_err("immutable request changes should conflict");
+
+        assert!(matches!(error, SdkError::ConfigurationConflict { .. }));
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].phase, CreationEventPhase::Started);
+        assert_eq!(events[1].stage, CreationStage::Validation);
+        assert_eq!(events[1].completed_steps, 0);
+        assert_eq!(
+            events[1].outcome,
+            Some(CreationOutcome::Failed {
+                stage: CreationStage::Validation,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn ends_prerequisite_failures_with_started_and_failed_terminal() {
+        if std::env::consts::ARCH != "x86_64" {
+            return;
+        }
+        let (sdk, _directory, _storage, _credentials, _network, _runtime) = test_sdk(false);
+        let mut request = test_request();
+        request.distribution_id = "no-such-distribution".to_owned();
+        let mut events = Vec::new();
+        let error = sdk
+            .create_microvm(request, Some(|event: CreationProgress| events.push(event)))
+            .await
+            .expect_err("unknown distribution should fail");
+
+        assert!(matches!(error, SdkError::NotFound { .. }));
+        assert!(events.len() >= 3);
+        assert_eq!(events[0].stage, CreationStage::Validation);
+        assert_eq!(events[0].phase, CreationEventPhase::Started);
+        assert_eq!(
+            events[1].outcome, None,
+            "validation should finish before prerequisites fail"
+        );
+        let terminal = events.last().expect("terminal event should exist");
+        assert_eq!(terminal.stage, CreationStage::PrerequisiteResolution);
+        assert_eq!(terminal.completed_steps, 1);
+        assert_eq!(
+            terminal.outcome,
+            Some(CreationOutcome::Failed {
+                stage: CreationStage::PrerequisiteResolution,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn reports_monotonic_percent_with_byte_ticks_only_on_byte_work() {
+        if std::env::consts::ARCH != "x86_64" {
+            return;
+        }
+        let (sdk, _directory, _storage, _credentials, _network, _runtime) = test_sdk(false);
+        let request = test_request();
+        let mut events = Vec::new();
+        sdk.create_microvm(request, Some(|event: CreationProgress| events.push(event)))
+            .await
+            .expect("test VM should be created");
+
+        assert_eq!(TOTAL_CREATION_STEPS, 6);
+        let mut previous_percent = 0;
+        let mut previous_steps = 0;
+        for event in &events {
+            assert!(event.overall_percent >= previous_percent);
+            assert!(event.overall_percent <= 100);
+            assert!(event.completed_steps >= previous_steps);
+            assert!(event.completed_steps <= TOTAL_CREATION_STEPS);
+            assert_eq!(event.total_steps, TOTAL_CREATION_STEPS);
+            previous_percent = event.overall_percent;
+            previous_steps = event.completed_steps;
+        }
+        for event in &events {
+            match event.phase {
+                CreationEventPhase::InProgress => {
+                    let (done, total) = (
+                        event.bytes_completed.expect("tick should carry bytes"),
+                        event.expected_bytes.expect("tick should carry a total"),
+                    );
+                    assert!(done <= total);
+                    assert!(total >= 1);
+                }
+                CreationEventPhase::Started | CreationEventPhase::Finished => {
+                    assert_eq!(event.bytes_completed, None);
+                    assert_eq!(event.expected_bytes, None);
+                }
+            }
+        }
+        let tick_stages: Vec<CreationStage> = events
+            .iter()
+            .filter(|event| event.phase == CreationEventPhase::InProgress)
+            .map(|event| event.stage)
+            .collect();
+        assert!(tick_stages.contains(&CreationStage::PrerequisiteResolution));
+        assert!(tick_stages.contains(&CreationStage::VolumePreparation));
+    }
+
+    #[tokio::test]
+    async fn returns_identical_results_with_and_without_an_observer() {
+        if std::env::consts::ARCH != "x86_64" {
+            return;
+        }
+        let (sdk, _directory, _storage, _credentials, _network, _runtime) = test_sdk(false);
+        let mut observed_request = test_request();
+        observed_request.name = "observed_vm".to_owned();
+        let mut events = Vec::new();
+        let observed = sdk
+            .create_microvm(
+                observed_request,
+                Some(|event: CreationProgress| events.push(event)),
+            )
+            .await
+            .expect("observed VM should be created");
+        let mut unobserved_request = test_request();
+        unobserved_request.name = "unobserved_vm".to_owned();
+        let unobserved = sdk
+            .create_microvm(unobserved_request, None::<fn(CreationProgress)>)
+            .await
+            .expect("unobserved VM should be created");
+
+        assert!(!events.is_empty());
+        assert_eq!(
+            events.last().expect("terminal event should exist").outcome,
+            Some(CreationOutcome::Completed)
+        );
+        assert_eq!(observed.state, unobserved.state);
+        assert_eq!(observed.distribution_id, unobserved.distribution_id);
+        assert_eq!(observed.image_id, unobserved.image_id);
+        assert_eq!(observed.vcpu_count, unobserved.vcpu_count);
+        assert_eq!(observed.memory_bytes, unobserved.memory_bytes);
+        assert_eq!(observed.disk_size_bytes, unobserved.disk_size_bytes);
+        assert_eq!(observed.network.mode, unobserved.network.mode);
+        assert_eq!(observed.ssh.user, unobserved.ssh.user);
+        assert_eq!(observed.ssh.port, unobserved.ssh.port);
+    }
+
+    #[tokio::test]
     async fn creates_an_idempotent_host_only_vm_through_injected_ports() {
         if std::env::consts::ARCH != "x86_64" {
             return;
@@ -3091,11 +4053,11 @@ mod tests {
         let (sdk, directory, storage, credentials, _network, runtime) = test_sdk(false);
         let request = test_request();
         let first = sdk
-            .create_microvm(request.clone())
+            .create_microvm(request.clone(), None::<fn(CreationProgress)>)
             .await
             .expect("test VM should be created");
         let second = sdk
-            .create_microvm(request)
+            .create_microvm(request, None::<fn(CreationProgress)>)
             .await
             .expect("identical test VM creation should be idempotent");
 
@@ -3125,7 +4087,7 @@ mod tests {
             return;
         }
         let (sdk, _directory, _storage, _credentials, _network, runtime) = test_sdk(false);
-        sdk.create_microvm(test_request())
+        sdk.create_microvm(test_request(), None::<fn(CreationProgress)>)
             .await
             .expect("test VM should be created");
 
@@ -3156,11 +4118,11 @@ mod tests {
         second_request.expose_on_lan = true;
         second_request.lan_address = Some(std::net::Ipv4Addr::new(192, 168, 3, 92));
         let first = sdk
-            .create_microvm(first_request)
+            .create_microvm(first_request, None::<fn(CreationProgress)>)
             .await
             .expect("first LAN VM should be created");
         let second = sdk
-            .create_microvm(second_request)
+            .create_microvm(second_request, None::<fn(CreationProgress)>)
             .await
             .expect("second LAN VM should be created");
 
@@ -3180,7 +4142,7 @@ mod tests {
         first_request.name = "lan_dup_a".to_owned();
         first_request.expose_on_lan = true;
         first_request.lan_address = Some(std::net::Ipv4Addr::new(192, 168, 3, 91));
-        sdk.create_microvm(first_request)
+        sdk.create_microvm(first_request, None::<fn(CreationProgress)>)
             .await
             .expect("first LAN VM should be created");
         let stored = sdk
@@ -3200,14 +4162,14 @@ mod tests {
             return;
         }
         let (sdk, _directory, storage, _credentials, _network, _runtime) = test_sdk(false);
-        sdk.create_microvm(test_request())
+        sdk.create_microvm(test_request(), None::<fn(CreationProgress)>)
             .await
             .expect("test VM should be created");
         let mut conflicting_request = test_request();
         conflicting_request.disk_size_bytes = 17;
 
         let error = sdk
-            .create_microvm(conflicting_request)
+            .create_microvm(conflicting_request, None::<fn(CreationProgress)>)
             .await
             .expect_err("immutable request changes should conflict");
 
@@ -3223,7 +4185,7 @@ mod tests {
         let (sdk, _directory, _storage, _credentials, network, _runtime) = test_sdk(true);
         let volume_path = sdk.home.join("vms/fixture_vm");
         let error = sdk
-            .create_microvm(test_request())
+            .create_microvm(test_request(), None::<fn(CreationProgress)>)
             .await
             .expect_err("injected runtime verification should fail creation");
         assert!(matches!(error, SdkError::TemporaryRuntime { .. }));
@@ -3250,7 +4212,7 @@ mod tests {
         request.expose_on_lan = true;
         request.lan_address = Some(Ipv4Addr::new(192, 168, 3, 77));
         let created = sdk
-            .create_microvm(request)
+            .create_microvm(request, None::<fn(CreationProgress)>)
             .await
             .expect("routed LAN VM should be created");
 
@@ -3276,7 +4238,7 @@ mod tests {
         let mut request = test_request();
         request.lan_address = Some(Ipv4Addr::new(192, 168, 3, 77));
         let error = sdk
-            .create_microvm(request)
+            .create_microvm(request, None::<fn(CreationProgress)>)
             .await
             .expect_err("host-only LAN override should fail");
 
@@ -3294,7 +4256,7 @@ mod tests {
         request.expose_on_lan = true;
         request.lan_address = Some(std::net::Ipv4Addr::new(192, 168, 3, 88));
         let created = sdk
-            .create_microvm(request)
+            .create_microvm(request, None::<fn(CreationProgress)>)
             .await
             .expect("routed LAN VM should be created");
         let result = sdk

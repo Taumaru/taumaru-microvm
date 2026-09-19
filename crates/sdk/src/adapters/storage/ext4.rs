@@ -21,6 +21,7 @@ impl GuestStorage for Ext4Storage {
         source: &Path,
         volume_path: &Path,
         requested_size_bytes: u64,
+        on_copy_progress: &mut dyn FnMut(u64, u64),
     ) -> Result<PreparedRootfs, SdkError> {
         let source_metadata = fs::symlink_metadata(source)
             .map_err(|error| SdkError::filesystem("inspect source rootfs", source, error))?;
@@ -82,16 +83,22 @@ impl GuestStorage for Ext4Storage {
         }
         let sequence = ROOTFS_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
         let temporary_path = volume_path.join(format!(".rootfs.{sequence}.part"));
-        let result = copy_rootfs(source, &temporary_path, &rootfs_path, requested_size_bytes)
-            .and_then(|_| {
-                if requested_size_bytes > source_size {
-                    resize_filesystem(&rootfs_path)
-                } else {
-                    Ok(())
-                }
-            })
-            .and_then(|_| verify_ext4_filesystem(&rootfs_path))
-            .and_then(|_| verify_rootfs_size(&rootfs_path, requested_size_bytes));
+        let result = copy_rootfs(
+            source,
+            &temporary_path,
+            &rootfs_path,
+            requested_size_bytes,
+            on_copy_progress,
+        )
+        .and_then(|_| {
+            if requested_size_bytes > source_size {
+                resize_filesystem(&rootfs_path)
+            } else {
+                Ok(())
+            }
+        })
+        .and_then(|_| verify_ext4_filesystem(&rootfs_path))
+        .and_then(|_| verify_rootfs_size(&rootfs_path, requested_size_bytes));
         if let Err(error) = result {
             let _ = fs::remove_file(&temporary_path);
             let _ = fs::remove_file(&rootfs_path);
@@ -157,6 +164,7 @@ fn copy_rootfs(
     temporary_path: &Path,
     rootfs_path: &Path,
     requested_size_bytes: u64,
+    on_copy_progress: &mut dyn FnMut(u64, u64),
 ) -> Result<(), SdkError> {
     let mut input = fs::File::open(source)
         .map_err(|error| SdkError::filesystem("open source rootfs", source, error))?;
@@ -165,6 +173,11 @@ fn copy_rootfs(
         .create_new(true)
         .open(temporary_path)
         .map_err(|error| SdkError::filesystem("create temporary rootfs", temporary_path, error))?;
+    let source_len = fs::metadata(source)
+        .map_err(|error| SdkError::filesystem("inspect source rootfs", source, error))?
+        .len();
+    let expected = requested_size_bytes.max(source_len).max(1);
+    let mut copied = 0_u64;
     let mut buffer = [0_u8; 128 * 1024];
     loop {
         let read = input
@@ -176,6 +189,8 @@ fn copy_rootfs(
         output.write_all(&buffer[..read]).map_err(|error| {
             SdkError::filesystem("write temporary rootfs", temporary_path, error)
         })?;
+        copied += read as u64;
+        on_copy_progress(copied.min(expected), expected);
     }
     if requested_size_bytes
         > fs::metadata(source)
@@ -191,6 +206,7 @@ fn copy_rootfs(
         .and_then(|_| output.sync_all())
         .map_err(|error| SdkError::filesystem("sync temporary rootfs", temporary_path, error))?;
     drop(output);
+    on_copy_progress(expected, expected);
     fs::rename(temporary_path, rootfs_path)
         .map_err(|error| SdkError::filesystem("publish VM rootfs", rootfs_path, error))
 }
@@ -255,19 +271,25 @@ mod tests {
         let destination = directory.path().join("rootfs.ext4");
         fs::write(&source, b"verified source").expect("source should be written");
 
-        copy_rootfs(&source, &temporary, &destination, 32)
-            .expect("rootfs copy and expansion should succeed");
+        let mut ticks = Vec::new();
+        copy_rootfs(&source, &temporary, &destination, 32, &mut |done, total| {
+            ticks.push((done, total));
+        })
+        .expect("rootfs copy and expansion should succeed");
 
         assert_eq!(
             fs::read(&source).expect("source should remain readable"),
             b"verified source"
         );
         assert_eq!(
-            fs::metadata(destination)
+            fs::metadata(&destination)
                 .expect("destination should exist")
                 .len(),
             32
         );
         assert!(!temporary.exists());
+        assert!(!ticks.is_empty());
+        assert_eq!(ticks.last(), Some(&(32, 32)));
+        assert!(ticks.windows(2).all(|pair| pair[1].0 >= pair[0].0));
     }
 }

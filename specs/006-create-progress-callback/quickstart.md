@@ -1,9 +1,9 @@
-# Quickstart: MicroVM Creation Progress Observer
+# Quickstart: MicroVM Creation Progress Observer (realtime)
 
-This feature is consumed through the Rust SDK. It adds an optional progress observer to
-the existing creation operation. It adds no CLI command and changes no persistence,
-registry, or runtime behavior. Full creation prerequisites still apply — see
-`specs/003-create-microvm/quickstart.md` for host setup and artifact preparation.
+This feature is consumed through the Rust SDK. It adds an optional realtime progress
+observer to the existing creation operation. It adds no CLI command and changes no
+persistence, registry, or runtime behavior. Full creation prerequisites still apply —
+see `specs/003-create-microvm/quickstart.md` for host setup and artifact preparation.
 
 ## Prerequisites
 
@@ -13,7 +13,7 @@ registry, or runtime behavior. Full creation prerequisites still apply — see
 - Test execution uses the deterministic manager fakes for unit coverage and the fixture
   registry server for integration coverage; no KVM, TAP, or DHCP host work is needed.
 
-## Observe a creation
+## Observe a creation in real time
 
 ```rust
 use taumaru_microvm::{CreateMicroVmRequest, CreationProgress, CreationStage, MicroVmSdk};
@@ -33,21 +33,24 @@ let created = sdk
             lan_address: None,
             volume_path: None,
         },
-        Some(|event: CreationProgress| events.push(event)),
+        Some(|event: CreationProgress| {
+            // A single progress bar needs only this field:
+            // bar.set_position(event.overall_percent);
+            events.push(event);
+        }),
     )
     .await?;
 
 assert_eq!(created.state, taumaru_microvm::MicroVmState::Configured);
-// Exactly six stage events in order, then one completed terminal:
-assert_eq!(events.len(), 7);
-assert!(events[..6].iter().all(|event| event.outcome.is_none()));
-assert_eq!(events[0].stage, CreationStage::Validation);
-assert_eq!(events[5].stage, CreationStage::Finalization);
+// Starts + byte ticks + finishes, then one completed terminal at 100%:
+assert_eq!(events.first().expect("stream").overall_percent, 0);
+assert_eq!(events.last().expect("terminal").overall_percent, 100);
+assert!(events.windows(2).all(|pair| pair[1].overall_percent >= pair[0].overall_percent));
 ```
 
-Expected stream shape: stages report 1/6 through 6/6 out of `total_steps = 6`; the
-`VolumePreparation` event alone carries byte counters equal to the requested
-`disk_size_bytes`; the terminal event carries `Completed` at 6/6. See
+Expected stream shape: every stage emits `Started` then `Finished` in stage order;
+artifact verification reads and the rootfs copy emit `InProgress` ticks with byte
+counters while bytes advance; `overall_percent` rises monotonically 0 → 100. See
 [contract](./contracts/sdk-create-progress.md) for the full emission table and
 [data-model](./data-model.md) for the field invariants.
 
@@ -68,10 +71,10 @@ previous one-argument behavior; no events are emitted.
   single `failed` terminal naming the failed stage (N/6 for the N finished stages),
   the typed error matches the no-observer error, and rollback removes attempt-owned
   resources.
-- Repeat an identical creation with an observer: a single `already-configured`
-  terminal at 0/6, no stage events, no host changes.
-- Request with conflicting settings under an existing name: a single `failed`
-  terminal at `Validation`, 0/6, plus the existing typed conflict error.
+- Repeat an identical creation with an observer: a `Started` event plus a single
+  `already-configured` terminal at 0/6, no finishes, no host changes.
+- Request with conflicting settings under an existing name: a `Started` event plus a
+  single `failed` terminal at `Validation`, 0/6, plus the existing typed conflict error.
 
 ## Verification commands
 

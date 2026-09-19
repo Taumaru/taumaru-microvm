@@ -10,12 +10,18 @@ pub(crate) struct PreparedRootfs {
 }
 
 /// Replaceable storage boundary for rootfs copy, resize, and guest mutation.
+///
+/// `prepare_rootfs` reports copy progress as `(bytes_copied, expected_bytes)` through
+/// `on_copy_progress`; the callback is invoked synchronously from the copy loop and
+/// must be non-blocking. Implementations that copy without chunking report a single
+/// completion tick.
 pub(crate) trait GuestStorage: Send + Sync {
     fn prepare_rootfs(
         &self,
         source: &Path,
         volume_path: &Path,
         requested_size_bytes: u64,
+        on_copy_progress: &mut dyn FnMut(u64, u64),
     ) -> Result<PreparedRootfs, SdkError>;
 
     fn inject_public_key(&self, rootfs_path: &Path, public_key: &str) -> Result<(), SdkError>;

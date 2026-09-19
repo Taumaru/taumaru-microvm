@@ -11,8 +11,9 @@ pub use artifact::{
 };
 pub use lifecycle::{MicroVmState, NetworkMode};
 pub use microvm::{
-    CreateMicroVmRequest, MicroVmCreationResult, NetworkConfiguration, NetworkConfigurationResult,
-    NetworkResource, SshConnectionInfo,
+    CreateMicroVmRequest, CreationEventPhase, CreationOutcome, CreationProgress, CreationStage,
+    MicroVmCreationResult, NetworkConfiguration, NetworkConfigurationResult, NetworkResource,
+    SshConnectionInfo, TOTAL_CREATION_STEPS,
 };
 pub use registry::{
     Architecture, ArtifactFile, BinaryFile, BinaryPackage, BootConfiguration, Distribution,

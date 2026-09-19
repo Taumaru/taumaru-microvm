@@ -18,7 +18,7 @@
 
 **Purpose**: Baseline verification before touching the SDK contract
 
-- [ ] T001 Verify baseline gates pass from the repository root (`cargo test -p taumaru-microvm --all-targets --all-features`) and enumerate all in-repo `create_microvm` call sites via grep over `crates/` for migration tracking
+- [X] T001 Verify baseline gates pass from the repository root (`cargo test -p taumaru-microvm --all-targets --all-features`) and enumerate all in-repo `create_microvm` call sites via grep over `crates/` for migration tracking
 
 ---
 
@@ -28,9 +28,9 @@
 
 **⚠️ CRITICAL**: No user story work can begin until this phase is complete
 
-- [ ] T002 Add `CreationStage` (6 variants: `Validation`, `PrerequisiteResolution`, `VolumePreparation`, `CredentialSetup`, `NetworkConfiguration`, `Finalization`), `CreationOutcome` (`Completed`, `AlreadyConfigured`, `Failed { stage }`), `CreationProgress` (`stage: CreationStage`, `completed_steps: u64`, `total_steps: u64`, `bytes_completed: Option<u64>`, `expected_bytes: Option<u64>`, `outcome: Option<CreationOutcome>`), and `TOTAL_CREATION_STEPS: u64 = 6` in `crates/sdk/src/domain/microvm.rs` with Rustdoc, `Clone + Copy + Debug + Eq + PartialEq` derives, and `Display` plus `pub(crate) as_str`/`parse` following the `MicroVmState`/`NetworkMode` pattern in `crates/sdk/src/domain/lifecycle.rs`
-- [ ] T003 Re-export `CreationStage`, `CreationOutcome`, `CreationProgress` (and `TOTAL_CREATION_STEPS` if a const re-export is used) from `crates/sdk/src/domain/mod.rs` and `crates/sdk/src/lib.rs` (depends on T002)
-- [ ] T004 [P] Extend export assertions in `crates/sdk/tests/public_api.rs` to reference the three new types (e.g. `size_of::<CreationProgress>()`) so the public facade is contract-tested (depends on T003)
+- [X] T002 Add `CreationStage` (6 variants: `Validation`, `PrerequisiteResolution`, `VolumePreparation`, `CredentialSetup`, `NetworkConfiguration`, `Finalization`), `CreationOutcome` (`Completed`, `AlreadyConfigured`, `Failed { stage }`), `CreationProgress` (`stage: CreationStage`, `completed_steps: u64`, `total_steps: u64`, `bytes_completed: Option<u64>`, `expected_bytes: Option<u64>`, `outcome: Option<CreationOutcome>`), and `TOTAL_CREATION_STEPS: u64 = 6` in `crates/sdk/src/domain/microvm.rs` with Rustdoc, `Clone + Copy + Debug + Eq + PartialEq` derives, and `Display` plus `pub(crate) as_str`/`parse` following the `MicroVmState`/`NetworkMode` pattern in `crates/sdk/src/domain/lifecycle.rs`
+- [X] T003 Re-export `CreationStage`, `CreationOutcome`, `CreationProgress` (and `TOTAL_CREATION_STEPS` if a const re-export is used) from `crates/sdk/src/domain/mod.rs` and `crates/sdk/src/lib.rs` (depends on T002)
+- [X] T004 [P] Extend export assertions in `crates/sdk/tests/public_api.rs` to reference the three new types (e.g. `size_of::<CreationProgress>()`) so the public facade is contract-tested (depends on T003)
 
 **Checkpoint**: Foundation ready - user story implementation can now begin in parallel
 
@@ -46,13 +46,10 @@
 
 > **NOTE: Write these tests FIRST, ensure they FAIL before implementation**
 
-- [ ] T005 [US1] Add success-stream test in `crates/sdk/src/manager.rs` tests module asserting exactly 7 events (`Validation` 1/6 through `Finalization` 6/6 in order, then `completed` terminal at 6/6, `outcome.is_none()` on the first 6) using a recording closure over the injected fakes (`TestStorage`, `TestCredentials`, `TestNetwork`, `TestRuntime`, `TestArtifactSource`)
-
-### Implementation for User Story 1
-
-- [ ] T006 [US1] Change `create_microvm` signature in `crates/sdk/src/manager.rs` to `pub async fn create_microvm<F>(&self, request: CreateMicroVmRequest, on_progress: Option<F>) -> Result<MicroVmCreationResult, SdkError> where F: FnMut(CreationProgress) + Send`, add a private `emit` helper taking `Option<&mut F>`, and emit `Validation` 1/6 (after the existing-VM lookup returns `None`) and `PrerequisiteResolution` 2/6 (after `insert_creating` succeeds)
-- [ ] T007 [US1] Thread `Option<&mut F>` into `create_claimed_microvm` in `crates/sdk/src/manager.rs` and emit `VolumePreparation` 3/6 (after `prepare_rootfs`, with byte fields set per US3 rule), `CredentialSetup` 4/6 (after `inject_public_key`), `NetworkConfiguration` 5/6 (after guest-config writes), `Finalization` 6/6 (after `update_state(Configured)`), then the `completed` terminal at 6/6 (depends on T006, same file — sequential)
-- [ ] T008 [US1] Migrate every in-repo `create_microvm(...)` call site to the new signature in `crates/sdk/src/manager.rs` tests module (~9 sites, recording closure or `None::<fn(CreationProgress)>`) and in `crates/sdk/tests/public_api.rs` (1 site) (depends on T006)
+- [X] T005 [US1] Add success-stream test in `crates/sdk/src/manager.rs` tests module asserting exactly 7 events (`Validation` 1/6 through `Finalization` 6/6 in order, then `completed` terminal at 6/6, `outcome.is_none()` on the first 6) using a recording closure over the injected fakes (`TestStorage`, `TestCredentials`, `TestNetwork`, `TestRuntime`, `TestArtifactSource`)
+- [X] T006 [US1] Change `create_microvm` signature in `crates/sdk/src/manager.rs` to `pub async fn create_microvm<F>(&self, request: CreateMicroVmRequest, on_progress: Option<F>) -> Result<MicroVmCreationResult, SdkError> where F: FnMut(CreationProgress) + Send`, add a private `emit` helper taking `Option<&mut F>`, and emit `Validation` 1/6 (after the existing-VM lookup returns `None`) and `PrerequisiteResolution` 2/6 (after `insert_creating` succeeds)
+- [X] T007 [US1] Thread `Option<&mut F>` into `create_claimed_microvm` in `crates/sdk/src/manager.rs` and emit `VolumePreparation` 3/6 (after `prepare_rootfs`, with byte fields set per US3 rule), `CredentialSetup` 4/6 (after `inject_public_key`), `NetworkConfiguration` 5/6 (after guest-config writes), `Finalization` 6/6 (after `update_state(Configured)`), then the `completed` terminal at 6/6 (depends on T006, same file — sequential)
+- [X] T008 [US1] Migrate every in-repo `create_microvm(...)` call site to the new signature in `crates/sdk/src/manager.rs` tests module (~9 sites, recording closure or `None::<fn(CreationProgress)>`) and in `crates/sdk/tests/public_api.rs` (1 site) (depends on T006)
 
 **Checkpoint**: At this point, User Story 1 should be fully functional and testable independently (run T005 plus `cargo test -p taumaru-microvm --all-targets --all-features`)
 
@@ -66,11 +63,8 @@
 
 ### Implementation for User Story 2
 
-- [ ] T009 [US2] Add no-observer equivalence test in `crates/sdk/src/manager.rs` tests module creating the same request twice (once with a recording observer, once with `None`) and asserting field-identical `MicroVmCreationResult` values
-- [ ] T010 [US2] Verify all pre-existing creation scenarios in `crates/sdk/src/manager.rs` tests module (idempotent repeat, immutable-field conflict, injected runtime verification failure, LAN variants) pass with `None` attached and produce unchanged typed errors and rollback (no new code expected — verification task; fix any divergence found)
-
-**Checkpoint**: At this point, User Stories 1 AND 2 should both work independently
-
+- [X] T009 [US2] Add no-observer equivalence test in `crates/sdk/src/manager.rs` tests module creating the same request twice (once with a recording observer, once with `None`) and asserting field-identical `MicroVmCreationResult` values
+- [X] T010 [US2] Verify all pre-existing creation scenarios in `crates/sdk/src/manager.rs` tests module (idempotent repeat, immutable-field conflict, injected runtime verification failure, LAN variants) pass with `None` attached and produce unchanged typed errors and rollback (no new code expected — verification task; fix any divergence found)
 ---
 
 ## Phase 5: User Story 3 - Truthful Measurable Progress (Priority: P2)
@@ -81,8 +75,8 @@
 
 ### Implementation for User Story 3
 
-- [ ] T011 [US3] Add counter-truthfulness test in `crates/sdk/src/manager.rs` tests module asserting monotonic `completed_steps` 1–6 with `total_steps == 6` on every event, `bytes_completed == expected_bytes == Some(disk_size_bytes)` on exactly the `VolumePreparation` event, and `None`/`None` byte fields on all other 6 events (covers FR-005 byte rule and the "both Some or both None — never mixed" invariant from `specs/006-create-progress-callback/data-model.md`)
-- [ ] T012 [P] [US3] Add `Display` label test in a new `#[cfg(test)]` module in `crates/sdk/src/domain/microvm.rs` asserting the six snake-case strings (`validation`, `prerequisite_resolution`, `volume_preparation`, `credential_setup`, `network_configuration`, `finalization`) from `specs/006-create-progress-callback/contracts/sdk-create-progress.md`
+- [X] T011 [US3] Add counter-truthfulness test in `crates/sdk/src/manager.rs` tests module asserting monotonic `completed_steps` 1–6 with `total_steps == 6` on every event, `bytes_completed == expected_bytes == Some(disk_size_bytes)` on exactly the `VolumePreparation` event, and `None`/`None` byte fields on all other 6 events (covers FR-005 byte rule and the "both Some or both None — never mixed" invariant from `specs/006-create-progress-callback/data-model.md`)
+- [X] T012 [P] [US3] Add `Display` label test in a new `#[cfg(test)]` module in `crates/sdk/src/domain/microvm.rs` asserting the six snake-case strings (`validation`, `prerequisite_resolution`, `volume_preparation`, `credential_setup`, `network_configuration`, `finalization`) from `specs/006-create-progress-callback/contracts/sdk-create-progress.md`
 
 **Checkpoint**: All P1 stories plus truthful counters independently functional
 
@@ -96,24 +90,23 @@
 
 ### Tests for User Story 4
 
-- [ ] T013 [US4] Add failure-terminal tests in `crates/sdk/src/manager.rs` tests module covering: invalid request → single `failed` at `Validation` 0/6; missing prerequisite → finished-stage events plus single `failed` at `PrerequisiteResolution` 1/6 with unchanged typed error; idempotent repeat → single `already-configured` terminal 0/6 with no stage events and no host changes; conflicting settings → single `failed` at `Validation` 0/6 with unchanged conflict error
+- [X] T013 [US4] Add failure-terminal tests in `crates/sdk/src/manager.rs` tests module covering: invalid request → single `failed` at `Validation` 0/6; missing prerequisite → finished-stage events plus single `failed` at `PrerequisiteResolution` 1/6 with unchanged typed error; idempotent repeat → single `already-configured` terminal 0/6 with no stage events and no host changes; conflicting settings → single `failed` at `Validation` 0/6 with unchanged conflict error
 
 ### Implementation for User Story 4
 
-- [ ] T014 [US4] Wire terminal-`failed` emission at every stage error site in `crates/sdk/src/manager.rs` (match-emit-return replacing bare `?` where an emission is owed: validation/conflict/idempotent branch, prerequisites, volume, credentials, network, finalization), keeping `rollback_creation` emission-free and all `SdkError` variants and messages unchanged (depends on T013 test-first ordering; same file as T006/T007 — sequential)
-- [ ] T015 [P] [US4] Create `crates/sdk/tests/creation_progress.rs` integration test proving the silent/typed-error surface with an observer attached (invalid request yields typed `InvalidRequest` with a single `failed` terminal; no stdout/stderr assertion possible — assert error type and stream shape only) using the fixture registry server pattern from `crates/sdk/tests/download_flow.rs`
+- [X] T014 [US4] Wire terminal-`failed` emission at every stage error site in `crates/sdk/src/manager.rs` (match-emit-return replacing bare `?` where an emission is owed: validation/conflict/idempotent branch, prerequisites, volume, credentials, network, finalization), keeping `rollback_creation` emission-free and all `SdkError` variants and messages unchanged (depends on T013 test-first ordering; same file as T006/T007 — sequential)
+- [X] T015 [P] [US4] Create `crates/sdk/tests/creation_progress.rs` integration test proving the silent/typed-error surface with an observer attached (invalid request yields typed `InvalidRequest` with a single `failed` terminal; no stdout/stderr assertion possible — assert error type and stream shape only) using the fixture registry server pattern from `crates/sdk/tests/download_flow.rs`
 
 **Checkpoint**: All user stories should now be independently functional
 
 ---
 
 ## Phase 7: Polish & Cross-Cutting Concerns
-
+- [X] T016 [P] Add per-call isolation test in `crates/sdk/src/manager.rs` tests module running two concurrent creations for different VM names with separate recording observers and asserting each stream contains only its own 7 events in order
 **Purpose**: Contract alignment, per-call isolation proof, and full gates
 
-- [ ] T016 [P] Add per-call isolation test in `crates/sdk/src/manager.rs` tests module running two concurrent creations for different VM names with separate recording observers and asserting each stream contains only its own 7 events in order
-- [ ] T017 Verify `specs/006-create-progress-callback/quickstart.md` snippets against the implemented API (observer call convention `Some(|event: CreationProgress| events.push(event))` and `None::<fn(CreationProgress)>` form both compile) and confirm no CLI source under `crates/cli/src/` was touched and no SQLite migration was added
-- [ ] T018 Run full gates from the repository root (`cargo fmt --all -- --check`, `cargo check --all-targets --all-features`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test --all-targets --all-features`) and record results
+- [X] T017 Verify `specs/006-create-progress-callback/quickstart.md` snippets against the implemented API (observer call convention `Some(|event: CreationProgress| events.push(event))` and `None::<fn(CreationProgress)>` form both compile) and confirm no CLI source under `crates/cli/src/` was touched and no SQLite migration was added
+- [X] T018 Run full gates from the repository root (`cargo fmt --all -- --check`, `cargo check --all-targets --all-features`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test --all-targets --all-features`) and record results
 
 ---
 
