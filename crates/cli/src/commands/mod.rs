@@ -1,6 +1,6 @@
 pub(crate) mod download;
 
-use crate::cli::{Cli, Command};
+use crate::cli::{ArtifactsCommand, Cli};
 use crate::context::CliContext;
 
 pub(crate) async fn run(cli: Cli) -> Result<u8, crate::error::CliError> {
@@ -10,6 +10,8 @@ pub(crate) async fn run(cli: Cli) -> Result<u8, crate::error::CliError> {
 
     let context = CliContext::new()?;
     match command {
-        Command::Download(arguments) => download::run(&context, arguments).await,
+        crate::cli::Command::Artifacts(arguments) => match arguments.command {
+            ArtifactsCommand::Download(download) => download::run(&context, download).await,
+        },
     }
 }

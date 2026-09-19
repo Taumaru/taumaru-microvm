@@ -2,7 +2,7 @@ use std::path::Path;
 
 use tokio_util::sync::CancellationToken;
 
-use super::registry::{Architecture, BinaryPackage, Distribution, Kernel};
+use super::registry::{Architecture, BinaryPackage, Distribution, DistributionImage, Kernel};
 
 /// Identifies the kind of physical artifact being transferred.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -149,6 +149,17 @@ pub struct DownloadedDistribution {
     pub distribution: Distribution,
     /// Verified local images in registry order.
     pub images: Vec<DownloadedFile>,
+}
+
+/// Result of downloading one distribution image.
+#[derive(Clone, Debug)]
+pub struct DownloadedDistributionImage {
+    /// Registry metadata for the owning distribution as published.
+    pub distribution: Distribution,
+    /// Exact registry image metadata selected for the operation.
+    pub image: DistributionImage,
+    /// Verified local image file.
+    pub file: DownloadedFile,
 }
 
 /// Metadata for a verified runtime binary resolved from local inventory.

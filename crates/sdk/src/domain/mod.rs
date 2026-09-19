@@ -6,7 +6,8 @@ pub mod registry;
 
 pub use artifact::{
     ArtifactKind, DownloadCancellation, DownloadDisposition, DownloadPhase, DownloadProgress,
-    DownloadedBinary, DownloadedDistribution, DownloadedFile, DownloadedKernel, InstalledBinary,
+    DownloadedBinary, DownloadedDistribution, DownloadedDistributionImage, DownloadedFile,
+    DownloadedKernel, InstalledBinary,
 };
 pub use lifecycle::{MicroVmState, NetworkMode};
 pub use microvm::{

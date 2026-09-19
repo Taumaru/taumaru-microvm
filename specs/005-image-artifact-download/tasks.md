@@ -26,12 +26,11 @@ task below maps to a spec acceptance scenario or a constitution-mandated gate.
 
 ---
 
-- [ ] T001 Verify clean baseline gates for the `Cargo.toml` workspace from repository root (`cargo fmt --all -- --check`, `cargo check --all-targets --all-features`)
 
 **Purpose**: Baseline verification and fixture confirmation before any code changes.
 
-- [ ] T001 Verify clean baseline gates for the `Cargo.toml` workspace from repository root (`cargo fmt --all -- --check`, `cargo check --all-targets --all-features`)
-- [ ] T002 [P] Confirm dual-image fixture coverage in `crates/sdk/tests/fixtures/manifest.json` (`alpine-test-minimal` plus `alpine-test-debug` under `alpine-test-1.0`) with servable payload routes in `crates/sdk/tests/support/mod.rs`
+- [x] T001 Verify clean baseline gates for the `Cargo.toml` workspace from repository root (`cargo fmt --all -- --check`, `cargo check --all-targets --all-features`)
+- [x] T002 [P] Confirm dual-image fixture coverage in `crates/sdk/tests/fixtures/manifest.json` (`alpine-test-minimal` plus `alpine-test-debug` under `alpine-test-1.0`) with servable payload routes in `crates/sdk/tests/support/mod.rs`
 
 ---
 
@@ -41,12 +40,12 @@ task below maps to a spec acceptance scenario or a constitution-mandated gate.
 
 **⚠️ CRITICAL**: No user story work can begin until this phase is complete.
 
-- [ ] T003 Add `DownloadedDistributionImage { distribution, image, file }` struct with Rustdoc in `crates/sdk/src/domain/artifact.rs`
-- [ ] T004 Re-export `DownloadedDistributionImage` in `crates/sdk/src/domain/mod.rs` and `crates/sdk/src/lib.rs`
-- [ ] T005 Implement `download_distribution_image` plus `download_distribution_image_with_cancellation` in `crates/sdk/src/manager.rs`, reusing `distribution_image_member` and `download_member` with a single-member `ProgressTracker` (unknown distribution yields `NotFound { kind: "distribution" }`; image absent from that distribution yields `NotFound { kind: "distribution image" }`; cancellation removes the in-flight temporary file and returns `Cancelled`)
-- [ ] T006 [P] Add single-image SDK tests in `crates/sdk/tests/download_flow.rs` (requesting only `alpine-test-minimal` stores and verifies just that file with `Downloaded` disposition; repeat yields `SkippedExisting` with no new transfer; whole-distribution download still stores both images; unknown image yields typed `NotFound`; cancellation yields `Cancelled` with the partial file removed)
-- [ ] T007 [P] Extend type-export assertions in `crates/sdk/tests/public_api.rs` (`DownloadedDistributionImage` exported) and failure-path cases in `crates/sdk/tests/failure_paths.rs` (blank IDs rejected; unknown distribution vs wrong-distribution image distinguished)
-- [ ] T008 Run focused SDK gates for `crates/sdk/` from repository root (`cargo test -p taumaru-microvm --all-targets --all-features`)
+- [x] T003 Add `DownloadedDistributionImage { distribution, image, file }` struct with Rustdoc in `crates/sdk/src/domain/artifact.rs`
+- [x] T004 Re-export `DownloadedDistributionImage` in `crates/sdk/src/domain/mod.rs` and `crates/sdk/src/lib.rs`
+- [x] T005 Implement `download_distribution_image` plus `download_distribution_image_with_cancellation` in `crates/sdk/src/manager.rs`, reusing `distribution_image_member` and `download_member` with a single-member `ProgressTracker` (unknown distribution yields `NotFound { kind: "distribution" }`; image absent from that distribution yields `NotFound { kind: "distribution image" }`; cancellation removes the in-flight temporary file and returns `Cancelled`)
+- [x] T006 [P] Add single-image SDK tests in `crates/sdk/tests/download_flow.rs` (requesting only `alpine-test-minimal` stores and verifies just that file with `Downloaded` disposition; repeat yields `SkippedExisting` with no new transfer; whole-distribution download still stores both images; unknown image yields typed `NotFound`; cancellation yields `Cancelled` with the partial file removed)
+- [x] T007 [P] Extend type-export assertions in `crates/sdk/tests/public_api.rs` (`DownloadedDistributionImage` exported) and failure-path cases in `crates/sdk/tests/failure_paths.rs` (blank IDs rejected; unknown distribution vs wrong-distribution image distinguished)
+- [x] T008 Run focused SDK gates for `crates/sdk/` from repository root (`cargo test -p taumaru-microvm --all-targets --all-features`)
 
 **Checkpoint**: Foundation ready — `download_distribution_image` verified against fixtures; user story implementation can now begin.
 
@@ -62,13 +61,13 @@ several images each, use keyboard-only input to select images across distributio
 (including two of one distribution), and verify the review shows only selected images with
 resolved default kernels before any transfer.
 
-- [ ] T009 [US1] Nest download under an `artifacts` parent subcommand with `DownloadArgs { images: Vec<String>, non_interactive: bool }` in `crates/cli/src/cli.rs`, removing the `distributions`/`kernels` fields and documenting `--image DISTRIBUTION_ID=IMAGE_ID` (repeatable) in help text
-- [ ] T010 [US1] Route the nested `Command::Artifacts` dispatch to the download flow in `crates/cli/src/commands/mod.rs`
-- [ ] T011 [US1] Replace `DistributionSelection` with `ImageSelection { distribution, image, kernel, expected_bytes }` plus a flattened host-architecture-filtered image catalog sorted and deduplicated by `(distribution.id, image.id)` with automatic default-kernel resolution and no override path in `crates/cli/src/commands/download.rs` (constraint, quoted from data-model: "The pair `(distribution.id, image.id)` is the plan key; display names never identify a row."; "`kernel` is resolved, never chosen: it always equals `distribution.default_kernel` as published.")
-- [ ] T012 [US1] Replace the distribution `MultiSelect` plus per-distribution kernel `Select` prompts with a single image `MultiSelect` whose rows carry image identity, parent distribution, variant or capabilities, and size in `crates/cli/src/commands/download.rs`
-- [ ] T013 [P] [US1] Render per-image review rows ordered by distribution then image with parent distribution, resolved default kernel, runtime bundle, and selected-only byte totals in `crates/cli/src/output/human.rs`
-- [ ] T014 [US1] Cover catalog flattening, host filtering, `(distribution.id, image.id)` sort order, repeat-pair dedup to one entry, default-kernel resolution, and missing/incompatible-default rejection in the tests module of `crates/cli/src/commands/download.rs`
-- [ ] T015 [P] [US1] Assert the renamed `artifacts download` help path and rejection of removed `--distribution`/`--kernel` flags with guidance toward `--image` in `crates/cli/tests/command_surface.rs`
+- [x] T009 [US1] Nest download under an `artifacts` parent subcommand with `DownloadArgs { images: Vec<String>, non_interactive: bool }` in `crates/cli/src/cli.rs`, removing the `distributions`/`kernels` fields and documenting `--image DISTRIBUTION_ID=IMAGE_ID` (repeatable) in help text
+- [x] T010 [US1] Route the nested `Command::Artifacts` dispatch to the download flow in `crates/cli/src/commands/mod.rs`
+- [x] T011 [US1] Replace `DistributionSelection` with `ImageSelection { distribution, image, kernel, expected_bytes }` plus a flattened host-architecture-filtered image catalog sorted and deduplicated by `(distribution.id, image.id)` with automatic default-kernel resolution and no override path in `crates/cli/src/commands/download.rs` (constraint, quoted from data-model: "The pair `(distribution.id, image.id)` is the plan key; display names never identify a row."; "`kernel` is resolved, never chosen: it always equals `distribution.default_kernel` as published.")
+- [x] T012 [US1] Replace the distribution `MultiSelect` plus per-distribution kernel `Select` prompts with a single image `MultiSelect` whose rows carry image identity, parent distribution, variant or capabilities, and size in `crates/cli/src/commands/download.rs`
+- [x] T013 [P] [US1] Render per-image review rows ordered by distribution then image with parent distribution, resolved default kernel, runtime bundle, and selected-only byte totals in `crates/cli/src/output/human.rs`
+- [x] T014 [US1] Cover catalog flattening, host filtering, `(distribution.id, image.id)` sort order, repeat-pair dedup to one entry, default-kernel resolution, and missing/incompatible-default rejection in the tests module of `crates/cli/src/commands/download.rs`
+- [x] T015 [P] [US1] Assert the renamed `artifacts download` help path and rejection of removed `--distribution`/`--kernel` flags with guidance toward `--image` in `crates/cli/tests/command_surface.rs`
 
 **Checkpoint**: At this point, User Story 1 should be fully functional and testable independently (selection through review with zero transfers started before confirmation).
 
@@ -83,11 +82,11 @@ kernel once, then exactly the selected images — never unselected siblings.
 image of another, and verify every selected image is acquired and verified, no unselected
 image is stored, and each unique default kernel is requested at most once.
 
-- [ ] T016 [US2] Replace `PlanMember::DistributionImages` with per-image `PlanMember::DistributionImage { distribution_id, image_id, expected_bytes }` and runtime-first, unique-kernels-second, images-last ordering with checked byte totals covering selected artifacts only in `crates/cli/src/commands/download.rs` (constraint, quoted from data-model: "Each image member maps to exactly one `download_distribution_image(distribution_id, image_id)` call.")
-- [ ] T017 [US2] Swap `ArtifactClient::download_distribution` for `download_distribution_image(distribution_id, image_id)` plus a per-image `VerifiedArtifact` variant holding `DownloadedDistributionImage` in `crates/cli/src/commands/download.rs`
-- [ ] T018 [US2] Execute images sorted by distribution then image independent of selection order, with per-image byte accounting and kernel-failure skipping only dependent images in `crates/cli/src/commands/download.rs`
-- [ ] T019 [P] [US2] Render `distribution/{distro}/{image}` progress labels and per-image summary groups in `crates/cli/src/output/human.rs`
-- [ ] T020 [US2] Cover sorted execution order, shared-default-kernel-once, unselected-images-untouched, and two-images-one-distribution plans with the `RecordingClient` fake in the tests module of `crates/cli/src/commands/download.rs`
+- [x] T016 [US2] Replace `PlanMember::DistributionImages` with per-image `PlanMember::DistributionImage { distribution_id, image_id, expected_bytes }` and runtime-first, unique-kernels-second, images-last ordering with checked byte totals covering selected artifacts only in `crates/cli/src/commands/download.rs` (constraint, quoted from data-model: "Each image member maps to exactly one `download_distribution_image(distribution_id, image_id)` call.")
+- [x] T017 [US2] Swap `ArtifactClient::download_distribution` for `download_distribution_image(distribution_id, image_id)` plus a per-image `VerifiedArtifact` variant holding `DownloadedDistributionImage` in `crates/cli/src/commands/download.rs`
+- [x] T018 [US2] Execute images sorted by distribution then image independent of selection order, with per-image byte accounting and kernel-failure skipping only dependent images in `crates/cli/src/commands/download.rs`
+- [x] T019 [P] [US2] Render `distribution/{distro}/{image}` progress labels and per-image summary groups in `crates/cli/src/output/human.rs`
+- [x] T020 [US2] Cover sorted execution order, shared-default-kernel-once, unselected-images-untouched, and two-images-one-distribution plans with the `RecordingClient` fake in the tests module of `crates/cli/src/commands/download.rs`
 
 **Checkpoint**: At this point, User Stories 1 AND 2 should both work independently (select, review, transfer exactly the selection with creation-satisfiable default kernels).
 
@@ -101,9 +100,9 @@ through SDK behavior, and show truthful per-image progress with reuse distinctly
 **Independent Test**: Run the same confirmed image plan twice, corrupt one cached image
 between runs, and verify reused/repaired/failed statuses plus transfer counts.
 
-- [ ] T021 [US3] Verify aggregate plan accounting (`completed_plan_bytes` plus SDK counters via checked addition) and `Downloaded`/`Adopted`/`Already available` disposition passthrough with no progress-shape change in `crates/cli/src/commands/download.rs` (constraint, quoted from data-model: "Aggregate progress derives only from SDK counters plus plan metadata — never from elapsed time or assumed rate.")
-- [ ] T022 [US3] Cover verified-reuse without second transfer, missing/corrupt repair before readiness, and per-image identity in progress events in the tests module of `crates/cli/src/commands/download.rs`
-- [ ] T023 [P] [US3] Cover non-color and narrow-terminal status rendering (text/symbol state never color-only) in the tests module of `crates/cli/src/output/human.rs`
+- [x] T021 [US3] Verify aggregate plan accounting (`completed_plan_bytes` plus SDK counters via checked addition) and `Downloaded`/`Adopted`/`Already available` disposition passthrough with no progress-shape change in `crates/cli/src/commands/download.rs` (constraint, quoted from data-model: "Aggregate progress derives only from SDK counters plus plan metadata — never from elapsed time or assumed rate.")
+- [x] T022 [US3] Cover verified-reuse without second transfer, missing/corrupt repair before readiness, and per-image identity in progress events in the tests module of `crates/cli/src/commands/download.rs`
+- [x] T023 [P] [US3] Cover non-color and narrow-terminal status rendering (text/symbol state never color-only) in the tests module of `crates/cli/src/output/human.rs`
 
 **Checkpoint**: All P1 stories independently functional (select, transfer, reuse, truthful progress).
 
@@ -119,9 +118,9 @@ cancelled/successful/failed summary.
 status, separated group summary, retained artifacts, retry guidance, and `130` with no
 partial artifact on interrupt.
 
-- [ ] T024 [US4] Implement runtime-terminal rule, kernel-failure skips-only-dependents continuation, and the remaining-images cancellation tail (`append_cancelled_after_image`) in `crates/cli/src/commands/download.rs` (constraint, quoted from data-model: "`Succeeded` is possible only when every runtime package, every unique resolved default kernel, and every selected image returns a verified SDK result.")
-- [ ] T025 [P] [US4] Keep three-part failure messages (what happened, why preparation is incomplete, what to do next) and exit codes `0`/`1`/`130` in `crates/cli/src/error.rs`
-- [ ] T026 [US4] Cover runtime-terminal stop, kernel-failure dependent-skip with independent continuation, and `Ctrl-C` returning `130` with preserved groups and no published partial in the tests module of `crates/cli/src/commands/download.rs`
+- [x] T024 [US4] Implement runtime-terminal rule, kernel-failure skips-only-dependents continuation, and the remaining-images cancellation tail (`append_cancelled_after_image`) in `crates/cli/src/commands/download.rs` (constraint, quoted from data-model: "`Succeeded` is possible only when every runtime package, every unique resolved default kernel, and every selected image returns a verified SDK result.")
+- [x] T025 [P] [US4] Keep three-part failure messages (what happened, why preparation is incomplete, what to do next) and exit codes `0`/`1`/`130` in `crates/cli/src/error.rs`
+- [x] T026 [US4] Cover runtime-terminal stop, kernel-failure dependent-skip with independent continuation, and `Ctrl-C` returning `130` with preserved groups and no published partial in the tests module of `crates/cli/src/commands/download.rs`
 
 **Checkpoint**: Failure and cancellation behavior independently verified.
 
@@ -137,9 +136,9 @@ rejection of removed flags.
 images of one distribution and verify no prompts, same plan semantics, and deterministic
 status.
 
-- [ ] T027 [US5] Parse repeatable `--image DISTRIBUTION=IMAGE` values with scoped validation (distribution present and host-compatible; image published by its named distribution; repeats deduplicate, never error) in `crates/cli/src/commands/download.rs`
-- [ ] T028 [US5] Gate explicit versus interactive modes with non-TTY guidance naming the `--image` form and removed-flag migration help in `crates/cli/src/commands/download.rs`
-- [ ] T029 [P] [US5] Cover explicit multi-image plans, malformed/unavailable/mismatched scoped IDs starting no transfer, and parser-level rejection of `--distribution`/`--kernel` in `crates/cli/tests/command_surface.rs` and the parser tests of `crates/cli/src/cli.rs`
+- [x] T027 [US5] Parse repeatable `--image DISTRIBUTION=IMAGE` values with scoped validation (distribution present and host-compatible; image published by its named distribution; repeats deduplicate, never error) in `crates/cli/src/commands/download.rs`
+- [x] T028 [US5] Gate explicit versus interactive modes with non-TTY guidance naming the `--image` form and removed-flag migration help in `crates/cli/src/commands/download.rs`
+- [x] T029 [P] [US5] Cover explicit multi-image plans, malformed/unavailable/mismatched scoped IDs starting no transfer, and parser-level rejection of `--distribution`/`--kernel` in `crates/cli/tests/command_surface.rs` and the parser tests of `crates/cli/src/cli.rs`
 
 **Checkpoint**: All user stories independently functional over both interactive and scripted input.
 
@@ -149,9 +148,9 @@ status.
 
 **Purpose**: Dead-code removal, contract conformance, and full-gate validation.
 
-- [ ] T030 Remove superseded distro-first code (`parse_kernel_mappings`, kernel `Select` flow, `DistributionSelection`, group-level `DistributionImages` member and its helpers) in `crates/cli/src/commands/download.rs`
-- [ ] T031 [P] Validate English-only user-facing strings and old-`download` to `artifacts download` migration guidance across `crates/cli/src/cli.rs`, `crates/cli/src/error.rs`, and `crates/cli/src/output/human.rs`
-- [ ] T032 Run the validation guide in `specs/005-image-artifact-download/quickstart.md` (interactive flow, explicit flow, failure checks) followed by full workspace gates from repository root (`cargo fmt --all -- --check`, `cargo check --all-targets --all-features`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test --all-targets --all-features`)
+- [x] T030 Remove superseded distro-first code (`parse_kernel_mappings`, kernel `Select` flow, `DistributionSelection`, group-level `DistributionImages` member and its helpers) in `crates/cli/src/commands/download.rs`
+- [x] T031 [P] Validate English-only user-facing strings and old-`download` to `artifacts download` migration guidance across `crates/cli/src/cli.rs`, `crates/cli/src/error.rs`, and `crates/cli/src/output/human.rs`
+- [x] T032 Run the validation guide in `specs/005-image-artifact-download/quickstart.md` (interactive flow, explicit flow, failure checks) followed by full workspace gates from repository root (`cargo fmt --all -- --check`, `cargo check --all-targets --all-features`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test --all-targets --all-features`)
 
 ---
 

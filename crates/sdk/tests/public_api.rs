@@ -2,12 +2,11 @@
 fn public_artifact_types_are_exported() {
     use taumaru_microvm::{
         Architecture, ArtifactFile, ArtifactKind, CreateMicroVmRequest, DownloadDisposition,
-        DownloadPhase, DownloadProgress, DownloadedBinary, DownloadedDistribution, DownloadedFile,
-        DownloadedKernel, InstalledBinary, Kernel, MicroVmCreationResult, MicroVmSdk, MicroVmState,
-        NetworkConfiguration, NetworkConfigurationResult, NetworkMode, NetworkResource, SdkError,
-        SshConnectionInfo,
+        DownloadPhase, DownloadProgress, DownloadedBinary, DownloadedDistribution,
+        DownloadedDistributionImage, DownloadedFile, DownloadedKernel, InstalledBinary, Kernel,
+        MicroVmCreationResult, MicroVmSdk, MicroVmState, NetworkConfiguration,
+        NetworkConfigurationResult, NetworkMode, NetworkResource, SdkError, SshConnectionInfo,
     };
-
     let _ = std::mem::size_of::<Architecture>();
     let _ = std::mem::size_of::<ArtifactFile>();
     let _ = std::mem::size_of::<ArtifactKind>();
@@ -17,6 +16,7 @@ fn public_artifact_types_are_exported() {
     let _ = std::mem::size_of::<DownloadProgress>();
     let _ = std::mem::size_of::<DownloadedBinary>();
     let _ = std::mem::size_of::<DownloadedDistribution>();
+    let _ = std::mem::size_of::<DownloadedDistributionImage>();
     let _ = std::mem::size_of::<DownloadedFile>();
     let _ = std::mem::size_of::<DownloadedKernel>();
     let _ = std::mem::size_of::<InstalledBinary>();
@@ -31,7 +31,6 @@ fn public_artifact_types_are_exported() {
     let _ = std::mem::size_of::<SdkError>();
     let _ = std::mem::size_of::<SshConnectionInfo>();
 }
-
 #[test]
 fn public_resolver_method_is_available_without_process_local_state() {
     use taumaru_microvm::MicroVmSdk;

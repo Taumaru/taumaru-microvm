@@ -42,13 +42,13 @@ impl CliError {
             Self::Validation(message) => (
                 "Download selection is invalid".to_owned(),
                 message.clone(),
-                "Choose compatible registry IDs and provide one kernel mapping per distribution, then retry"
+                "Choose compatible registry image IDs as DISTRIBUTION_ID=IMAGE_ID and retry"
                     .to_owned(),
             ),
             Self::Prompt(message) if message == "cancelled" => (
                 "Download cancelled".to_owned(),
                 "No artifact transfer was started".to_owned(),
-                "Run `microvm download` again when you are ready".to_owned(),
+                "Run `microvm artifacts download` again when you are ready".to_owned(),
             ),
             Self::Prompt(message) => (
                 "Download selection could not be completed".to_owned(),
@@ -58,7 +58,7 @@ impl CliError {
             Self::Sdk(SdkError::Cancelled) => (
                 "Download cancelled".to_owned(),
                 "The SDK stopped before publishing an unverified partial artifact".to_owned(),
-                "Retry `microvm download` to acquire the remaining groups".to_owned(),
+                "Retry `microvm artifacts download` to acquire the remaining groups".to_owned(),
             ),
             Self::Sdk(error) => (
                 "Artifact preparation failed".to_owned(),
@@ -128,12 +128,12 @@ mod tests {
 
     #[test]
     fn error_message_has_a_compact_actionable_hierarchy() {
-        let message = CliError::Validation("at least one distribution is required".to_owned())
-            .user_message(false);
+        let message =
+            CliError::Validation("at least one image is required".to_owned()).user_message(false);
 
         assert!(message.starts_with("\n! Download selection is invalid"));
-        assert!(message.contains("Why: At least one distribution is required."));
-        assert!(message.contains("Next: Choose compatible registry IDs"));
+        assert!(message.contains("Why: At least one image is required."));
+        assert!(message.contains("Next: Choose compatible registry image IDs"));
         assert!(!message.contains("\u{1b}["));
     }
 }

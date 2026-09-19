@@ -272,3 +272,148 @@ async fn cancellation_after_a_verified_binary_member_preserves_that_member()
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn downloads_one_distribution_image_without_touching_its_sibling()
+-> Result<(), Box<dyn Error + Send + Sync>> {
+    let server = FixtureServer::start().await?;
+    let home = tempdir()?;
+    let sdk = MicroVmSdk::with_registry_base_url(home.path(), server.base_url())?;
+    let mut events = Vec::new();
+
+    let result = sdk
+        .download_distribution_image("alpine-test-1.0", "alpine-test-minimal", |event| {
+            events.push(event);
+        })
+        .await?;
+
+    assert_eq!(result.distribution.id, "alpine-test-1.0");
+    assert_eq!(result.image.id, "alpine-test-minimal");
+    assert_eq!(result.file.artifact_kind, ArtifactKind::DistributionImage);
+    assert_eq!(
+        result.file.member_name.as_deref(),
+        Some("alpine-test-minimal")
+    );
+    assert_eq!(result.file.disposition, DownloadDisposition::Downloaded);
+    assert!(result.file.absolute_path.starts_with(home.path()));
+    assert!(
+        home.path()
+            .join("artifacts/rootfs/alpine-test-1.0/alpine-test-minimal/alpine-test-minimal.ext4")
+            .exists()
+    );
+    assert!(
+        !home
+            .path()
+            .join("artifacts/rootfs/alpine-test-1.0/alpine-test-debug")
+            .exists()
+    );
+    assert!(
+        events
+            .iter()
+            .all(|event| event.member_name.as_deref() == Some("alpine-test-minimal"))
+    );
+    assert_eq!(
+        events.last().map(|event| &event.phase),
+        Some(&DownloadPhase::Completed)
+    );
+    assert_eq!(server.artifact_request_count(), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn reuses_a_downloaded_image_and_keeps_whole_distribution_working()
+-> Result<(), Box<dyn Error + Send + Sync>> {
+    let server = FixtureServer::start().await?;
+    let home = tempdir()?;
+    let sdk = MicroVmSdk::with_registry_base_url(home.path(), server.base_url())?;
+
+    let first = sdk
+        .download_distribution_image("alpine-test-1.0", "alpine-test-minimal", |_| {})
+        .await?;
+    let requests_after_first = server.artifact_request_count();
+    let second = sdk
+        .download_distribution_image("alpine-test-1.0", "alpine-test-minimal", |_| {})
+        .await?;
+
+    assert_eq!(first.file.disposition, DownloadDisposition::Downloaded);
+    assert_eq!(
+        second.file.disposition,
+        DownloadDisposition::SkippedExisting
+    );
+    assert_eq!(server.artifact_request_count(), requests_after_first);
+
+    let whole = sdk.download_distribution("alpine-test-1.0", |_| {}).await?;
+    assert_eq!(whole.images.len(), 2);
+    assert!(
+        whole
+            .images
+            .iter()
+            .any(|file| file.member_name.as_deref() == Some("alpine-test-minimal"))
+    );
+    assert!(
+        whole
+            .images
+            .iter()
+            .any(|file| file.member_name.as_deref() == Some("alpine-test-debug"))
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn rejects_an_image_outside_its_named_distribution()
+-> Result<(), Box<dyn Error + Send + Sync>> {
+    let server = FixtureServer::start().await?;
+    let home = tempdir()?;
+    let sdk = MicroVmSdk::with_registry_base_url(home.path(), server.base_url())?;
+
+    let missing_image = sdk
+        .download_distribution_image("alpine-test-1.0", "no-such-image", |_| {})
+        .await
+        .expect_err("unknown image should not download");
+    assert!(matches!(missing_image, SdkError::NotFound { kind, id }
+            if kind == "distribution image" && id == "no-such-image"));
+
+    let missing_distribution = sdk
+        .download_distribution_image("no-such-distro", "alpine-test-minimal", |_| {})
+        .await
+        .expect_err("unknown distribution should not download");
+    assert!(
+        matches!(missing_distribution, SdkError::NotFound { kind, id }
+            if kind == "distribution" && id == "no-such-distro")
+    );
+    assert_eq!(server.artifact_request_count(), 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn cancelled_single_image_download_publishes_nothing()
+-> Result<(), Box<dyn Error + Send + Sync>> {
+    let server = FixtureServer::start().await?;
+    let home = tempdir()?;
+    let sdk = MicroVmSdk::with_registry_base_url(home.path(), server.base_url())?;
+    let cancellation = DownloadCancellation::new();
+    cancellation.cancel();
+    let mut phases = Vec::new();
+
+    let result = sdk
+        .download_distribution_image_with_cancellation(
+            "alpine-test-1.0",
+            "alpine-test-minimal",
+            &cancellation,
+            |event| {
+                phases.push(event.phase);
+            },
+        )
+        .await;
+
+    assert!(matches!(result, Err(SdkError::Cancelled)));
+    assert!(phases.contains(&DownloadPhase::Cancelled));
+    assert!(
+        !home
+            .path()
+            .join("artifacts/rootfs/alpine-test-1.0/alpine-test-minimal/alpine-test-minimal.ext4")
+            .exists()
+    );
+    assert_eq!(server.artifact_request_count(), 0);
+    Ok(())
+}

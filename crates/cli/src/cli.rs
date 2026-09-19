@@ -14,19 +14,27 @@ pub(crate) struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum Command {
-    /// Select and download runtime, kernel, and distribution artifacts.
+    /// Manage local artifact inventory.
+    Artifacts(ArtifactsArgs),
+}
+
+#[derive(Debug, Args, Clone)]
+pub(crate) struct ArtifactsArgs {
+    #[command(subcommand)]
+    pub(crate) command: ArtifactsCommand,
+}
+
+#[derive(Debug, Subcommand, Clone)]
+pub(crate) enum ArtifactsCommand {
+    /// Select and download runtime, kernel, and distribution image artifacts.
     Download(DownloadArgs),
 }
 
 #[derive(Debug, Args, Clone)]
 pub(crate) struct DownloadArgs {
-    /// Select a distribution by registry ID. Repeat for multiple distributions.
-    #[arg(long = "distribution", value_name = "DISTRIBUTION_ID")]
-    pub(crate) distributions: Vec<String>,
-
-    /// Select a kernel for a distribution as DISTRIBUTION_ID=KERNEL_ID. Repeat per distribution.
-    #[arg(long = "kernel", value_name = "DISTRIBUTION_ID=KERNEL_ID")]
-    pub(crate) kernels: Vec<String>,
+    /// Select an image by registry IDs as DISTRIBUTION_ID=IMAGE_ID. Repeat for multiple images.
+    #[arg(long = "image", value_name = "DISTRIBUTION_ID=IMAGE_ID")]
+    pub(crate) images: Vec<String>,
 
     /// Disable prompts and require complete explicit selections.
     #[arg(long = "non-interactive")]
@@ -37,33 +45,54 @@ pub(crate) struct DownloadArgs {
 mod tests {
     use clap::Parser;
 
-    use super::{Cli, Command};
+    use super::{ArtifactsCommand, Cli, Command};
 
     #[test]
     fn download_parser_accepts_repeatable_explicit_options() {
         let cli = Cli::try_parse_from([
             "microvm",
+            "artifacts",
             "download",
             "--non-interactive",
-            "--distribution",
-            "distro-a",
-            "--distribution",
-            "distro-z",
-            "--kernel",
-            "distro-a=kernel-a",
-            "--kernel",
-            "distro-z=kernel-z",
+            "--image",
+            "distro-a=image-a",
+            "--image",
+            "distro-a=image-a-debug",
+            "--image",
+            "distro-z=image-z",
         ])
         .expect("valid explicit download arguments");
 
-        let Some(Command::Download(arguments)) = cli.command else {
+        let Some(Command::Artifacts(arguments)) = cli.command else {
             panic!("download command should be parsed");
         };
-        assert!(arguments.non_interactive);
-        assert_eq!(arguments.distributions, ["distro-a", "distro-z"]);
+        let ArtifactsCommand::Download(download) = arguments.command;
+        assert!(download.non_interactive);
         assert_eq!(
-            arguments.kernels,
-            ["distro-a=kernel-a", "distro-z=kernel-z"]
+            download.images,
+            [
+                "distro-a=image-a",
+                "distro-a=image-a-debug",
+                "distro-z=image-z"
+            ]
+        );
+    }
+
+    #[test]
+    fn removed_distribution_and_kernel_flags_are_rejected() {
+        assert!(Cli::try_parse_from(["microvm", "download"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "microvm",
+                "artifacts",
+                "download",
+                "--distribution",
+                "distro-a",
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from(["microvm", "artifacts", "download", "--kernel", "x=y"]).is_err()
         );
     }
 }

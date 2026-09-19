@@ -1,9 +1,7 @@
 use std::io::{self, Write};
 use std::time::Duration;
 
-use crate::commands::download::{
-    Availability, DownloadOutcome, DownloadPlan, MemberOutcome, PlanMember,
-};
+use crate::commands::download::{Availability, DownloadOutcome, DownloadPlan, MemberOutcome};
 use crate::context::TerminalCapabilities;
 use crate::output::ProgressSink;
 use indicatif::{ProgressBar, ProgressStyle};
@@ -236,48 +234,33 @@ pub(crate) fn format_review(plan: &DownloadPlan, capabilities: TerminalCapabilit
         paint("Targets", ANSI_BOLD, capabilities.color)
     ));
     for selection in &plan.selections {
-        let default_marker = if selection.kernel_is_default {
-            " · default"
-        } else {
-            ""
-        };
         if capabilities.width.is_some_and(|width| width < 72) {
             output.push_str(&format!(
-                "  {}  {} → {}{}\n",
+                "  {}  {} / {} · default\n",
                 paint("•", ANSI_BLUE, capabilities.color),
                 selection.distribution.id,
-                selection.kernel.id,
-                default_marker,
+                selection.image.id,
             ));
             output.push_str(&format!(
-                "     {} images · {}\n",
-                selection.distribution.images.len(),
-                format_bytes(selection_image_bytes(selection)),
+                "     {}\n",
+                format_bytes(selection.expected_bytes),
             ));
         } else {
             output.push_str(&format!(
-                "  {}  {} ({})\n     {}  {} ({}){} · {} images · {}\n",
+                "  {}  {} / {} ({})\n     {}  {} ({}) · default · {}\n",
                 paint("•", ANSI_BLUE, capabilities.color),
                 selection.distribution.id,
-                selection.distribution.display_name,
+                selection.image.id,
+                selection.image.display_name,
                 paint("↳", ANSI_DIM, capabilities.color),
                 selection.kernel.id,
                 selection.kernel.display_name,
-                default_marker,
-                selection.distribution.images.len(),
-                format_bytes(selection_image_bytes(selection)),
+                format_bytes(selection.expected_bytes),
             ));
         }
     }
 
-    let image_count = plan
-        .members
-        .iter()
-        .filter_map(|member| match member {
-            PlanMember::DistributionImages { image_count, .. } => Some(*image_count),
-            _ => None,
-        })
-        .fold(0_usize, usize::saturating_add);
+    let image_count = plan.selections.len();
     output.push_str(&format!(
         "\n{}\n  {} · {} planned groups · {} images\n\n",
         paint("Transfer", ANSI_BOLD, capabilities.color),
@@ -294,14 +277,6 @@ pub(crate) fn format_review(plan: &DownloadPlan, capabilities: TerminalCapabilit
         )
     ));
     output
-}
-
-fn selection_image_bytes(selection: &crate::commands::download::DistributionSelection) -> u64 {
-    selection
-        .distribution
-        .images
-        .iter()
-        .fold(0_u64, |total, image| total.saturating_add(image.size_bytes))
 }
 
 fn divider(capabilities: TerminalCapabilities) -> String {
@@ -376,13 +351,9 @@ fn format_summary_with_capabilities(
             crate::commands::download::VerifiedArtifact::Kernel(result) => {
                 (1, result.file.size_bytes)
             }
-            crate::commands::download::VerifiedArtifact::Distribution(result) => (
-                result.images.len(),
-                result
-                    .images
-                    .iter()
-                    .fold(0_u64, |total, file| total.saturating_add(file.size_bytes)),
-            ),
+            crate::commands::download::VerifiedArtifact::DistributionImage(result) => {
+                (1, result.file.size_bytes)
+            }
         })
         .fold(
             (0_usize, 0_u64),
@@ -454,7 +425,7 @@ fn format_summary_with_capabilities(
     }
     if outcome.cancelled {
         output.push_str(
-            "\n  Why: transfer stopped before the remaining groups were verified; completed groups were preserved.\n  Next: retry `microvm download` to acquire the cancelled groups.\n",
+            "\n  Why: transfer stopped before the remaining groups were verified; completed groups were preserved.\n  Next: retry `microvm artifacts download` to acquire the cancelled groups.\n",
         );
     } else if !outcome.is_success() {
         output.push_str(
@@ -558,6 +529,24 @@ mod tests {
         assert!(narrow.contains("Downloading"));
         assert!(narrow.contains("linux-6.8"));
         assert!(!narrow.contains("\u{1b}["));
+    }
+
+    #[test]
+    fn image_progress_line_keeps_distribution_and_image_visible() {
+        let mut image_view = view();
+        image_view.artifact_kind = ArtifactKind::DistributionImage;
+        image_view.artifact_id = "distro-a".to_owned();
+        image_view.member_name = Some("image-a".to_owned());
+        let line = format_progress_line(
+            &image_view,
+            TerminalCapabilities {
+                interactive: false,
+                color: false,
+                width: Some(50),
+            },
+        );
+        assert!(line.contains("distribution/distro-a/image-a"));
+        assert!(line.contains("Downloading"));
     }
 
     #[test]

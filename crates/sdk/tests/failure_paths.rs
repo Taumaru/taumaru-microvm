@@ -263,6 +263,46 @@ async fn cancellation_emits_a_typed_terminal_phase_and_leaves_no_partial_file()
     Ok(())
 }
 
+#[tokio::test]
+async fn single_image_download_rejects_blank_and_unknown_identifiers()
+-> Result<(), Box<dyn Error + Send + Sync>> {
+    let server = FixtureServer::start().await?;
+    let home = tempdir()?;
+    let sdk = MicroVmSdk::with_registry_base_url(home.path(), server.base_url())?;
+
+    let blank_distribution = sdk
+        .download_distribution_image("", "alpine-test-minimal", |_| {})
+        .await
+        .expect_err("blank distribution should be rejected");
+    assert!(matches!(
+        blank_distribution,
+        SdkError::InvalidRequest { .. } | SdkError::InvalidMetadata { .. }
+    ));
+
+    let blank_image = sdk
+        .download_distribution_image("alpine-test-1.0", "  ", |_| {})
+        .await
+        .expect_err("whitespace image should not resolve");
+    assert!(matches!(blank_image, SdkError::NotFound { .. }));
+
+    let unknown_distribution = sdk
+        .download_distribution_image("no-such-distro", "alpine-test-minimal", |_| {})
+        .await
+        .expect_err("unknown distribution should be typed");
+    assert!(
+        matches!(unknown_distribution, SdkError::NotFound { kind, id }
+            if kind == "distribution" && id == "no-such-distro")
+    );
+    let foreign_image = sdk
+        .download_distribution_image("alpine-test-1.0", "linux-test-x86_64", |_| {})
+        .await
+        .expect_err("kernel id is not an image of this distribution");
+    assert!(matches!(foreign_image, SdkError::NotFound { kind, id }
+            if kind == "distribution image" && id == "linux-test-x86_64"));
+    assert_eq!(server.artifact_request_count(), 0);
+    Ok(())
+}
+
 #[test]
 fn unprivileged_link_probe_reports_command_diagnostics_not_absence() {
     use std::os::unix::fs::PermissionsExt;

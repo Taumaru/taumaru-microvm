@@ -18,8 +18,9 @@ use crate::adapters::runtime::firecracker::FirecrackerRuntime;
 use crate::adapters::storage::ext4::Ext4Storage;
 use crate::domain::artifact::{
     ArtifactKind, DownloadCancellation, DownloadDisposition, DownloadPhase, DownloadProgress,
-    DownloadSpec, DownloadedBinary, DownloadedDistribution, DownloadedFile, DownloadedKernel,
-    FileIntegrity, InstalledBinary, ProgressTracker, is_valid_sha256, validate_registry_path,
+    DownloadSpec, DownloadedBinary, DownloadedDistribution, DownloadedDistributionImage,
+    DownloadedFile, DownloadedKernel, FileIntegrity, InstalledBinary, ProgressTracker,
+    is_valid_sha256, validate_registry_path,
 };
 use crate::domain::config::minimum_memory_bytes;
 use crate::domain::lifecycle::{MicroVmState, NetworkMode};
@@ -347,6 +348,76 @@ impl MicroVmSdk {
         Ok(DownloadedDistribution {
             distribution,
             images,
+        })
+    }
+
+    /// Downloads one image of one distribution into the SDK home.
+    ///
+    /// The distribution's boot arguments and kernel compatibility references are persisted as
+    /// part of image persistence. The default kernel is referenced but never implicitly fetched.
+    /// The existing whole-distribution operation is preserved for callers that need every image.
+    pub async fn download_distribution_image<F>(
+        &self,
+        distribution_id: &str,
+        image_id: &str,
+        on_progress: F,
+    ) -> Result<DownloadedDistributionImage, SdkError>
+    where
+        F: FnMut(DownloadProgress) + Send,
+    {
+        let cancellation = DownloadCancellation::new();
+        self.download_distribution_image_with_cancellation(
+            distribution_id,
+            image_id,
+            &cancellation,
+            on_progress,
+        )
+        .await
+    }
+
+    /// Downloads one distribution image while observing a caller-owned cancellation
+    /// handle. A cancelled in-flight file is removed before [`SdkError::Cancelled`] is
+    /// returned; images committed by earlier calls are preserved.
+    pub async fn download_distribution_image_with_cancellation<F>(
+        &self,
+        distribution_id: &str,
+        image_id: &str,
+        cancellation: &DownloadCancellation,
+        mut on_progress: F,
+    ) -> Result<DownloadedDistributionImage, SdkError>
+    where
+        F: FnMut(DownloadProgress) + Send,
+    {
+        validate_requested_id(distribution_id, "distribution")?;
+        validate_requested_id(image_id, "distribution image")?;
+        let manifest = self.fetch_manifest().await?;
+        let distribution = manifest
+            .distributions
+            .into_iter()
+            .find(|candidate| candidate.id == distribution_id)
+            .ok_or_else(|| SdkError::NotFound {
+                kind: "distribution".to_owned(),
+                id: distribution_id.to_owned(),
+            })?;
+        let image = distribution
+            .images
+            .iter()
+            .find(|candidate| candidate.id == image_id)
+            .cloned()
+            .ok_or_else(|| SdkError::NotFound {
+                kind: "distribution image".to_owned(),
+                id: image_id.to_owned(),
+            })?;
+        let member =
+            self.distribution_image_member(distribution.clone(), image.clone(), manifest.kernels)?;
+        let mut tracker = ProgressTracker::new(member.spec.expected_size);
+        let file = self
+            .download_member(&member, cancellation, &mut tracker, &mut on_progress)
+            .await?;
+        Ok(DownloadedDistributionImage {
+            distribution,
+            image,
+            file,
         })
     }
 

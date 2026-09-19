@@ -13,8 +13,8 @@ pub use domain::{
     Architecture, ArtifactFile, ArtifactKind, BinaryFile, BinaryPackage, BootConfiguration,
     Distribution, DistributionImage, DistributionRequirements, DownloadCancellation,
     DownloadDisposition, DownloadPhase, DownloadProgress, DownloadedBinary, DownloadedDistribution,
-    DownloadedFile, DownloadedKernel, ElfMetadata, Endianness, FilesystemMetadata, InstalledBinary,
-    Kernel, Linkage,
+    DownloadedDistributionImage, DownloadedFile, DownloadedKernel, ElfMetadata, Endianness,
+    FilesystemMetadata, InstalledBinary, Kernel, Linkage,
 };
 pub use domain::{
     CreateMicroVmRequest, MicroVmCreationResult, MicroVmState, NetworkConfiguration,

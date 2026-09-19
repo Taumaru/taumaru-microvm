@@ -1,14 +1,14 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::fmt;
-use std::future::Future;
 use std::io;
 
 use inquire::ui::{Color, RenderConfig, StyleSheet, Styled};
-use inquire::{Confirm, InquireError, MultiSelect, Select};
+use inquire::{Confirm, InquireError, MultiSelect};
 use semver::Version;
 use taumaru_microvm::{
-    Architecture, BinaryPackage, Distribution, DownloadCancellation, DownloadProgress,
-    DownloadedBinary, DownloadedDistribution, DownloadedKernel, Kernel, MicroVmSdk, SdkError,
+    Architecture, BinaryPackage, Distribution, DistributionImage, DownloadCancellation,
+    DownloadProgress, DownloadedBinary, DownloadedDistributionImage, DownloadedKernel, Kernel,
+    MicroVmSdk, SdkError,
 };
 
 use crate::cli::DownloadArgs;
@@ -39,12 +39,13 @@ trait ArtifactClient {
     where
         F: FnMut(DownloadProgress) + Send;
 
-    async fn download_distribution<F>(
+    async fn download_distribution_image<F>(
         &self,
         distribution_id: &str,
+        image_id: &str,
         cancellation: &DownloadCancellation,
         on_progress: F,
-    ) -> Result<DownloadedDistribution, SdkError>
+    ) -> Result<DownloadedDistributionImage, SdkError>
     where
         F: FnMut(DownloadProgress) + Send;
 }
@@ -100,17 +101,23 @@ impl ArtifactClient for SdkArtifactClient<'_> {
             .await
     }
 
-    async fn download_distribution<F>(
+    async fn download_distribution_image<F>(
         &self,
         distribution_id: &str,
+        image_id: &str,
         cancellation: &DownloadCancellation,
         on_progress: F,
-    ) -> Result<DownloadedDistribution, SdkError>
+    ) -> Result<DownloadedDistributionImage, SdkError>
     where
         F: FnMut(DownloadProgress) + Send,
     {
         self.sdk
-            .download_distribution_with_cancellation(distribution_id, cancellation, on_progress)
+            .download_distribution_image_with_cancellation(
+                distribution_id,
+                image_id,
+                cancellation,
+                on_progress,
+            )
             .await
     }
 }
@@ -199,10 +206,11 @@ pub(crate) struct RegistryCatalog {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct DistributionSelection {
+pub(crate) struct ImageSelection {
     pub(crate) distribution: Distribution,
+    pub(crate) image: DistributionImage,
     pub(crate) kernel: Kernel,
-    pub(crate) kernel_is_default: bool,
+    pub(crate) expected_bytes: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -222,9 +230,9 @@ pub(crate) enum PlanMember {
         kernel_id: String,
         expected_bytes: u64,
     },
-    DistributionImages {
+    DistributionImage {
         distribution_id: String,
-        image_count: usize,
+        image_id: String,
         expected_bytes: u64,
     },
 }
@@ -232,7 +240,7 @@ pub(crate) enum PlanMember {
 #[derive(Clone, Debug)]
 pub(crate) struct DownloadPlan {
     pub(crate) runtime: RuntimeBinarySelection,
-    pub(crate) selections: Vec<DistributionSelection>,
+    pub(crate) selections: Vec<ImageSelection>,
     pub(crate) members: Vec<PlanMember>,
     pub(crate) expected_bytes: u64,
 }
@@ -274,7 +282,21 @@ impl RegistryCatalog {
             .collect()
     }
 
-    fn compatible_kernels(&self, distribution: &Distribution) -> Result<Vec<&Kernel>, CliError> {
+    fn compatible_images(&self) -> Vec<(&Distribution, &DistributionImage)> {
+        let mut pairs = Vec::new();
+        for distribution in self.compatible_distributions() {
+            for image in &distribution.images {
+                pairs.push((distribution, image));
+            }
+        }
+        pairs.sort_by(|left, right| {
+            (left.0.id.as_str(), left.1.id.as_str())
+                .cmp(&(right.0.id.as_str(), right.1.id.as_str()))
+        });
+        pairs
+    }
+
+    fn default_kernel(&self, distribution: &Distribution) -> Result<Kernel, CliError> {
         if !same_architecture(&distribution.architecture, &self.host_architecture) {
             return Err(CliError::Validation(format!(
                 "distribution {} is not published for host architecture {}",
@@ -282,40 +304,27 @@ impl RegistryCatalog {
                 architecture_label(&distribution.architecture)
             )));
         }
-        let mut supported_ids = HashSet::new();
-        let mut kernels = Vec::new();
-        for kernel_id in &distribution.supported_kernels {
-            if !supported_ids.insert(kernel_id.as_str()) {
-                return Err(CliError::Validation(format!(
-                    "distribution {} lists kernel {} more than once",
-                    distribution.id, kernel_id
-                )));
-            }
-            let kernel = self
-                .kernels
-                .iter()
-                .find(|candidate| candidate.id == *kernel_id)
-                .ok_or_else(|| {
-                    CliError::Validation(format!(
-                        "distribution {} references unavailable kernel {}",
-                        distribution.id, kernel_id
-                    ))
-                })?;
-            if same_architecture(&kernel.architecture, &self.host_architecture)
-                && same_architecture(&kernel.architecture, &distribution.architecture)
-            {
-                kernels.push(kernel);
-            }
-        }
-        kernels.sort_by(|left, right| left.id.cmp(&right.id));
-        if kernels.is_empty() {
+        let kernel = self
+            .kernels
+            .iter()
+            .find(|candidate| candidate.id == distribution.default_kernel)
+            .ok_or_else(|| {
+                CliError::Validation(format!(
+                    "distribution {} default kernel {} is unavailable for this host",
+                    distribution.id, distribution.default_kernel
+                ))
+            })?;
+        if !same_architecture(&kernel.architecture, &self.host_architecture)
+            || !same_architecture(&kernel.architecture, &distribution.architecture)
+        {
             return Err(CliError::Validation(format!(
-                "distribution {} has no compatible kernels for host architecture {}",
+                "distribution {} default kernel {} is not compatible with host architecture {}",
                 distribution.id,
+                kernel.id,
                 architecture_label(&self.host_architecture)
             )));
         }
-        Ok(kernels)
+        Ok(kernel.clone())
     }
 
     fn select_runtime_packages(&self) -> Result<RuntimeBinarySelection, CliError> {
@@ -380,10 +389,6 @@ impl RegistryCatalog {
         self.distributions
             .iter()
             .find(|distribution| distribution.id == id)
-    }
-
-    fn kernel(&self, id: &str) -> Option<&Kernel> {
-        self.kernels.iter().find(|kernel| kernel.id == id)
     }
 
     pub(crate) fn counts(&self) -> (usize, usize, usize) {
@@ -468,83 +473,61 @@ fn binary_package_size(package: &BinaryPackage) -> Result<u64, CliError> {
     })
 }
 
-fn parse_kernel_mappings(values: &[String]) -> Result<HashMap<String, String>, CliError> {
-    let mut mappings = HashMap::new();
+fn parse_image_selections(values: &[String]) -> Result<Vec<(String, String)>, CliError> {
+    let mut selections = Vec::with_capacity(values.len());
     for value in values {
         let parts = value.split('=').collect::<Vec<_>>();
         if parts.len() != 2 || parts[0].trim().is_empty() || parts[1].trim().is_empty() {
             return Err(CliError::Validation(format!(
-                "kernel mapping {value:?} must use DISTRIBUTION_ID=KERNEL_ID"
+                "image selection {value:?} must use DISTRIBUTION_ID=IMAGE_ID"
             )));
         }
-        let distribution_id = parts[0].to_owned();
-        let kernel_id = parts[1].to_owned();
-        if mappings
-            .insert(distribution_id.clone(), kernel_id)
-            .is_some()
-        {
-            return Err(CliError::Validation(format!(
-                "distribution {distribution_id} has more than one kernel mapping"
-            )));
-        }
+        selections.push((parts[0].to_owned(), parts[1].to_owned()));
     }
-    Ok(mappings)
+    Ok(selections)
 }
 
 fn build_plan(
     catalog: &RegistryCatalog,
-    selected_distribution_ids: &[String],
-    kernel_mappings: &HashMap<String, String>,
+    selected_images: &[(String, String)],
 ) -> Result<DownloadPlan, CliError> {
-    if selected_distribution_ids.is_empty() {
+    if selected_images.is_empty() {
         return Err(CliError::Validation(
-            "at least one distribution must be selected".to_owned(),
+            "at least one image must be selected".to_owned(),
         ));
     }
-    validate_ids(selected_distribution_ids, "selected distribution", |id| id)?;
-    for distribution_id in kernel_mappings.keys() {
-        if !selected_distribution_ids
-            .iter()
-            .any(|selected| selected == distribution_id)
-        {
-            return Err(CliError::Validation(format!(
-                "kernel mapping for unselected distribution {distribution_id}"
-            )));
-        }
-    }
 
-    let mut distribution_ids = selected_distribution_ids.to_vec();
-    distribution_ids.sort();
-    let mut selections = Vec::with_capacity(distribution_ids.len());
-    for distribution_id in distribution_ids {
+    let mut pairs = selected_images.to_vec();
+    pairs.sort();
+    pairs.dedup();
+    let mut selections = Vec::with_capacity(pairs.len());
+    for (distribution_id, image_id) in pairs {
         let distribution = catalog.distribution(&distribution_id).ok_or_else(|| {
             CliError::Validation(format!(
                 "distribution {distribution_id} is unavailable for this host"
             ))
         })?;
-        let kernel_id = kernel_mappings.get(&distribution_id).ok_or_else(|| {
-            CliError::Validation(format!(
-                "distribution {distribution_id} requires exactly one kernel mapping"
-            ))
-        })?;
-        let kernel = catalog.kernel(kernel_id).ok_or_else(|| {
-            CliError::Validation(format!(
-                "kernel {kernel_id} is not available in the registry"
-            ))
-        })?;
-        let compatible_kernels = catalog.compatible_kernels(distribution)?;
-        if !compatible_kernels
-            .iter()
-            .any(|candidate| candidate.id == kernel.id)
-        {
+        if !same_architecture(&distribution.architecture, &catalog.host_architecture) {
             return Err(CliError::Validation(format!(
-                "kernel {kernel_id} is not compatible with distribution {distribution_id}"
+                "distribution {distribution_id} is not published for host architecture {}",
+                architecture_label(&distribution.architecture)
             )));
         }
-        selections.push(DistributionSelection {
+        let image = distribution
+            .images
+            .iter()
+            .find(|candidate| candidate.id == image_id)
+            .ok_or_else(|| {
+                CliError::Validation(format!(
+                    "image {image_id} is not published by distribution {distribution_id}"
+                ))
+            })?;
+        let kernel = catalog.default_kernel(distribution)?;
+        selections.push(ImageSelection {
             distribution: distribution.clone(),
-            kernel: kernel.clone(),
-            kernel_is_default: distribution.default_kernel == kernel.id,
+            image: image.clone(),
+            kernel,
+            expected_bytes: image.size_bytes,
         });
     }
 
@@ -580,24 +563,15 @@ fn build_plan(
         });
     }
     for selection in &selections {
-        let image_bytes =
-            selection
-                .distribution
-                .images
-                .iter()
-                .try_fold(0_u64, |total, image| {
-                    total.checked_add(image.size_bytes).ok_or_else(|| {
-                        CliError::Validation(format!(
-                            "distribution {} image sizes exceed the supported range",
-                            selection.distribution.id
-                        ))
-                    })
-                })?;
-        expected_bytes = checked_size_add(expected_bytes, image_bytes, "distribution images")?;
-        members.push(PlanMember::DistributionImages {
+        expected_bytes = checked_size_add(
+            expected_bytes,
+            selection.expected_bytes,
+            "distribution image",
+        )?;
+        members.push(PlanMember::DistributionImage {
             distribution_id: selection.distribution.id.clone(),
-            image_count: selection.distribution.images.len(),
-            expected_bytes: image_bytes,
+            image_id: selection.image.id.clone(),
+            expected_bytes: selection.expected_bytes,
         });
     }
     Ok(DownloadPlan {
@@ -628,7 +602,7 @@ pub(crate) enum Availability {
 pub(crate) enum VerifiedArtifact {
     Binary(Box<DownloadedBinary>),
     Kernel(Box<DownloadedKernel>),
-    Distribution(Box<DownloadedDistribution>),
+    DistributionImage(Box<DownloadedDistributionImage>),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -879,77 +853,60 @@ where
     }
 
     for (index, selection) in plan.selections.iter().enumerate() {
-        let distribution_id = &selection.distribution.id;
+        let distribution_id = selection.distribution.id.clone();
+        let image_id = selection.image.id.clone();
+        let label = format!("distribution/{distribution_id}/{image_id}");
         if failed_kernels.contains(&selection.kernel.id) {
             outcome.groups.push(MemberOutcome::Skipped {
-                label: format!("distribution/{distribution_id}"),
+                label,
                 reason: format!("kernel/{} failed", selection.kernel.id),
             });
             continue;
         }
         if cancellation.is_cancelled() {
             outcome.cancelled = true;
-            outcome.groups.push(MemberOutcome::Cancelled {
-                label: format!("distribution/{distribution_id}"),
-            });
-            append_cancelled_after_distribution(plan, &mut outcome, index + 1);
+            outcome.groups.push(MemberOutcome::Cancelled { label });
+            append_cancelled_after_image(plan, &mut outcome, index + 1);
             return Ok(outcome);
         }
-        let expected_bytes = plan
-            .members
-            .iter()
-            .find_map(|member| match member {
-                PlanMember::DistributionImages {
-                    distribution_id: member_distribution_id,
-                    expected_bytes,
-                    ..
-                } if member_distribution_id == distribution_id => Some(*expected_bytes),
-                _ => None,
-            })
-            .ok_or_else(|| {
-                CliError::Validation(format!(
-                    "distribution {distribution_id} is missing from the download plan"
-                ))
-            })?;
-        let mut distribution_progress =
+        let mut image_progress =
             ProgressForwarder::new(sink, completed_plan_bytes, plan.expected_bytes);
-        let distribution_call =
-            client.download_distribution(distribution_id, cancellation, |progress| {
-                distribution_progress.forward(progress)
-            });
-        let distribution_result =
-            call_with_signal(distribution_call, cancellation, signal_factory()).await?;
-        if let Some(error) = distribution_progress.take_error() {
+        let image_call = client.download_distribution_image(
+            &distribution_id,
+            &image_id,
+            cancellation,
+            |progress| image_progress.forward(progress),
+        );
+        let image_result = call_with_signal(image_call, cancellation, signal_factory()).await?;
+        if let Some(error) = image_progress.take_error() {
             return Err(error);
         }
-        match distribution_result {
+        match image_result {
             OperationResult::Finished(Ok(result)) => {
-                outcome.add_available_bytes(expected_bytes)?;
+                outcome.add_available_bytes(selection.expected_bytes)?;
                 completed_plan_bytes = checked_size_add(
                     completed_plan_bytes,
-                    expected_bytes,
-                    "completed distribution",
+                    selection.expected_bytes,
+                    "completed image",
                 )?;
                 outcome.groups.push(MemberOutcome::Verified {
-                    label: format!("distribution/{distribution_id}"),
-                    availability: availability_for_files(&result.images),
+                    label,
+                    availability: availability_for_files(std::slice::from_ref(&result.file)),
                 });
                 outcome
                     .verified
-                    .push(VerifiedArtifact::Distribution(Box::new(result)));
+                    .push(VerifiedArtifact::DistributionImage(Box::new(result)));
             }
             OperationResult::Finished(Err(error)) => {
                 outcome.groups.push(MemberOutcome::Failed {
-                    label: format!("distribution/{distribution_id}"),
+                    label,
                     reason: error.to_string(),
                 });
             }
             OperationResult::Cancelled => {
                 outcome.cancelled = true;
-                outcome.groups.push(MemberOutcome::Cancelled {
-                    label: format!("distribution/{distribution_id}"),
-                });
-                append_cancelled_after_distribution(plan, &mut outcome, index + 1);
+                outcome.groups.push(MemberOutcome::Cancelled { label });
+                append_cancelled_after_image(plan, &mut outcome, index + 1);
                 return Ok(outcome);
             }
         }
@@ -987,10 +944,12 @@ fn append_cancelled_after_runtime(
             PlanMember::Kernel { kernel_id, .. } => outcome.groups.push(MemberOutcome::Cancelled {
                 label: format!("kernel/{kernel_id}"),
             }),
-            PlanMember::DistributionImages {
-                distribution_id, ..
+            PlanMember::DistributionImage {
+                distribution_id,
+                image_id,
+                ..
             } => outcome.groups.push(MemberOutcome::Cancelled {
-                label: format!("distribution/{distribution_id}"),
+                label: format!("distribution/{distribution_id}/{image_id}"),
             }),
         }
     }
@@ -1014,21 +973,20 @@ fn append_cancelled_after_kernel(
             label: format!("kernel/{kernel_id}"),
         });
     }
-    for selection in &plan.selections {
-        outcome.groups.push(MemberOutcome::Cancelled {
-            label: format!("distribution/{}", selection.distribution.id),
-        });
-    }
+    append_cancelled_after_image(plan, outcome, 0);
 }
 
-fn append_cancelled_after_distribution(
+fn append_cancelled_after_image(
     plan: &DownloadPlan,
     outcome: &mut DownloadOutcome,
-    distribution_start: usize,
+    image_start: usize,
 ) {
-    for selection in plan.selections.iter().skip(distribution_start) {
+    for selection in plan.selections.iter().skip(image_start) {
         outcome.groups.push(MemberOutcome::Cancelled {
-            label: format!("distribution/{}", selection.distribution.id),
+            label: format!(
+                "distribution/{}/{}",
+                selection.distribution.id, selection.image.id
+            ),
         });
     }
 }
@@ -1059,8 +1017,8 @@ fn build_explicit_plan(
     catalog: &RegistryCatalog,
     arguments: &DownloadArgs,
 ) -> Result<DownloadPlan, CliError> {
-    let mappings = parse_kernel_mappings(&arguments.kernels)?;
-    build_plan(catalog, &arguments.distributions, &mappings)
+    let selections = parse_image_selections(&arguments.images)?;
+    build_plan(catalog, &selections)
 }
 
 fn prompt_render_config(color: bool) -> RenderConfig<'static> {
@@ -1115,17 +1073,36 @@ fn prompt_render_config(color: bool) -> RenderConfig<'static> {
 fn prompt_selections(
     catalog: &RegistryCatalog,
     capabilities: crate::context::TerminalCapabilities,
-) -> Result<(Vec<String>, HashMap<String, String>), CliError> {
+) -> Result<Vec<(String, String)>, CliError> {
     let render_config = prompt_render_config(capabilities.color);
-    let distribution_options = catalog
-        .compatible_distributions()
+    let image_options = catalog
+        .compatible_images()
         .into_iter()
-        .map(|distribution| SelectionOption {
-            id: distribution.id.clone(),
-            label: format!("{} ({})", distribution.display_name, distribution.id),
+        .map(|(distribution, image)| {
+            let capabilities_text = if image.capabilities.is_empty() {
+                String::new()
+            } else {
+                format!(" · {}", image.capabilities.join(", "))
+            };
+            SelectionOption {
+                id: format!("{}={}", distribution.id, image.id),
+                label: format!(
+                    "{} / {} ({} · {}{})",
+                    distribution.id,
+                    image.display_name,
+                    image.variant,
+                    format_image_bytes(image.size_bytes),
+                    capabilities_text
+                ),
+            }
         })
         .collect::<Vec<_>>();
-    let selected = MultiSelect::new("Choose distributions to prepare", distribution_options)
+    if image_options.is_empty() {
+        return Err(CliError::Validation(
+            "no host-compatible images are available for this host".to_owned(),
+        ));
+    }
+    let selected = MultiSelect::new("Choose images to prepare", image_options)
         .with_help_message("↑↓ move  ·  space select  ·  enter confirm")
         .with_page_size(10)
         .with_render_config(render_config)
@@ -1133,41 +1110,30 @@ fn prompt_selections(
         .map_err(prompt_error)?;
     if selected.is_empty() {
         return Err(CliError::Validation(
-            "at least one distribution must be selected".to_owned(),
+            "at least one image must be selected".to_owned(),
         ));
     }
-    let selected_ids = selected
-        .iter()
-        .map(|option| option.id.clone())
-        .collect::<Vec<_>>();
-    let mut mappings = HashMap::new();
-    for distribution_id in &selected_ids {
-        let distribution = catalog.distribution(distribution_id).ok_or_else(|| {
-            CliError::Validation(format!(
-                "distribution {distribution_id} is unavailable for this host"
-            ))
-        })?;
-        let kernel_options = catalog
-            .compatible_kernels(distribution)?
-            .into_iter()
-            .map(|kernel| SelectionOption {
-                id: kernel.id.clone(),
-                label: if kernel.id == distribution.default_kernel {
-                    format!("{} ({}) [default]", kernel.display_name, kernel.id)
-                } else {
-                    format!("{} ({})", kernel.display_name, kernel.id)
-                },
-            })
-            .collect::<Vec<_>>();
-        let prompt = format!("Kernel for {}", distribution.display_name);
-        let selected_kernel = Select::new(&prompt, kernel_options)
-            .with_help_message("↑↓ move  ·  enter select")
-            .with_render_config(prompt_render_config(capabilities.color))
-            .prompt()
-            .map_err(prompt_error)?;
-        mappings.insert(distribution_id.clone(), selected_kernel.id);
+    parse_image_selections(
+        &selected
+            .iter()
+            .map(|option| option.id.clone())
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn format_image_bytes(size_bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
+    let mut value = size_bytes as f64;
+    let mut unit = 0_usize;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
     }
-    Ok((selected_ids, mappings))
+    if unit == 0 {
+        format!("{size_bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
 }
 
 fn prompt_error(error: InquireError) -> CliError {
@@ -1181,17 +1147,15 @@ fn prompt_error(error: InquireError) -> CliError {
 }
 
 pub(crate) async fn run(context: &CliContext, arguments: DownloadArgs) -> Result<u8, CliError> {
-    let explicit = arguments.non_interactive
-        || !arguments.distributions.is_empty()
-        || !arguments.kernels.is_empty();
+    let explicit = arguments.non_interactive || !arguments.images.is_empty();
     if !explicit && !context.terminal.interactive {
         return Err(CliError::Validation(
-            "an interactive terminal is required when selections are omitted; use --non-interactive with --distribution and --kernel".to_owned(),
+            "an interactive terminal is required when selections are omitted; use --non-interactive with --image DISTRIBUTION_ID=IMAGE_ID".to_owned(),
         ));
     }
-    if explicit && arguments.non_interactive && arguments.distributions.is_empty() {
+    if explicit && arguments.non_interactive && arguments.images.is_empty() {
         return Err(CliError::Validation(
-            "--non-interactive requires at least one --distribution".to_owned(),
+            "--non-interactive requires at least one --image DISTRIBUTION_ID=IMAGE_ID".to_owned(),
         ));
     }
 
@@ -1211,8 +1175,8 @@ pub(crate) async fn run(context: &CliContext, arguments: DownloadArgs) -> Result
     let plan = if explicit {
         build_explicit_plan(&catalog, &arguments)?
     } else {
-        let (selected_ids, mappings) = prompt_selections(&catalog, context.terminal)?;
-        build_plan(&catalog, &selected_ids, &mappings)?
+        let selections = prompt_selections(&catalog, context.terminal)?;
+        build_plan(&catalog, &selections)?
     };
 
     if !explicit {
@@ -1250,15 +1214,15 @@ mod tests {
     use taumaru_microvm::{
         Architecture, ArtifactKind, BinaryFile, BinaryPackage, BootConfiguration, Distribution,
         DistributionImage, DistributionRequirements, DownloadDisposition, DownloadPhase,
-        DownloadedBinary, DownloadedDistribution, DownloadedFile, DownloadedKernel,
+        DownloadedBinary, DownloadedDistributionImage, DownloadedFile, DownloadedKernel,
         FilesystemMetadata, Kernel,
     };
 
     use crate::output::ProgressSink;
 
     use super::{
-        ArtifactClient, PlanMember, RegistryCatalog, build_plan, execute_plan_with_signals,
-        parse_kernel_mappings,
+        ArtifactClient, PlanMember, RegistryCatalog, build_explicit_plan, build_plan,
+        execute_plan_with_signals, parse_image_selections,
     };
 
     #[derive(Default)]
@@ -1391,42 +1355,37 @@ mod tests {
             })
         }
 
-        async fn download_distribution<F>(
+        async fn download_distribution_image<F>(
             &self,
             distribution_id: &str,
+            image_id: &str,
             _cancellation: &taumaru_microvm::DownloadCancellation,
             _on_progress: F,
-        ) -> Result<DownloadedDistribution, taumaru_microvm::SdkError>
+        ) -> Result<DownloadedDistributionImage, taumaru_microvm::SdkError>
         where
             F: FnMut(taumaru_microvm::DownloadProgress) + Send,
         {
-            let call = format!("distribution:{distribution_id}");
+            let call = format!("image:{distribution_id}/{image_id}");
             self.record(call.clone());
             if self.fails(&call) {
                 return Err(taumaru_microvm::SdkError::Migration(
-                    "fake distribution failure".to_owned(),
+                    "fake image failure".to_owned(),
                 ));
             }
-            Ok(DownloadedDistribution {
+            Ok(DownloadedDistributionImage {
                 distribution: distribution(
                     distribution_id,
                     Architecture::X86_64,
                     "kernel-a",
                     vec!["kernel-a"],
-                    vec![image("image-1", 1), image("image-2", 2)],
+                    vec![image(image_id, 1)],
                 ),
-                images: vec![
-                    downloaded_file(
-                        ArtifactKind::DistributionImage,
-                        distribution_id,
-                        Some("image-1"),
-                    ),
-                    downloaded_file(
-                        ArtifactKind::DistributionImage,
-                        distribution_id,
-                        Some("image-2"),
-                    ),
-                ],
+                image: image(image_id, 1),
+                file: downloaded_file(
+                    ArtifactKind::DistributionImage,
+                    distribution_id,
+                    Some(image_id),
+                ),
             })
         }
     }
@@ -1638,25 +1597,27 @@ mod tests {
     }
 
     #[test]
-    fn catalog_filters_distributions_and_kernels_to_the_host_architecture() {
+    fn catalog_flattens_images_sorted_by_distribution_then_image() {
         let catalog = catalog();
-        let distributions = catalog.compatible_distributions();
+        let pairs = catalog.compatible_images();
 
         assert_eq!(
-            distributions
+            pairs
                 .iter()
-                .map(|distribution| distribution.id.as_str())
+                .map(|(distribution, image)| (distribution.id.as_str(), image.id.as_str()))
                 .collect::<Vec<_>>(),
-            vec!["distro-a", "distro-z"]
+            vec![
+                ("distro-a", "image-a"),
+                ("distro-a", "image-a-debug"),
+                ("distro-z", "image-z"),
+            ]
         );
-        assert_eq!(
+        assert!(
             catalog
-                .compatible_kernels(distributions[0])
-                .expect("compatible kernels should resolve")
-                .iter()
-                .map(|kernel| kernel.id.as_str())
-                .collect::<Vec<_>>(),
-            vec!["kernel-a", "kernel-z"]
+                .default_kernel(catalog.distribution("distro-a").expect("distro-a exists"))
+                .expect("default kernel resolves")
+                .id
+                == "kernel-a"
         );
     }
 
@@ -1683,77 +1644,77 @@ mod tests {
     }
 
     #[test]
-    fn explicit_kernel_mappings_are_parsed_and_duplicate_mappings_are_rejected() {
-        let values = vec![
-            "distro-a=kernel-a".to_owned(),
-            "distro-z=kernel-z".to_owned(),
-        ];
-        let mappings = parse_kernel_mappings(&values).expect("mappings should parse");
+    fn image_selections_require_scoped_pairs() {
+        let selections =
+            parse_image_selections(&["distro-a=image-a".to_owned(), "distro-z=image-z".to_owned()])
+                .expect("scoped selections should parse");
         assert_eq!(
-            mappings.get("distro-a").map(String::as_str),
-            Some("kernel-a")
+            selections,
+            vec![
+                ("distro-a".to_owned(), "image-a".to_owned()),
+                ("distro-z".to_owned(), "image-z".to_owned()),
+            ]
         );
-        assert!(
-            parse_kernel_mappings(&[
-                "distro-a=kernel-a".to_owned(),
-                "distro-a=kernel-z".to_owned()
-            ])
-            .is_err()
-        );
-        assert!(parse_kernel_mappings(&["distro-a".to_owned()]).is_err());
-        assert!(parse_kernel_mappings(&["=kernel-a".to_owned()]).is_err());
+        assert!(parse_image_selections(&["image-a".to_owned()]).is_err());
+        assert!(parse_image_selections(&["=image-a".to_owned()]).is_err());
+        assert!(parse_image_selections(&["distro-a=".to_owned()]).is_err());
     }
 
     #[test]
-    fn plan_requires_exactly_one_compatible_kernel_mapping_per_distribution() {
+    fn plan_rejects_unknown_mismatched_and_incompatible_images() {
         let catalog = catalog();
-        assert!(build_plan(&catalog, &["distro-a".to_owned()], &Default::default()).is_err());
+        assert!(build_plan(&catalog, &[],).is_err());
         assert!(
             build_plan(
                 &catalog,
-                &["distro-a".to_owned()],
-                &parse_kernel_mappings(&["distro-z=kernel-z".to_owned()]).expect("valid mapping"),
+                &[("distro-a".to_owned(), "missing-image".to_owned())],
             )
             .is_err()
         );
+        assert!(build_plan(&catalog, &[("distro-a".to_owned(), "image-arm".to_owned())],).is_err());
+        assert!(build_plan(&catalog, &[("no-distro".to_owned(), "image-a".to_owned())],).is_err());
         assert!(
             build_plan(
                 &catalog,
-                &["distro-a".to_owned()],
-                &parse_kernel_mappings(&["distro-a=kernel-arm".to_owned()]).expect("valid mapping"),
-            )
-            .is_err()
-        );
-        assert!(
-            build_plan(
-                &catalog,
-                &["distro-a".to_owned()],
-                &parse_kernel_mappings(&["distro-a=missing-kernel".to_owned()])
-                    .expect("valid mapping"),
+                &[("distro-arm".to_owned(), "image-arm".to_owned())],
             )
             .is_err()
         );
     }
 
     #[test]
-    fn plan_selects_highest_runtime_deduplicates_kernels_and_orders_members() {
+    fn plan_deduplicates_repeats_resolves_defaults_and_orders_members() {
         let catalog = catalog();
-        let mappings = parse_kernel_mappings(&[
-            "distro-z=kernel-a".to_owned(),
-            "distro-a=kernel-a".to_owned(),
-        ])
-        .expect("valid mappings");
         let plan = build_plan(
             &catalog,
-            &["distro-z".to_owned(), "distro-a".to_owned()],
-            &mappings,
+            &[
+                ("distro-z".to_owned(), "image-z".to_owned()),
+                ("distro-a".to_owned(), "image-a-debug".to_owned()),
+                ("distro-a".to_owned(), "image-a".to_owned()),
+                ("distro-a".to_owned(), "image-a".to_owned()),
+            ],
         )
         .expect("plan should be valid");
 
         assert_eq!(plan.runtime.packages[0].id, "runtime-new");
         assert_eq!(plan.runtime.file_count, 2);
         assert_eq!(plan.runtime.expected_bytes, 42);
-        assert_eq!(plan.expected_bytes, 42 + 13 + 31 + 37 + 41);
+        assert_eq!(
+            plan.selections
+                .iter()
+                .map(|selection| (
+                    selection.distribution.id.as_str(),
+                    selection.image.id.as_str(),
+                    selection.kernel.id.as_str()
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                ("distro-a", "image-a", "kernel-a"),
+                ("distro-a", "image-a-debug", "kernel-a"),
+                ("distro-z", "image-z", "kernel-z"),
+            ]
+        );
+        assert_eq!(plan.expected_bytes, 42 + 13 + 11 + 37 + 41 + 31);
         assert_eq!(
             plan.members,
             vec![
@@ -1765,14 +1726,23 @@ mod tests {
                     kernel_id: "kernel-a".to_owned(),
                     expected_bytes: 13,
                 },
-                PlanMember::DistributionImages {
-                    distribution_id: "distro-a".to_owned(),
-                    image_count: 2,
-                    expected_bytes: 78,
+                PlanMember::Kernel {
+                    kernel_id: "kernel-z".to_owned(),
+                    expected_bytes: 11,
                 },
-                PlanMember::DistributionImages {
+                PlanMember::DistributionImage {
+                    distribution_id: "distro-a".to_owned(),
+                    image_id: "image-a".to_owned(),
+                    expected_bytes: 37,
+                },
+                PlanMember::DistributionImage {
+                    distribution_id: "distro-a".to_owned(),
+                    image_id: "image-a-debug".to_owned(),
+                    expected_bytes: 41,
+                },
+                PlanMember::DistributionImage {
                     distribution_id: "distro-z".to_owned(),
-                    image_count: 1,
+                    image_id: "image-z".to_owned(),
                     expected_bytes: 31,
                 },
             ]
@@ -1780,76 +1750,36 @@ mod tests {
     }
 
     #[test]
-    fn runtime_selection_accepts_registry_packages_split_by_component() {
-        let catalog = split_runtime_catalog();
-
-        let runtime = catalog
-            .select_runtime_packages()
-            .expect("separate firecracker and firectl packages should form a runtime");
-
-        assert_eq!(
-            runtime
-                .packages
-                .iter()
-                .map(|package| package.id.as_str())
-                .collect::<Vec<_>>(),
-            vec!["firecracker-1.17.0-x86_64", "firectl-0.2.0-x86_64"]
-        );
-        assert_eq!(runtime.file_count, 3);
-        assert_eq!(runtime.expected_bytes, 59);
-    }
-
-    #[test]
-    fn runtime_selection_rejects_catalog_missing_a_required_component() {
-        let mut catalog = catalog();
-        catalog.binaries = vec![binary(
-            "firecracker-only",
-            "1.0.0",
-            vec![binary_file("firecracker", 19)],
-        )];
-
-        let error = catalog
-            .select_runtime_packages()
-            .expect_err("a runtime without firectl must be rejected");
-
-        match error {
-            super::CliError::Validation(message) => assert!(message.contains("firectl")),
-            other => panic!("expected a validation error, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn explicit_and_interactive_selection_inputs_produce_the_same_plan() {
+    fn explicit_image_plan_matches_prompted_selection_order() {
         let catalog = catalog();
-        let mappings = parse_kernel_mappings(&[
-            "distro-z=kernel-z".to_owned(),
-            "distro-a=kernel-a".to_owned(),
-        ])
-        .expect("valid mappings");
-        let interactive_plan = build_plan(
+        let prompted = build_plan(
             &catalog,
-            &["distro-a".to_owned(), "distro-z".to_owned()],
-            &mappings,
+            &[
+                ("distro-a".to_owned(), "image-a".to_owned()),
+                ("distro-z".to_owned(), "image-z".to_owned()),
+            ],
         )
-        .expect("interactive plan should be valid");
-        let explicit_plan = build_plan(
+        .expect("prompted plan should be valid");
+        let explicit = build_explicit_plan(
             &catalog,
-            &["distro-z".to_owned(), "distro-a".to_owned()],
-            &mappings,
+            &crate::cli::DownloadArgs {
+                images: vec!["distro-z=image-z".to_owned(), "distro-a=image-a".to_owned()],
+                non_interactive: true,
+            },
         )
         .expect("explicit plan should be valid");
 
-        assert_eq!(interactive_plan.members, explicit_plan.members);
+        assert_eq!(prompted.members, explicit.members);
         assert_eq!(
-            interactive_plan
+            prompted
                 .selections
                 .iter()
-                .map(|selection| (&selection.distribution.id, &selection.kernel.id))
+                .map(|selection| (&selection.distribution.id, &selection.image.id))
                 .collect::<Vec<_>>(),
-            explicit_plan
+            explicit
                 .selections
                 .iter()
-                .map(|selection| (&selection.distribution.id, &selection.kernel.id))
+                .map(|selection| (&selection.distribution.id, &selection.image.id))
                 .collect::<Vec<_>>()
         );
     }
@@ -1857,21 +1787,20 @@ mod tests {
     #[test]
     fn plan_review_is_deterministic_for_reversed_explicit_input() {
         let catalog = catalog();
-        let mappings = parse_kernel_mappings(&[
-            "distro-z=kernel-z".to_owned(),
-            "distro-a=kernel-a".to_owned(),
-        ])
-        .expect("valid mappings");
         let first = build_plan(
             &catalog,
-            &["distro-z".to_owned(), "distro-a".to_owned()],
-            &mappings,
+            &[
+                ("distro-z".to_owned(), "image-z".to_owned()),
+                ("distro-a".to_owned(), "image-a".to_owned()),
+            ],
         )
         .expect("plan should be valid");
         let second = build_plan(
             &catalog,
-            &["distro-a".to_owned(), "distro-z".to_owned()],
-            &mappings,
+            &[
+                ("distro-a".to_owned(), "image-a".to_owned()),
+                ("distro-z".to_owned(), "image-z".to_owned()),
+            ],
         )
         .expect("plan should be valid");
         let capabilities = crate::context::TerminalCapabilities {
@@ -1887,17 +1816,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn executor_downloads_runtime_then_unique_kernels_then_distributions() {
+    async fn executor_downloads_runtime_then_unique_kernels_then_images() {
         let catalog = catalog();
-        let mappings = parse_kernel_mappings(&[
-            "distro-z=kernel-a".to_owned(),
-            "distro-a=kernel-a".to_owned(),
-        ])
-        .expect("valid mappings");
         let plan = build_plan(
             &catalog,
-            &["distro-z".to_owned(), "distro-a".to_owned()],
-            &mappings,
+            &[
+                ("distro-z".to_owned(), "image-z".to_owned()),
+                ("distro-a".to_owned(), "image-a-debug".to_owned()),
+                ("distro-a".to_owned(), "image-a".to_owned()),
+            ],
         )
         .expect("plan should be valid");
         let client = RecordingClient::new();
@@ -1915,20 +1842,20 @@ mod tests {
             vec![
                 "binary:runtime-new",
                 "kernel:kernel-a",
-                "distribution:distro-a",
-                "distribution:distro-z",
+                "kernel:kernel-z",
+                "image:distro-a/image-a",
+                "image:distro-a/image-a-debug",
+                "image:distro-z/image-z",
             ]
         );
         assert!(outcome.is_success());
-        assert_eq!(outcome.verified.len(), 4);
+        assert_eq!(outcome.verified.len(), 6);
     }
 
     #[tokio::test]
     async fn executor_downloads_split_runtime_packages_before_kernels() {
         let catalog = split_runtime_catalog();
-        let mappings =
-            parse_kernel_mappings(&["distro-a=kernel-a".to_owned()]).expect("valid mapping");
-        let plan = build_plan(&catalog, &["distro-a".to_owned()], &mappings)
+        let plan = build_plan(&catalog, &[("distro-a".to_owned(), "image-a".to_owned())])
             .expect("plan should be valid");
         let client = RecordingClient::new();
         let cancellation = taumaru_microvm::DownloadCancellation::new();
@@ -1946,7 +1873,7 @@ mod tests {
                 "binary:firecracker-1.17.0-x86_64",
                 "binary:firectl-0.2.0-x86_64",
                 "kernel:kernel-a",
-                "distribution:distro-a",
+                "image:distro-a/image-a",
             ]
         );
         assert!(outcome.is_success());
@@ -1956,9 +1883,7 @@ mod tests {
     #[tokio::test]
     async fn split_runtime_package_failure_stops_kernel_and_distribution_downloads() {
         let catalog = split_runtime_catalog();
-        let mappings =
-            parse_kernel_mappings(&["distro-a=kernel-a".to_owned()]).expect("valid mapping");
-        let plan = build_plan(&catalog, &["distro-a".to_owned()], &mappings)
+        let plan = build_plan(&catalog, &[("distro-a".to_owned(), "image-a".to_owned())])
             .expect("plan should be valid");
         let client = RecordingClient::with_failure("binary:firectl-0.2.0-x86_64");
         let cancellation = taumaru_microvm::DownloadCancellation::new();
@@ -1982,12 +1907,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn executor_waits_for_every_image_group_before_reporting_success() {
+    async fn executor_downloads_every_selected_image_before_reporting_success() {
         let catalog = catalog();
-        let mappings =
-            parse_kernel_mappings(&["distro-a=kernel-a".to_owned()]).expect("valid mappings");
-        let plan = build_plan(&catalog, &["distro-a".to_owned()], &mappings)
-            .expect("plan should be valid");
+        let plan = build_plan(
+            &catalog,
+            &[
+                ("distro-a".to_owned(), "image-a".to_owned()),
+                ("distro-a".to_owned(), "image-a-debug".to_owned()),
+            ],
+        )
+        .expect("plan should be valid");
         let client = RecordingClient::new();
         let cancellation = taumaru_microvm::DownloadCancellation::new();
         let mut sink = NoopSink;
@@ -2004,7 +1933,8 @@ mod tests {
             vec![
                 "binary:runtime-new",
                 "kernel:kernel-a",
-                "distribution:distro-a",
+                "image:distro-a/image-a",
+                "image:distro-a/image-a-debug",
             ]
         );
         assert_eq!(
@@ -2013,20 +1943,17 @@ mod tests {
                 .iter()
                 .filter(|artifact| matches!(
                     artifact,
-                    super::VerifiedArtifact::Distribution(result)
-                        if result.images.len() == 2
+                    super::VerifiedArtifact::DistributionImage(_)
                 ))
                 .count(),
-            1
+            2
         );
     }
 
     #[tokio::test]
     async fn runtime_failure_stops_all_dependent_downloads() {
         let catalog = catalog();
-        let mappings =
-            parse_kernel_mappings(&["distro-a=kernel-a".to_owned()]).expect("valid mappings");
-        let plan = build_plan(&catalog, &["distro-a".to_owned()], &mappings)
+        let plan = build_plan(&catalog, &[("distro-a".to_owned(), "image-a".to_owned())])
             .expect("plan should be valid");
         let client = RecordingClient::with_failure("binary:runtime-new");
         let cancellation = taumaru_microvm::DownloadCancellation::new();
@@ -2044,17 +1971,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_kernel_skips_only_its_distributions_and_continues_unrelated_groups() {
+    async fn failed_kernel_skips_only_its_images_and_continues_unrelated_groups() {
         let catalog = catalog();
-        let mappings = parse_kernel_mappings(&[
-            "distro-a=kernel-a".to_owned(),
-            "distro-z=kernel-z".to_owned(),
-        ])
-        .expect("valid mappings");
         let plan = build_plan(
             &catalog,
-            &["distro-a".to_owned(), "distro-z".to_owned()],
-            &mappings,
+            &[
+                ("distro-a".to_owned(), "image-a".to_owned()),
+                ("distro-a".to_owned(), "image-a-debug".to_owned()),
+                ("distro-z".to_owned(), "image-z".to_owned()),
+            ],
         )
         .expect("plan should be valid");
         let client = RecordingClient::with_failure("kernel:kernel-a");
@@ -2073,31 +1998,34 @@ mod tests {
                 "binary:runtime-new",
                 "kernel:kernel-a",
                 "kernel:kernel-z",
-                "distribution:distro-z",
+                "image:distro-z/image-z",
             ]
         );
         assert!(outcome.groups.iter().any(|group| matches!(
             group,
             super::MemberOutcome::Skipped { label, .. }
-                if label == "distribution/distro-a"
+                if label == "distribution/distro-a/image-a"
+        )));
+        assert!(outcome.groups.iter().any(|group| matches!(
+            group,
+            super::MemberOutcome::Skipped { label, .. }
+                if label == "distribution/distro-a/image-a-debug"
         )));
         assert!(outcome.groups.iter().any(|group| matches!(
             group,
             super::MemberOutcome::Verified { label, .. }
-                if label == "distribution/distro-z"
+                if label == "distribution/distro-z/image-z"
         )));
         assert!(!outcome.is_success());
         assert_eq!(outcome.exit_code(), 1);
     }
 
     #[tokio::test]
-    async fn distribution_failure_retains_verified_runtime_and_kernel_results() {
+    async fn image_failure_retains_verified_runtime_and_kernel_results() {
         let catalog = catalog();
-        let mappings =
-            parse_kernel_mappings(&["distro-a=kernel-a".to_owned()]).expect("valid mappings");
-        let plan = build_plan(&catalog, &["distro-a".to_owned()], &mappings)
+        let plan = build_plan(&catalog, &[("distro-a".to_owned(), "image-a".to_owned())])
             .expect("plan should be valid");
-        let client = RecordingClient::with_failure("distribution:distro-a");
+        let client = RecordingClient::with_failure("image:distro-a/image-a");
         let cancellation = taumaru_microvm::DownloadCancellation::new();
         let mut sink = NoopSink;
 
@@ -2111,7 +2039,7 @@ mod tests {
         assert!(outcome.groups.iter().any(|group| matches!(
             group,
             super::MemberOutcome::Failed { label, .. }
-                if label == "distribution/distro-a"
+                if label == "distribution/distro-a/image-a"
         )));
         let summary = crate::output::human::format_summary(&outcome);
         assert!(summary.contains("Failed"));
@@ -2123,9 +2051,7 @@ mod tests {
     #[tokio::test]
     async fn signal_cancellation_waits_for_the_current_group_and_starts_no_later_group() {
         let catalog = catalog();
-        let mappings =
-            parse_kernel_mappings(&["distro-a=kernel-a".to_owned()]).expect("valid mappings");
-        let plan = build_plan(&catalog, &["distro-a".to_owned()], &mappings)
+        let plan = build_plan(&catalog, &[("distro-a".to_owned(), "image-a".to_owned())])
             .expect("plan should be valid");
         let client = RecordingClient::with_blocking_kernel();
         let cancellation = taumaru_microvm::DownloadCancellation::new();
@@ -2161,12 +2087,7 @@ mod tests {
             super::MemberOutcome::Cancelled { label }
                 if label == "kernel/kernel-a"
         )));
-        assert!(
-            !client
-                .calls()
-                .iter()
-                .any(|call| call.starts_with("distribution:"))
-        );
+        assert!(!client.calls().iter().any(|call| call.starts_with("image:")));
     }
 
     #[test]

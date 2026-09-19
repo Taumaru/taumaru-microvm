@@ -58,22 +58,22 @@ fn invalid_option_returns_a_clear_error() {
 }
 
 #[test]
-fn download_help_exposes_repeatable_selection_options() {
-    let output = run_microvm(&["download", "--help"]);
+fn artifacts_download_help_exposes_image_selection_options() {
+    let output = run_microvm(&["artifacts", "download", "--help"]);
     let stdout = String::from_utf8_lossy(&output.stdout);
 
     assert!(output.status.success());
-    assert!(stdout.contains("Usage: microvm download"));
-    assert!(stdout.contains("--distribution <DISTRIBUTION_ID>"));
-    assert!(stdout.contains("--kernel <DISTRIBUTION_ID=KERNEL_ID>"));
+    assert!(stdout.contains("Usage: microvm artifacts download"));
+    assert!(stdout.contains("--image <DISTRIBUTION_ID=IMAGE_ID>"));
     assert!(stdout.contains("--non-interactive"));
+    assert!(!stdout.contains("--distribution"));
 }
 
 #[test]
 fn non_interactive_download_rejects_incomplete_selection_without_prompting() {
     let home = tempfile::tempdir().expect("temporary home should be created");
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_microvm"))
-        .args(["download", "--non-interactive"])
+        .args(["artifacts", "download", "--non-interactive"])
         .env("TAUMARU_HOME", home.path())
         .output()
         .expect("failed to execute microvm");
@@ -81,5 +81,5 @@ fn non_interactive_download_rejects_incomplete_selection_without_prompting() {
 
     assert!(!output.status.success());
     assert!(stderr.contains("selection") || stderr.contains("plan"));
-    assert!(!stderr.contains("Select distributions"));
+    assert!(!stderr.contains("Choose images"));
 }
