@@ -12,6 +12,10 @@ static INJECT_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// The image is edited with `debugfs` in userspace. A kernel loop mount would
 /// require `CAP_SYS_ADMIN`, so `mount -o loop` fails with exit status 32 for
 /// regular unprivileged users.
+///
+/// Besides the client key in `/root/.ssh/authorized_keys`, this also ensures
+/// the server host keys (`/etc/ssh/ssh_host_*_key`) exist so `sshd` can start
+/// on images that ship without them. Existing host keys are preserved.
 pub(crate) fn inject_public_key(rootfs_path: &Path, public_key: &str) -> Result<(), SdkError> {
     let key_line = public_key.trim_end_matches(['\r', '\n']);
     if key_line.is_empty() {
@@ -84,7 +88,119 @@ pub(crate) fn inject_public_key(rootfs_path: &Path, public_key: &str) -> Result<
         }
     }
 
-    chmod_guest(rootfs_path, "root/.ssh/authorized_keys", "0100600")
+    chmod_guest(rootfs_path, "root/.ssh/authorized_keys", "0100600")?;
+    ensure_host_keys(rootfs_path)
+}
+
+/// Server key types provisioned when the image ships without host keys.
+///
+/// This mirrors the default `ssh-keygen -A` set on Ubuntu images.
+const HOST_KEY_TYPES: &[(&str, &str, Option<&str>)] = &[
+    ("ed25519", "ssh_host_ed25519_key", None),
+    ("rsa", "ssh_host_rsa_key", Some("-b 3072")),
+    ("ecdsa", "ssh_host_ecdsa_key", None),
+];
+
+fn ensure_host_keys(rootfs_path: &Path) -> Result<(), SdkError> {
+    ensure_guest_directory(
+        rootfs_path,
+        "etc",
+        "inspect guest etc directory",
+        "verify guest etc directory",
+        "create guest etc directory",
+        "the expected /etc directory is unavailable",
+    )?;
+    ensure_guest_directory(
+        rootfs_path,
+        "etc/ssh",
+        "inspect guest SSH server directory",
+        "verify guest SSH server directory",
+        "create guest SSH server directory",
+        "the expected /etc/ssh directory is unavailable",
+    )?;
+    for (key_type, file_name, extra_args) in HOST_KEY_TYPES {
+        let guest_path = format!("etc/ssh/{file_name}");
+        match stat_guest(rootfs_path, &guest_path, "inspect guest host key")? {
+            Some(stat) => {
+                if stat.is_symlink || !stat.is_regular {
+                    return Err(SdkError::GuestFilesystem {
+                        operation: "verify guest host key".to_owned(),
+                        path: rootfs_path.to_path_buf(),
+                        reason: format!("the expected {guest_path} path is not a regular file"),
+                    });
+                }
+            }
+            None => generate_host_key(rootfs_path, key_type, &guest_path, *extra_args)?,
+        }
+    }
+    Ok(())
+}
+
+fn generate_host_key(
+    rootfs_path: &Path,
+    key_type: &str,
+    guest_path: &str,
+    extra_args: Option<&str>,
+) -> Result<(), SdkError> {
+    let sequence = INJECT_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let host_path = std::env::temp_dir().join(format!(
+        ".taumaru-hostkey-{}-{sequence}",
+        std::process::id()
+    ));
+    let host_arg = host_path.display().to_string();
+    let mut arguments = vec!["-t", key_type, "-N", "", "-f", &host_arg, "-q"];
+    if let Some(extra) = extra_args {
+        arguments.extend(extra.split_whitespace());
+    }
+    let output = Command::new("ssh-keygen")
+        .args(&arguments)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|error| SdkError::HostCommand {
+            program: "ssh-keygen".to_owned(),
+            reason: error.to_string(),
+        })?;
+    if !output.status.success() {
+        let _ = fs::remove_file(&host_path);
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        let mut reason = format!("ssh-keygen exited with {}", output.status);
+        if !stderr.is_empty() {
+            reason.push_str(": ");
+            reason.push_str(&stderr.split_whitespace().collect::<Vec<_>>().join(" "));
+        }
+        return Err(SdkError::HostCommand {
+            program: "ssh-keygen".to_owned(),
+            reason,
+        });
+    }
+    let public_path = host_path.with_extension("pub");
+    let private_bytes = fs::read(&host_path)
+        .map_err(|error| SdkError::filesystem("read generated host key", &host_path, error))?;
+    let public_bytes = fs::read(&public_path).map_err(|error| {
+        SdkError::filesystem("read generated host public key", &public_path, error)
+    })?;
+    let _ = fs::remove_file(&host_path);
+    let _ = fs::remove_file(&public_path);
+    let public_guest_path = format!("{guest_path}.pub");
+    write_guest_file(
+        rootfs_path,
+        guest_path,
+        &private_bytes,
+        "inject guest host key",
+    )?;
+    if let Err(error) = write_guest_file(
+        rootfs_path,
+        &public_guest_path,
+        &public_bytes,
+        "inject guest host public key",
+    ) {
+        let _ = run_debugfs(rootfs_path, &format!("rm {guest_path}"), true);
+        return Err(error);
+    }
+    chmod_guest(rootfs_path, guest_path, "0100600")?;
+    chmod_guest(rootfs_path, &public_guest_path, "0100644")
 }
 
 struct GuestStat {
@@ -493,6 +609,19 @@ mod tests {
         String::from_utf8(output.stdout).expect("debugfs stat should be UTF-8")
     }
 
+    fn guest_file_bytes(image: &Path, guest_path: &str) -> Vec<u8> {
+        let output = Command::new("debugfs")
+            .args(["-R", &format!("cat {guest_path}")])
+            .arg(image)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output()
+            .expect("debugfs should execute");
+        assert!(output.status.success(), "debugfs cat should succeed");
+        output.stdout
+    }
+
     #[test]
     fn injects_a_key_without_host_mount_privileges() {
         if !e2fsprogs_available() {
@@ -516,6 +645,73 @@ mod tests {
         assert!(
             guest_stat(&image, "root/.ssh/authorized_keys").contains("0600"),
             "guest authorized_keys should be private"
+        );
+    }
+
+    #[test]
+    fn provisions_host_keys_when_the_image_has_none() {
+        if !e2fsprogs_available() || !host_tool_available("ssh-keygen") {
+            return;
+        }
+        let directory = tempdir().expect("temporary directory should exist");
+        let image = directory.path().join("rootfs.ext4");
+        create_ext4_image(&image);
+
+        inject_public_key(&image, FIRST_KEY).expect("injection should succeed");
+
+        for key_type in ["ed25519", "rsa", "ecdsa"] {
+            let guest_path = format!("etc/ssh/ssh_host_{key_type}_key");
+            let stat = guest_stat(&image, &guest_path);
+            assert!(stat.contains("0600"), "{guest_path} should be private");
+            let public_stat = guest_stat(&image, &format!("{guest_path}.pub"));
+            assert!(
+                public_stat.contains("0644"),
+                "{guest_path}.pub should be readable"
+            );
+        }
+        let private = guest_file_bytes(&image, "etc/ssh/ssh_host_ed25519_key");
+        assert!(private.starts_with(b"-----BEGIN OPENSSH PRIVATE KEY-----"));
+    }
+
+    #[test]
+    fn preserves_existing_host_keys_on_repeated_injection() {
+        if !e2fsprogs_available() || !host_tool_available("ssh-keygen") {
+            return;
+        }
+        let directory = tempdir().expect("temporary directory should exist");
+        let image = directory.path().join("rootfs.ext4");
+        create_ext4_image(&image);
+
+        inject_public_key(&image, FIRST_KEY).expect("first injection should succeed");
+        let before = guest_file_bytes(&image, "etc/ssh/ssh_host_ed25519_key");
+        inject_public_key(&image, SECOND_KEY).expect("second injection should succeed");
+        let after = guest_file_bytes(&image, "etc/ssh/ssh_host_ed25519_key");
+
+        assert_eq!(before, after, "existing host keys must be preserved");
+        assert_eq!(
+            guest_file_content(&image, "root/.ssh/authorized_keys"),
+            format!("{FIRST_KEY}\n{SECOND_KEY}\n")
+        );
+    }
+
+    #[test]
+    fn rejects_a_symlinked_host_key_without_following_it() {
+        if !e2fsprogs_available() || !host_tool_available("ssh-keygen") {
+            return;
+        }
+        let directory = tempdir().expect("temporary directory should exist");
+        let image = directory.path().join("rootfs.ext4");
+        create_ext4_image(&image);
+        debugfs_exec(&image, "mkdir etc");
+        debugfs_exec(&image, "mkdir etc/ssh");
+        debugfs_exec(&image, "symlink etc/ssh/ssh_host_ed25519_key some-target");
+
+        let error =
+            inject_public_key(&image, FIRST_KEY).expect_err("symlink injection should fail");
+
+        assert!(
+            matches!(error, SdkError::GuestFilesystem { .. }),
+            "unexpected error: {error}"
         );
     }
 
