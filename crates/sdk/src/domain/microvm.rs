@@ -18,8 +18,13 @@ pub struct CreateMicroVmRequest {
     pub vcpu_count: u32,
     /// Requested memory size in bytes.
     pub memory_bytes: u64,
-    /// Whether the VM should use the explicit LAN bridge/DHCP mode.
+    /// Whether the VM should use routed LAN mode with a LAN address.
     pub expose_on_lan: bool,
+    /// Optional explicit LAN address override. `None` selects automatically.
+    ///
+    /// Only meaningful with `expose_on_lan`; providing a value for a host-only
+    /// VM is an invalid request.
+    pub lan_address: Option<Ipv4Addr>,
     /// Optional absolute VM-volume directory. Defaults below the SDK home.
     pub volume_path: Option<PathBuf>,
 }
@@ -52,10 +57,12 @@ pub struct NetworkConfiguration {
     pub gateway: Option<IpAddr>,
     /// VM-specific TAP interface.
     pub tap_name: String,
-    /// SDK-managed bridge for LAN mode.
+    /// SDK-managed bridge for legacy LAN mode. Always `None` for routed LAN.
     pub bridge_name: Option<String>,
     /// Default-route uplink used for LAN mode.
     pub uplink_name: Option<String>,
+    /// Committed LAN address for routed LAN mode. `None` for host-only VMs.
+    pub lan_address: Option<IpAddr>,
 }
 
 /// A resource considered by network reconciliation.
@@ -65,19 +72,27 @@ pub enum NetworkResource {
     Tap,
     /// Host address on the TAP interface.
     TapAddress,
-    /// SDK-managed bridge.
+    /// Host route for the VM's LAN address through the TAP interface.
+    HostRoute,
+    /// Proxy ARP entry for the VM's LAN address on the uplink interface.
+    ProxyArpEntry,
+    /// SDK-managed bridge (legacy LAN rows only).
     Bridge,
-    /// Uplink-to-bridge attachment.
+    /// Uplink-to-bridge attachment (legacy LAN rows only).
     BridgeUplinkAttachment,
-    /// TAP-to-bridge attachment.
+    /// TAP-to-bridge attachment (legacy LAN rows only).
     BridgeTapAttachment,
     /// Host forwarding configuration.
     Forwarding,
+    /// Per-VM iptables FORWARD rule.
+    ForwardRule,
     /// Per-VM NAT rule.
     Nat,
+    /// Per-VM iptables MASQUERADE rule for the private host-only range.
+    IptablesNat,
     /// Firecracker network interface configuration.
     FirecrackerInterface,
-    /// External DHCP lease observed for the VM.
+    /// External DHCP lease observed for the VM (legacy LAN rows only).
     DhcpLease,
 }
 
@@ -86,11 +101,15 @@ impl NetworkResource {
         match self {
             Self::Tap => "tap",
             Self::TapAddress => "tap_address",
+            Self::HostRoute => "host_route",
+            Self::ProxyArpEntry => "proxy_arp_entry",
             Self::Bridge => "bridge",
             Self::BridgeUplinkAttachment => "bridge_uplink_attachment",
             Self::BridgeTapAttachment => "bridge_tap_attachment",
             Self::Forwarding => "forwarding",
+            Self::ForwardRule => "forward_rule",
             Self::Nat => "nat",
+            Self::IptablesNat => "iptables_nat",
             Self::FirecrackerInterface => "firecracker_interface",
             Self::DhcpLease => "dhcp_lease",
         }
@@ -100,11 +119,15 @@ impl NetworkResource {
         match value {
             "tap" => Some(Self::Tap),
             "tap_address" => Some(Self::TapAddress),
+            "host_route" => Some(Self::HostRoute),
+            "proxy_arp_entry" => Some(Self::ProxyArpEntry),
             "bridge" => Some(Self::Bridge),
             "bridge_uplink_attachment" => Some(Self::BridgeUplinkAttachment),
             "bridge_tap_attachment" => Some(Self::BridgeTapAttachment),
             "forwarding" => Some(Self::Forwarding),
+            "forward_rule" => Some(Self::ForwardRule),
             "nat" => Some(Self::Nat),
+            "iptables_nat" => Some(Self::IptablesNat),
             "firecracker_interface" => Some(Self::FirecrackerInterface),
             "dhcp_lease" => Some(Self::DhcpLease),
             _ => None,
@@ -187,12 +210,26 @@ pub(crate) struct PersistedNetwork {
     pub dhcp_lease_reference: Option<String>,
     pub desired_boot_parameters: String,
     pub resources: Vec<PersistedNetworkResource>,
+    /// Uplink CIDR the LAN address was selected from. `None` for host-only VMs.
+    pub uplink_cidr: Option<String>,
+    /// Whether this VM caused proxy ARP enablement on the uplink.
+    pub proxy_arp_enabled_by_sdk: bool,
+    /// Legacy bridge ownership flags. Unused for routed LAN rows.
     pub bridge_created_by_sdk: bool,
+    /// Legacy uplink attachment flag. Unused for routed LAN rows.
     pub uplink_attached_by_sdk: bool,
     pub forwarding_enabled_by_sdk: bool,
+    /// Legacy nftables ownership flags. Unused for routed LAN rows.
     pub nat_table_created_by_sdk: bool,
+    /// Legacy nftables ownership flags. Unused for routed LAN rows.
     pub nat_chain_created_by_sdk: bool,
+    /// Whether the host route for the LAN address was created by the SDK.
+    pub host_route_created_by_sdk: bool,
+    /// Whether the proxy ARP entry for the LAN address was created by the SDK.
+    pub proxy_arp_entry_created_by_sdk: bool,
+    /// Legacy uplink address snapshot. Unused for routed LAN rows.
     pub host_address_specs: Vec<String>,
+    /// Legacy default-route snapshot. Unused for routed LAN rows.
     pub default_route_specs: Vec<Vec<String>>,
 }
 

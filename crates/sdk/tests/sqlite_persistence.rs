@@ -59,7 +59,7 @@ fn constructor_creates_idempotent_inventory_schema() {
             row.get(0)
         })
         .expect("migration ledger should be readable");
-    assert_eq!(migration_count, 2);
+    assert_eq!(migration_count, 3);
     let preserved_count: i64 = connection
         .query_row(
             "SELECT COUNT(*) FROM downloads WHERE artifact_key = 'kernel:preserved'",

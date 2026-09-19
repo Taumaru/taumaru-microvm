@@ -120,6 +120,7 @@ pub(crate) trait MicroVmRepository: Send + Sync {
         uplink_name: &str,
     ) -> Result<bool, SdkError>;
 
+    #[allow(dead_code)]
     fn bridge_is_managed(&self, bridge_name: &str, uplink_name: &str) -> Result<bool, SdkError>;
 
     #[allow(dead_code)]

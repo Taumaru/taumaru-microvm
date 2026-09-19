@@ -76,6 +76,7 @@ async fn creation_validates_input_before_registry_or_host_mutation() {
             vcpu_count: 1,
             memory_bytes: 128 * 1024 * 1024,
             expose_on_lan: false,
+            lan_address: None,
             volume_path: None,
         })
         .await;

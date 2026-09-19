@@ -23,6 +23,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "0002_microvm_creation.sql",
         sql: include_str!("../../../migrations/0002_microvm_creation.sql"),
     },
+    Migration {
+        version: 3,
+        name: "0003_routed_lan.sql",
+        sql: include_str!("../../../migrations/0003_routed_lan.sql"),
+    },
 ];
 
 pub(crate) fn apply_pending(connection: &mut Connection) -> Result<(), SdkError> {
@@ -223,6 +228,13 @@ fn verify_required_schema(connection: &Connection) -> Result<(), SdkError> {
                 "nat_chain_created_by_sdk",
                 "host_address_specs",
                 "default_route_specs",
+                "lan_ip",
+                "uplink_cidr",
+                "proxy_arp_enabled_by_sdk",
+                "host_route_created_by_sdk",
+                "proxy_arp_entry_created_by_sdk",
+                "iptables_forward_specs",
+                "iptables_nat_spec",
             ],
         ),
         (

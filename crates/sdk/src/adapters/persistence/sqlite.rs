@@ -1024,7 +1024,10 @@ fn load_network_record(connection: &Connection, vm_id: i64) -> Result<PersistedN
                     n.bridge_created_by_sdk, n.uplink_attached_by_sdk,
                     n.forwarding_enabled_by_sdk, n.nat_table_created_by_sdk,
                     n.nat_chain_created_by_sdk, n.host_address_specs,
-                    n.default_route_specs
+                    n.default_route_specs, n.lan_ip, n.uplink_cidr,
+                    n.proxy_arp_enabled_by_sdk, n.host_route_created_by_sdk,
+                    n.proxy_arp_entry_created_by_sdk, n.iptables_forward_specs,
+                    n.iptables_nat_spec
              FROM vm_networks n
              LEFT JOIN network_bridges b ON b.id = n.bridge_id
              WHERE n.microvm_id = ?1",
@@ -1050,6 +1053,13 @@ fn load_network_record(connection: &Connection, vm_id: i64) -> Result<PersistedN
                     row.get::<_, i64>(16)?,
                     row.get::<_, String>(17)?,
                     row.get::<_, String>(18)?,
+                    row.get::<_, Option<String>>(19)?,
+                    row.get::<_, Option<String>>(20)?,
+                    row.get::<_, i64>(21)?,
+                    row.get::<_, i64>(22)?,
+                    row.get::<_, i64>(23)?,
+                    row.get::<_, String>(24)?,
+                    row.get::<_, String>(25)?,
                 ))
             },
         )
@@ -1075,6 +1085,13 @@ fn load_network_record(connection: &Connection, vm_id: i64) -> Result<PersistedN
         nat_chain_created_by_sdk,
         host_address_specs,
         default_route_specs,
+        lan_ip,
+        uplink_cidr,
+        proxy_arp_enabled_by_sdk,
+        host_route_created_by_sdk,
+        proxy_arp_entry_created_by_sdk,
+        _iptables_forward_specs,
+        _iptables_nat_spec,
     ) = row;
     let mode = NetworkMode::parse(&mode)
         .ok_or_else(|| SdkError::Migration(format!("unknown persisted network mode {mode}")))?;
@@ -1087,6 +1104,10 @@ fn load_network_record(connection: &Connection, vm_id: i64) -> Result<PersistedN
         tap_name,
         bridge_name,
         uplink_name,
+        lan_address: lan_ip
+            .as_deref()
+            .map(|value| parse_ip(value, "LAN IP"))
+            .transpose()?,
     };
 
     let mut statement = connection.prepare(
@@ -1120,18 +1141,21 @@ fn load_network_record(connection: &Connection, vm_id: i64) -> Result<PersistedN
             })
         })
         .collect::<Result<Vec<_>, SdkError>>()?;
-
     Ok(PersistedNetwork {
         config,
         host_address: parse_optional_ip(host_ip.as_deref(), "host IP")?,
         guest_mac,
         dhcp_lease_reference,
         desired_boot_parameters,
+        uplink_cidr,
+        proxy_arp_enabled_by_sdk: proxy_arp_enabled_by_sdk != 0,
         bridge_created_by_sdk: bridge_created_by_sdk != 0,
         uplink_attached_by_sdk: uplink_attached_by_sdk != 0,
         forwarding_enabled_by_sdk: forwarding_enabled_by_sdk != 0,
         nat_table_created_by_sdk: nat_table_created_by_sdk != 0,
         nat_chain_created_by_sdk: nat_chain_created_by_sdk != 0,
+        host_route_created_by_sdk: host_route_created_by_sdk != 0,
+        proxy_arp_entry_created_by_sdk: proxy_arp_entry_created_by_sdk != 0,
         host_address_specs: serde_json::from_str(&host_address_specs).map_err(|error| {
             SdkError::Migration(format!("invalid persisted host address state: {error}"))
         })?,
@@ -1262,6 +1286,7 @@ fn persist_network_transaction(
                 }
             }
         }
+        (None, Some(_)) if network.config.mode == NetworkMode::Lan => None,
         (None, None) => None,
         _ => {
             return Err(SdkError::Network {
@@ -1275,14 +1300,18 @@ fn persist_network_transaction(
     let guest_ip = network.config.guest_address.to_string();
     let gateway_ip = network.config.gateway.map(|value| value.to_string());
     let host_ip = network.host_address.map(|value| value.to_string());
+    let lan_ip = network.config.lan_address.map(|value| value.to_string());
     transaction.execute(
         "INSERT INTO vm_networks (
             microvm_id, mode, guest_ip, prefix_length, gateway_ip, host_ip,
             tap_name, guest_mac, bridge_id, uplink_name, dhcp_lease_reference,
             desired_boot_parameters, bridge_created_by_sdk, uplink_attached_by_sdk,
             forwarding_enabled_by_sdk, nat_table_created_by_sdk, nat_chain_created_by_sdk,
-            host_address_specs, default_route_specs, updated_at
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)
+            host_address_specs, default_route_specs, lan_ip, uplink_cidr,
+            proxy_arp_enabled_by_sdk, host_route_created_by_sdk,
+            proxy_arp_entry_created_by_sdk, iptables_forward_specs, iptables_nat_spec,
+            updated_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27)
         ON CONFLICT(microvm_id) DO UPDATE SET
             mode = excluded.mode,
             guest_ip = excluded.guest_ip,
@@ -1302,6 +1331,13 @@ fn persist_network_transaction(
             nat_chain_created_by_sdk = excluded.nat_chain_created_by_sdk,
             host_address_specs = excluded.host_address_specs,
             default_route_specs = excluded.default_route_specs,
+            lan_ip = excluded.lan_ip,
+            uplink_cidr = excluded.uplink_cidr,
+            proxy_arp_enabled_by_sdk = excluded.proxy_arp_enabled_by_sdk,
+            host_route_created_by_sdk = excluded.host_route_created_by_sdk,
+            proxy_arp_entry_created_by_sdk = excluded.proxy_arp_entry_created_by_sdk,
+            iptables_forward_specs = excluded.iptables_forward_specs,
+            iptables_nat_spec = excluded.iptables_nat_spec,
             updated_at = excluded.updated_at",
         params![
             vm_id,
@@ -1326,6 +1362,17 @@ fn persist_network_transaction(
             })?,
             serde_json::to_string(&network.default_route_specs).map_err(|error| {
                 SdkError::Migration(format!("could not encode default route state: {error}"))
+            })?,
+            lan_ip,
+            network.uplink_cidr,
+            network.proxy_arp_enabled_by_sdk,
+            network.host_route_created_by_sdk,
+            network.proxy_arp_entry_created_by_sdk,
+            serde_json::to_string(&Vec::<String>::new()).map_err(|error| {
+                SdkError::Migration(format!("could not encode iptables state: {error}"))
+            })?,
+            serde_json::to_string(&Option::<String>::None).map_err(|error| {
+                SdkError::Migration(format!("could not encode iptables state: {error}"))
             })?,
             unix_timestamp()?,
         ],

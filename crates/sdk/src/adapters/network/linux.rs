@@ -8,7 +8,9 @@ use crate::domain::microvm::{
     NetworkConfiguration, NetworkResource, PersistedNetwork, PersistedNetworkResource,
 };
 use crate::error::SdkError;
-use crate::ports::network::{NetworkController, NetworkOutcome, NetworkRequest};
+use crate::ports::network::{
+    LanAddressOffer, NetworkController, NetworkOutcome, NetworkRequest, UplinkIdentity,
+};
 
 const PRIVATE_POOL_START: u32 = (172_u32 << 24) | (30_u32 << 16);
 const PRIVATE_POOL_END: u32 = (172_u32 << 24) | (31_u32 << 16) | 0xff00;
@@ -21,60 +23,22 @@ const GUEST_INTERFACE: &str = "eth0";
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct LinuxNetworkController;
 
-impl LinuxNetworkController {
-    /// Returns a DHCP address observed for the VM MAC on the selected bridge.
-    pub(crate) fn discover_dhcp_address(
-        &self,
-        bridge_name: &str,
-        guest_mac: &str,
-    ) -> Result<(IpAddr, String), SdkError> {
-        let output = command_output("ip", &["-4", "neigh", "show", "dev", bridge_name])?;
-        let text = String::from_utf8_lossy(&output.stdout);
-        for line in text.lines() {
-            let fields = line.split_whitespace().collect::<Vec<_>>();
-            let Some(address) = fields.first() else {
-                continue;
-            };
-            let has_mac = fields
-                .windows(2)
-                .any(|pair| pair[0] == "lladdr" && pair[1].eq_ignore_ascii_case(guest_mac));
-            if has_mac && let Ok(address) = address.parse::<IpAddr>() {
-                return Ok((address, format!("{guest_mac}:{address}")));
-            }
-        }
-        Err(SdkError::Network {
-            mode: NetworkMode::Lan.to_string(),
-            operation: "observe DHCP lease".to_owned(),
-            resource: guest_mac.to_owned(),
-            reason: "no active lease for the VM MAC was observed".to_owned(),
-        })
-    }
-
-    /// Updates an in-memory outcome after a temporary DHCP observation.
-    pub(crate) fn with_dhcp_lease(
-        &self,
-        mut outcome: NetworkOutcome,
-        address: IpAddr,
-        lease_reference: String,
-    ) -> NetworkOutcome {
-        outcome.persisted.config.guest_address = address;
-        outcome.persisted.config.prefix_length = 24;
-        outcome.persisted.dhcp_lease_reference = Some(lease_reference);
-        outcome.persisted.resources.push(resource(
-            NetworkResource::DhcpLease,
-            &address.to_string(),
-            &format!("{}:{address}", outcome.persisted.guest_mac),
-        ));
-        outcome.applied.push(NetworkResource::DhcpLease);
-        outcome.requires_temporary_runtime = false;
-        outcome
-    }
-}
-
 impl NetworkController for LinuxNetworkController {
-    fn lan_bridge_identity(&self) -> Result<Option<(String, String)>, SdkError> {
-        let uplink = detect_default_uplink()?;
-        Ok(Some((bridge_name(&uplink), uplink)))
+    fn detect_uplink(&self) -> Result<UplinkIdentity, SdkError> {
+        detect_uplink_identity()
+    }
+
+    fn select_lan_offer(
+        &self,
+        uplink: &UplinkIdentity,
+        lan_override: Option<Ipv4Addr>,
+        previous: Option<Ipv4Addr>,
+        used_addresses: &[(String, IpAddr, String)],
+    ) -> Result<LanAddressOffer, SdkError> {
+        let _ = uplink.prefix_length;
+        let offer = select_lan_offer(uplink, lan_override, previous, used_addresses)?;
+        let _ = offer.source;
+        Ok(offer)
     }
 
     fn configure(
@@ -98,60 +62,42 @@ impl NetworkController for LinuxNetworkController {
             if let Err(error) = delete_link_if_present(&network.config.tap_name) {
                 failures.push(error.to_string());
             }
-            if let Err(error) = run_nft_delete(&network.config.tap_name) {
-                failures.push(error.to_string());
-            }
-            if (network.nat_table_created_by_sdk || network.nat_chain_created_by_sdk)
-                && let Err(error) = cleanup_created_nat_container(
-                    !network.nat_table_created_by_sdk,
-                    !network.nat_chain_created_by_sdk,
-                )
+            if network.forwarding_enabled_by_sdk
+                && let Err(error) = run_command("sysctl", &["-w", "net.ipv4.ip_forward=0"])
             {
                 failures.push(error.to_string());
-            }
-            if network.forwarding_enabled_by_sdk {
-                match nft_chain_has_rules() {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        if let Err(error) = run_command("sysctl", &["-w", "net.ipv4.ip_forward=0"])
-                        {
-                            failures.push(error.to_string());
-                        }
-                    }
-                    Err(error) => failures.push(error.to_string()),
-                }
             }
         } else {
-            if let Err(error) = delete_link_if_present(&network.config.tap_name) {
-                failures.push(error.to_string());
-            }
-            let mut uplink_restored = true;
-            if network.uplink_attached_by_sdk
-                && let (Some(bridge), Some(uplink)) = (
-                    network.config.bridge_name.as_deref(),
-                    network.config.uplink_name.as_deref(),
-                )
-            {
-                let restore_failures = restore_uplink_state(
-                    uplink,
-                    bridge,
-                    &UplinkSnapshot {
-                        address_specs: network.host_address_specs.clone(),
-                        default_route_specs: network.default_route_specs.clone(),
-                    },
-                );
-                if !restore_failures.is_empty() {
-                    uplink_restored = false;
-                    failures.extend(restore_failures);
-                }
-            }
-            if network.bridge_created_by_sdk
-                && uplink_restored
-                && let Some(bridge) = network.config.bridge_name.as_deref()
-                && let Err(error) = delete_link_if_present(bridge)
-            {
-                failures.push(error.to_string());
-            }
+            let Some(IpAddr::V4(lan)) = network.config.lan_address else {
+                failures.push("routed LAN network has no committed LAN address".to_owned());
+                return Err(SdkError::Cleanup {
+                    primary: "network rollback failed".to_owned(),
+                    failures,
+                });
+            };
+            let uplink = network.config.uplink_name.clone().unwrap_or_default();
+            let IpAddr::V4(private_guest) = network.config.guest_address else {
+                failures.push("routed LAN network has no private guest address".to_owned());
+                return Err(SdkError::Cleanup {
+                    primary: "network rollback failed".to_owned(),
+                    failures,
+                });
+            };
+            let private_network = private_guest_network(private_guest);
+            failures.extend(cleanup_routed_attempt(
+                &uplink,
+                &network.config.tap_name,
+                lan,
+                private_network,
+                private_guest,
+                &network
+                    .resources
+                    .iter()
+                    .map(|item| item.resource)
+                    .collect::<Vec<_>>(),
+                !network.forwarding_enabled_by_sdk,
+                !network.proxy_arp_enabled_by_sdk,
+            ));
         }
         if failures.is_empty() {
             Ok(())
@@ -163,21 +109,14 @@ impl NetworkController for LinuxNetworkController {
         }
     }
 
-    fn discover_dhcp_address(
+    fn apply_guest_routed_setup(
         &self,
-        bridge_name: &str,
-        guest_mac: &str,
-    ) -> Result<(IpAddr, String), SdkError> {
-        self.discover_dhcp_address(bridge_name, guest_mac)
-    }
-
-    fn with_dhcp_lease(
-        &self,
-        outcome: NetworkOutcome,
-        address: IpAddr,
-        lease_reference: String,
-    ) -> NetworkOutcome {
-        self.with_dhcp_lease(outcome, address, lease_reference)
+        private_key_path: &std::path::Path,
+        private_address: Ipv4Addr,
+        lan_address: Ipv4Addr,
+        gateway: Ipv4Addr,
+    ) -> Result<(), SdkError> {
+        apply_guest_routed_setup(private_key_path, private_address, lan_address, gateway)
     }
 }
 
@@ -189,7 +128,7 @@ impl LinuxNetworkController {
     ) -> Result<NetworkOutcome, SdkError> {
         let mut occupied = used_addresses.to_vec();
         occupied.extend(live_ipv4_addresses()?);
-        let (_network_base, gateway, guest) =
+        let (private_network, gateway, guest) =
             allocate_subnet(&occupied).ok_or_else(|| SdkError::Network {
                 mode: NetworkMode::HostOnly.to_string(),
                 operation: "allocate private /30".to_owned(),
@@ -206,6 +145,7 @@ impl LinuxNetworkController {
             tap_name: tap_name.clone(),
             bridge_name: None,
             uplink_name: None,
+            lan_address: None,
         };
         // The device field of `ip=` is resolved inside the guest, where the host TAP
         // name is unknown.
@@ -215,13 +155,11 @@ impl LinuxNetworkController {
         );
         let mut applied = Vec::new();
         let forwarding_was_enabled = forwarding_enabled()?;
-        let nat_table_existed = nft_table_exists()?;
-        let nat_chain_existed = nat_table_existed && nft_chain_exists()?;
         let result = (|| {
             ensure_tap(&tap_name, &mut applied, NetworkMode::HostOnly)?;
             ensure_tap_address(&tap_name, gateway, &mut applied)?;
             ensure_forwarding(&mut applied)?;
-            ensure_nat(&tap_name, &mut applied)?;
+            ensure_iptables_host_only(&tap_name, private_network, &mut applied)?;
             applied.push(NetworkResource::FirecrackerInterface);
             let resources = vec![
                 resource(NetworkResource::Tap, &tap_name, &tap_name),
@@ -236,9 +174,9 @@ impl LinuxNetworkController {
                     "net.ipv4.ip_forward=1",
                 ),
                 resource(
-                    NetworkResource::Nat,
+                    NetworkResource::IptablesNat,
                     &tap_name,
-                    &format!("{SDK_OWNERSHIP}:{tap_name}"),
+                    &format!("{SDK_OWNERSHIP}:{tap_name}:nat"),
                 ),
                 resource(
                     NetworkResource::FirecrackerInterface,
@@ -253,11 +191,15 @@ impl LinuxNetworkController {
                 dhcp_lease_reference: None,
                 desired_boot_parameters,
                 resources,
+                uplink_cidr: None,
+                proxy_arp_enabled_by_sdk: false,
                 bridge_created_by_sdk: false,
                 uplink_attached_by_sdk: false,
                 forwarding_enabled_by_sdk: !forwarding_was_enabled,
-                nat_table_created_by_sdk: !nat_table_existed,
-                nat_chain_created_by_sdk: !nat_chain_existed,
+                nat_table_created_by_sdk: false,
+                nat_chain_created_by_sdk: false,
+                host_route_created_by_sdk: false,
+                proxy_arp_entry_created_by_sdk: false,
                 host_address_specs: Vec::new(),
                 default_route_specs: Vec::new(),
             };
@@ -273,10 +215,9 @@ impl LinuxNetworkController {
             Err(primary) => {
                 let cleanup_failures = cleanup_host_only_attempt(
                     &tap_name,
+                    private_network,
                     &applied,
                     forwarding_was_enabled,
-                    nat_table_existed,
-                    nat_chain_existed,
                 );
                 if cleanup_failures.is_empty() {
                     Err(primary)
@@ -291,128 +232,138 @@ impl LinuxNetworkController {
     }
 
     fn create_lan(&self, request: &NetworkRequest) -> Result<NetworkOutcome, SdkError> {
-        let uplink = detect_default_uplink()?;
-        let bridge = bridge_name(&uplink);
-        let tap = tap_name(&request.vm_name);
-        let mut applied = Vec::new();
-        let bridge_existed = link_exists(&bridge)?;
-        if bridge_existed && !request.allow_existing_bridge {
-            return Err(SdkError::Network {
+        let uplink = self.detect_uplink()?;
+        let mut occupied = Vec::new();
+        occupied.extend(live_ipv4_addresses()?);
+        let (_network_base, gateway, guest) =
+            allocate_subnet(&occupied).ok_or_else(|| SdkError::Network {
                 mode: NetworkMode::Lan.to_string(),
-                operation: "claim managed bridge".to_owned(),
-                resource: bridge,
-                reason: "an existing bridge is not registered as SDK-owned".to_owned(),
-            });
-        }
-        if let Err(primary) = ensure_bridge(&bridge, &mut applied) {
-            let cleanup_failures =
-                cleanup_lan_attempt(&bridge, &tap, bridge_existed, None, &applied);
-            return if cleanup_failures.is_empty() {
-                Err(primary)
-            } else {
-                Err(SdkError::Cleanup {
-                    primary: primary.to_string(),
-                    failures: cleanup_failures,
-                })
-            };
-        }
-        if let Err(primary) = ensure_tap(&tap, &mut applied, NetworkMode::Lan) {
-            let cleanup_failures =
-                cleanup_lan_attempt(&bridge, &tap, bridge_existed, None, &applied);
-            return if cleanup_failures.is_empty() {
-                Err(primary)
-            } else {
-                Err(SdkError::Cleanup {
-                    primary: primary.to_string(),
-                    failures: cleanup_failures,
-                })
-            };
-        }
-        let mut transition = None;
-        let result = (|| {
-            ensure_bridge_attachment(
-                &tap,
-                &bridge,
-                NetworkResource::BridgeTapAttachment,
-                &mut applied,
-            )?;
-            transition = ensure_uplink_on_bridge(&uplink, &bridge)?;
-            if transition.is_some() {
-                applied.push(NetworkResource::BridgeUplinkAttachment);
-            }
-            Ok::<(), SdkError>(())
-        })();
-        if let Err(primary) = result {
-            let cleanup_failures =
-                cleanup_lan_attempt(&bridge, &tap, bridge_existed, transition.as_ref(), &applied);
-            return if cleanup_failures.is_empty() {
-                Err(primary)
-            } else {
-                Err(SdkError::Cleanup {
-                    primary: primary.to_string(),
-                    failures: cleanup_failures,
-                })
-            };
-        }
-        applied.push(NetworkResource::FirecrackerInterface);
+                operation: "allocate private /30".to_owned(),
+                resource: "172.30.0.0/16".to_owned(),
+                reason: "the private address pool is exhausted or overlaps persisted state"
+                    .to_owned(),
+            })?;
+        let tap = tap_name(&request.vm_name);
+        let offer = self.select_lan_offer(&uplink, request.lan_address_override, None, &[])?;
         let config = NetworkConfiguration {
             mode: NetworkMode::Lan,
-            guest_address: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-            prefix_length: 0,
-            gateway: None,
+            guest_address: IpAddr::V4(guest),
+            prefix_length: 30,
+            gateway: Some(IpAddr::V4(gateway)),
             tap_name: tap.clone(),
-            bridge_name: Some(bridge.clone()),
-            uplink_name: Some(uplink.clone()),
+            bridge_name: None,
+            uplink_name: Some(uplink.interface.clone()),
+            lan_address: Some(IpAddr::V4(offer.address)),
         };
-        let resources = vec![
-            resource(
-                NetworkResource::Bridge,
-                &bridge,
-                &format!("{bridge}:{uplink}"),
-            ),
-            resource(
-                NetworkResource::BridgeUplinkAttachment,
-                &format!("{bridge}:{uplink}"),
-                &format!("bridge={bridge},uplink={uplink}"),
-            ),
-            resource(
-                NetworkResource::BridgeTapAttachment,
-                &format!("{bridge}:{tap}"),
-                &format!("bridge={bridge},tap={tap}"),
-            ),
-            resource(NetworkResource::Tap, &tap, &tap),
-            resource(
-                NetworkResource::FirecrackerInterface,
-                &format!("{tap}:{}", request.guest_mac),
-                &format!("tap={tap},mac={}", request.guest_mac),
-            ),
-        ];
-        Ok(NetworkOutcome {
-            persisted: PersistedNetwork {
-                config,
-                host_address: None,
-                guest_mac: request.guest_mac.clone(),
-                dhcp_lease_reference: None,
-                desired_boot_parameters: "ip=dhcp".to_owned(),
-                resources,
-                bridge_created_by_sdk: !bridge_existed,
-                uplink_attached_by_sdk: transition.is_some(),
-                forwarding_enabled_by_sdk: false,
-                nat_table_created_by_sdk: false,
-                nat_chain_created_by_sdk: false,
-                host_address_specs: transition
-                    .as_ref()
-                    .map(|value| value.snapshot.address_specs.clone())
-                    .unwrap_or_default(),
-                default_route_specs: transition
-                    .as_ref()
-                    .map(|value| value.snapshot.default_route_specs.clone())
-                    .unwrap_or_default(),
-            },
-            applied,
-            skipped: Vec::new(),
-            requires_temporary_runtime: true,
-        })
+        let desired_boot_parameters = format!(
+            "ip={}::{}:{}::{GUEST_INTERFACE}:off",
+            guest, gateway, "255.255.255.252"
+        );
+        let mut applied = Vec::new();
+        let forwarding_was_enabled = forwarding_enabled()?;
+        let proxy_was_enabled = proxy_arp_enabled(&uplink.interface)?;
+        let result = (|| {
+            ensure_tap(&tap, &mut applied, NetworkMode::Lan)?;
+            ensure_routed_host(&uplink, &tap, offer.address, gateway, &mut applied)?;
+            ensure_forwarding(&mut applied)?;
+            ensure_proxy_arp(&uplink.interface, &mut applied)?;
+            ensure_iptables_routed(
+                &uplink.interface,
+                &tap,
+                _network_base,
+                guest,
+                offer.address,
+                &mut applied,
+            )?;
+            applied.push(NetworkResource::FirecrackerInterface);
+            Ok::<(), SdkError>(())
+        })();
+        match result {
+            Ok(()) => {
+                let resources = vec![
+                    resource(NetworkResource::Tap, &tap, &tap),
+                    resource(
+                        NetworkResource::TapAddress,
+                        &format!("{tap}:{gateway}/30"),
+                        &format!("{tap}:{gateway}/30"),
+                    ),
+                    resource(
+                        NetworkResource::HostRoute,
+                        &format!("{tap}:{}", offer.address),
+                        &format!("{tap}:{}", offer.address),
+                    ),
+                    resource(
+                        NetworkResource::ProxyArpEntry,
+                        &format!("{}:{}", uplink.interface, offer.address),
+                        &format!("{}:{}", uplink.interface, offer.address),
+                    ),
+                    resource(
+                        NetworkResource::Forwarding,
+                        "net.ipv4.ip_forward",
+                        "net.ipv4.ip_forward=1",
+                    ),
+                    resource(
+                        NetworkResource::ForwardRule,
+                        &format!("{tap}:forward"),
+                        &format!("{SDK_OWNERSHIP}:{tap}:forward"),
+                    ),
+                    resource(
+                        NetworkResource::IptablesNat,
+                        &tap,
+                        &format!("{SDK_OWNERSHIP}:{tap}"),
+                    ),
+                    resource(
+                        NetworkResource::FirecrackerInterface,
+                        &format!("{tap}:{}", request.guest_mac),
+                        &format!("tap={tap},mac={}", request.guest_mac),
+                    ),
+                ];
+                Ok(NetworkOutcome {
+                    persisted: PersistedNetwork {
+                        config,
+                        host_address: Some(IpAddr::V4(gateway)),
+                        guest_mac: request.guest_mac.clone(),
+                        dhcp_lease_reference: None,
+                        desired_boot_parameters,
+                        resources,
+                        uplink_cidr: Some(offer.uplink_cidr.clone()),
+                        proxy_arp_enabled_by_sdk: !proxy_was_enabled,
+                        bridge_created_by_sdk: false,
+                        uplink_attached_by_sdk: false,
+                        forwarding_enabled_by_sdk: !forwarding_was_enabled,
+                        nat_table_created_by_sdk: false,
+                        nat_chain_created_by_sdk: false,
+                        host_route_created_by_sdk: true,
+                        proxy_arp_entry_created_by_sdk: true,
+                        host_address_specs: Vec::new(),
+                        default_route_specs: Vec::new(),
+                    },
+                    applied: applied.clone(),
+                    skipped: Vec::new(),
+                    requires_temporary_runtime: true,
+                })
+            }
+            Err(primary) => {
+                let cleanup_failures = cleanup_routed_attempt(
+                    &uplink.interface,
+                    &tap,
+                    offer.address,
+                    _network_base,
+                    guest,
+                    &applied,
+                    forwarding_was_enabled,
+                    proxy_was_enabled,
+                );
+                if cleanup_failures.is_empty() {
+                    Err(primary)
+                } else {
+                    Err(SdkError::Cleanup {
+                        primary: primary.to_string(),
+                        failures: cleanup_failures,
+                    })
+                }
+            }
+        }
     }
 
     fn reconcile(
@@ -463,10 +414,17 @@ impl LinuxNetworkController {
                 reason: "host-only network must use a /30 prefix".to_owned(),
             });
         }
+        let IpAddr::V4(guest) = network.config.guest_address else {
+            return Err(SdkError::Network {
+                mode: NetworkMode::HostOnly.to_string(),
+                operation: "validate persisted guest address".to_owned(),
+                resource: network.config.tap_name.clone(),
+                reason: "host-only network has no IPv4 guest address".to_owned(),
+            });
+        };
+        let private_network = private_guest_network(guest);
         let tap_existed = link_exists(&network.config.tap_name)?;
         let forwarding_was_enabled = forwarding_enabled()?;
-        let nat_table_existed = nft_table_exists()?;
-        let nat_chain_existed = nat_table_existed && nft_chain_exists()?;
         let mut applied = Vec::new();
         let mut skipped = Vec::new();
         let result = (|| {
@@ -478,13 +436,14 @@ impl LinuxNetworkController {
                 &mut skipped,
             )?;
             reconcile_forwarding(&mut applied, &mut skipped)?;
-            reconcile_nat(&network.config.tap_name, &mut applied, &mut skipped)?;
+            reconcile_iptables_nat(
+                &network.config.tap_name,
+                private_network,
+                &mut applied,
+                &mut skipped,
+            )?;
             if applied.contains(&NetworkResource::Forwarding) {
                 network.forwarding_enabled_by_sdk = true;
-            }
-            if applied.contains(&NetworkResource::Nat) {
-                network.nat_table_created_by_sdk |= !nat_table_existed;
-                network.nat_chain_created_by_sdk |= !nat_chain_existed;
             }
             skipped.push(NetworkResource::FirecrackerInterface);
             Ok::<(), SdkError>(())
@@ -495,11 +454,10 @@ impl LinuxNetworkController {
                 let cleanup_failures = cleanup_reconciled_host_only(
                     &network.config.tap_name,
                     gateway,
+                    private_network,
                     tap_existed,
                     &applied,
                     forwarding_was_enabled,
-                    nat_table_existed,
-                    nat_chain_existed,
                 );
                 if cleanup_failures.is_empty() {
                     Err(primary)
@@ -518,16 +476,14 @@ impl LinuxNetworkController {
         network: &mut PersistedNetwork,
         vm_name: &str,
     ) -> Result<(Vec<NetworkResource>, Vec<NetworkResource>), SdkError> {
-        let bridge = network
-            .config
-            .bridge_name
-            .clone()
-            .ok_or_else(|| SdkError::Network {
+        let Some(IpAddr::V4(lan)) = network.config.lan_address else {
+            return Err(SdkError::Network {
                 mode: NetworkMode::Lan.to_string(),
-                operation: "load persisted bridge".to_owned(),
+                operation: "load persisted LAN address".to_owned(),
                 resource: vm_name.to_owned(),
-                reason: "LAN network has no bridge name".to_owned(),
-            })?;
+                reason: "LAN network has no committed LAN address".to_owned(),
+            });
+        };
         let uplink = network
             .config
             .uplink_name
@@ -538,36 +494,65 @@ impl LinuxNetworkController {
                 resource: vm_name.to_owned(),
                 reason: "LAN network has no uplink name".to_owned(),
             })?;
-        let bridge_existed = link_exists(&bridge)?;
+        let Some(IpAddr::V4(gateway)) = network.host_address else {
+            return Err(SdkError::Network {
+                mode: NetworkMode::Lan.to_string(),
+                operation: "validate persisted host address".to_owned(),
+                resource: network.config.tap_name.clone(),
+                reason: "routed LAN network has no persisted gateway".to_owned(),
+            });
+        };
+        let IpAddr::V4(private_guest) = network.config.guest_address else {
+            return Err(SdkError::Network {
+                mode: NetworkMode::Lan.to_string(),
+                operation: "validate persisted guest address".to_owned(),
+                resource: network.config.tap_name.clone(),
+                reason: "routed LAN network has no IPv4 guest address".to_owned(),
+            });
+        };
+        if network.config.prefix_length != 30 {
+            return Err(SdkError::Network {
+                mode: NetworkMode::Lan.to_string(),
+                operation: "validate persisted host prefix".to_owned(),
+                resource: network.config.tap_name.clone(),
+                reason: "routed LAN network must use a /30 prefix".to_owned(),
+            });
+        }
+        let tap_existed = link_exists(&network.config.tap_name)?;
+        let forwarding_was_enabled = forwarding_enabled()?;
+        let proxy_was_enabled = proxy_arp_enabled(&uplink)?;
         let mut applied = Vec::new();
         let mut skipped = Vec::new();
-        let mut transition = None;
+        let private_network = private_guest_network(private_guest);
         let result = (|| {
-            reconcile_bridge(&bridge, &mut applied, &mut skipped)?;
             reconcile_tap(&network.config.tap_name, &mut applied, &mut skipped)?;
-            reconcile_attachment(
+            reconcile_tap_address(
                 &network.config.tap_name,
-                &bridge,
-                NetworkResource::BridgeTapAttachment,
+                gateway,
                 &mut applied,
                 &mut skipped,
             )?;
-            transition = ensure_uplink_on_bridge(&uplink, &bridge)?;
-            if let Some(value) = transition.as_ref() {
-                network.uplink_attached_by_sdk = true;
-                network.host_address_specs = value.snapshot.address_specs.clone();
-                network.default_route_specs = value.snapshot.default_route_specs.clone();
-                applied.push(NetworkResource::BridgeUplinkAttachment);
-            } else {
-                skipped.push(NetworkResource::BridgeUplinkAttachment);
+            reconcile_host_route(&network.config.tap_name, lan, &mut applied, &mut skipped)?;
+            reconcile_proxy_entry(&uplink, lan, &mut applied, &mut skipped)?;
+            reconcile_forwarding(&mut applied, &mut skipped)?;
+            reconcile_proxy_arp(&uplink, &mut applied, &mut skipped)?;
+            reconcile_iptables_routed(
+                &uplink,
+                &network.config.tap_name,
+                private_network,
+                private_guest,
+                lan,
+                &mut applied,
+                &mut skipped,
+            )?;
+            if applied.contains(&NetworkResource::Forwarding) {
+                network.forwarding_enabled_by_sdk = true;
             }
-            if network.dhcp_lease_reference.is_some()
-                && !network.config.guest_address.is_unspecified()
-            {
-                skipped.push(NetworkResource::DhcpLease);
+            if applied.contains(&NetworkResource::ProxyArpEntry) {
+                network.proxy_arp_entry_created_by_sdk = true;
             }
-            if !bridge_existed {
-                network.bridge_created_by_sdk = true;
+            if applied.contains(&NetworkResource::HostRoute) {
+                network.host_route_created_by_sdk = true;
             }
             skipped.push(NetworkResource::FirecrackerInterface);
             Ok::<(), SdkError>(())
@@ -575,13 +560,17 @@ impl LinuxNetworkController {
         match result {
             Ok(()) => Ok((applied, skipped)),
             Err(primary) => {
-                let cleanup_failures = cleanup_lan_attempt(
-                    &bridge,
+                let cleanup_failures = cleanup_routed_attempt(
+                    &uplink,
                     &network.config.tap_name,
-                    bridge_existed,
-                    transition.as_ref(),
+                    lan,
+                    private_network,
+                    private_guest,
                     &applied,
+                    forwarding_was_enabled,
+                    proxy_was_enabled,
                 );
+                let _ = tap_existed;
                 if cleanup_failures.is_empty() {
                     Err(primary)
                 } else {
@@ -595,16 +584,112 @@ impl LinuxNetworkController {
     }
 }
 
-#[derive(Clone, Debug)]
-struct UplinkSnapshot {
-    address_specs: Vec<String>,
-    default_route_specs: Vec<Vec<String>>,
+fn reconcile_host_route(
+    tap: &str,
+    lan: Ipv4Addr,
+    applied: &mut Vec<NetworkResource>,
+    skipped: &mut Vec<NetworkResource>,
+) -> Result<(), SdkError> {
+    let output = command_output(
+        "ip",
+        &["-4", "route", "show", &format!("{lan}/32"), "dev", tap],
+    )?;
+    if !output.status.success() {
+        return Err(host_command_error(
+            "ip",
+            &["-4", "route", "show", &format!("{lan}/32"), "dev", tap],
+            &output,
+        ));
+    }
+    if String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .any(|line| line.contains(&format!("{lan}/32")) && line.contains(tap))
+    {
+        skipped.push(NetworkResource::HostRoute);
+    } else {
+        run_ip(&["route", "replace", &format!("{lan}/32"), "dev", tap])?;
+        applied.push(NetworkResource::HostRoute);
+    }
+    Ok(())
 }
 
-#[derive(Clone, Debug)]
-struct UplinkTransition {
-    uplink: String,
-    snapshot: UplinkSnapshot,
+fn reconcile_proxy_entry(
+    uplink: &str,
+    lan: Ipv4Addr,
+    applied: &mut Vec<NetworkResource>,
+    skipped: &mut Vec<NetworkResource>,
+) -> Result<(), SdkError> {
+    let output = command_output("ip", &["neigh", "show", "proxy", "dev", uplink])?;
+    if !output.status.success() {
+        return Err(host_command_error(
+            "ip",
+            &["neigh", "show", "proxy", "dev", uplink],
+            &output,
+        ));
+    }
+    if String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .any(|line| line.contains(&lan.to_string()))
+    {
+        skipped.push(NetworkResource::ProxyArpEntry);
+    } else {
+        run_ip(&["neigh", "replace", "proxy", &lan.to_string(), "dev", uplink])?;
+        applied.push(NetworkResource::ProxyArpEntry);
+    }
+    Ok(())
+}
+
+fn reconcile_proxy_arp(
+    uplink: &str,
+    applied: &mut Vec<NetworkResource>,
+    skipped: &mut Vec<NetworkResource>,
+) -> Result<(), SdkError> {
+    if proxy_arp_enabled(uplink)? {
+        skipped.push(NetworkResource::Forwarding);
+    } else {
+        ensure_proxy_arp(uplink, applied)?;
+    }
+    Ok(())
+}
+
+fn reconcile_iptables_routed(
+    uplink: &str,
+    tap: &str,
+    private_network: Ipv4Addr,
+    private_guest: Ipv4Addr,
+    lan: Ipv4Addr,
+    applied: &mut Vec<NetworkResource>,
+    skipped: &mut Vec<NetworkResource>,
+) -> Result<(), SdkError> {
+    let mut missing = 0;
+    for spec in routed_forward_specs(uplink, tap, private_guest, lan) {
+        let arguments = spec.iter().map(String::as_str).collect::<Vec<_>>();
+        if iptables_rule_exists(&arguments)? {
+            skipped.push(NetworkResource::ForwardRule);
+        } else {
+            run_iptables_spec(&spec)?;
+            applied.push(NetworkResource::ForwardRule);
+            missing += 1;
+        }
+    }
+    let nat = routed_nat_spec(uplink, tap, private_network);
+    let arguments = nat.iter().map(String::as_str).collect::<Vec<_>>();
+    let with_table = if arguments.first() == Some(&"POSTROUTING") {
+        let mut full = vec!["-t", "nat", "-C"];
+        full.extend(arguments.iter().copied());
+        full
+    } else {
+        arguments
+    };
+    if iptables_rule_exists(&with_table)? {
+        skipped.push(NetworkResource::IptablesNat);
+    } else {
+        run_iptables_spec(&nat)?;
+        applied.push(NetworkResource::IptablesNat);
+        missing += 1;
+    }
+    let _ = missing;
+    Ok(())
 }
 
 fn allocate_subnet(
@@ -639,220 +724,8 @@ fn allocate_subnet(
     None
 }
 
-fn ensure_uplink_on_bridge(
-    uplink: &str,
-    bridge: &str,
-) -> Result<Option<UplinkTransition>, SdkError> {
-    if let Some(current_master) = link_master(uplink)? {
-        if current_master == bridge {
-            return Ok(None);
-        }
-        return Err(SdkError::Network {
-            mode: NetworkMode::Lan.to_string(),
-            operation: "claim default uplink".to_owned(),
-            resource: uplink.to_owned(),
-            reason: format!(
-                "the default uplink is already attached to foreign bridge {current_master}"
-            ),
-        });
-    }
-    let snapshot = capture_uplink_state(uplink)?;
-    match move_uplink_to_bridge(uplink, bridge, &snapshot) {
-        Ok(()) => Ok(Some(UplinkTransition {
-            uplink: uplink.to_owned(),
-            snapshot,
-        })),
-        Err(primary) => {
-            let cleanup_failures = restore_uplink_state(uplink, bridge, &snapshot);
-            if cleanup_failures.is_empty() {
-                Err(primary)
-            } else {
-                Err(SdkError::Cleanup {
-                    primary: primary.to_string(),
-                    failures: cleanup_failures,
-                })
-            }
-        }
-    }
-}
-
-fn capture_uplink_state(uplink: &str) -> Result<UplinkSnapshot, SdkError> {
-    let output = command_output("ip", &["-o", "addr", "show", "dev", uplink])?;
-    if !output.status.success() {
-        return Err(SdkError::Network {
-            mode: NetworkMode::Lan.to_string(),
-            operation: "inspect uplink addresses".to_owned(),
-            resource: uplink.to_owned(),
-            reason: format!(
-                "interface is unavailable (ip exited with {})",
-                output.status
-            ),
-        });
-    }
-    let mut address_specs = Vec::new();
-    for line in String::from_utf8_lossy(&output.stdout).lines() {
-        let fields = line.split_whitespace().collect::<Vec<_>>();
-        let Some(index) = fields
-            .iter()
-            .position(|field| *field == "inet" || *field == "inet6")
-        else {
-            continue;
-        };
-        if let Some(address) = fields.get(index + 1) {
-            address_specs.push((*address).to_owned());
-        }
-    }
-
-    let mut default_route_specs = Vec::new();
-    for family in ["-4", "-6"] {
-        let output = command_output("ip", &[family, "route", "show", "default", "dev", uplink])?;
-        if !output.status.success() {
-            return Err(SdkError::Network {
-                mode: NetworkMode::Lan.to_string(),
-                operation: "inspect uplink default route".to_owned(),
-                resource: uplink.to_owned(),
-                reason: format!("ip exited with {}", output.status),
-            });
-        }
-        default_route_specs.extend(
-            String::from_utf8_lossy(&output.stdout)
-                .lines()
-                .map(|line| {
-                    let mut fields = vec![family.to_owned()];
-                    fields.extend(line.split_whitespace().map(str::to_owned));
-                    fields
-                })
-                .filter(|fields| !fields.is_empty()),
-        );
-    }
-    Ok(UplinkSnapshot {
-        address_specs,
-        default_route_specs,
-    })
-}
-
-fn move_uplink_to_bridge(
-    uplink: &str,
-    bridge: &str,
-    snapshot: &UplinkSnapshot,
-) -> Result<(), SdkError> {
-    for address in &snapshot.address_specs {
-        if !interface_has_address(bridge, address)? {
-            run_ip(&["addr", "add", address, "dev", bridge])?;
-        }
-    }
-    run_ip(&["link", "set", "dev", uplink, "master", bridge])?;
-    for address in &snapshot.address_specs {
-        if interface_has_address(uplink, address)? {
-            run_ip(&["addr", "del", address, "dev", uplink])?;
-        }
-    }
-    for route in &snapshot.default_route_specs {
-        let arguments = route_with_device(route, uplink, bridge);
-        run_ip_owned(&arguments)?;
-    }
-    Ok(())
-}
-
-fn restore_uplink_state(uplink: &str, bridge: &str, snapshot: &UplinkSnapshot) -> Vec<String> {
-    let mut failures = Vec::new();
-    if link_master(uplink)
-        .map_err(|error| failures.push(error.to_string()))
-        .ok()
-        .flatten()
-        .is_some_and(|master| master == bridge)
-        && let Err(error) = run_ip(&["link", "set", "dev", uplink, "nomaster"])
-    {
-        failures.push(error.to_string());
-    }
-    for address in &snapshot.address_specs {
-        if let Ok(true) = interface_has_address(bridge, address)
-            && let Err(error) = run_ip(&["addr", "del", address, "dev", bridge])
-        {
-            failures.push(error.to_string());
-        }
-        match interface_has_address(uplink, address) {
-            Ok(true) => {}
-            Ok(false) => {
-                if let Err(error) = run_ip(&["addr", "add", address, "dev", uplink]) {
-                    failures.push(error.to_string());
-                }
-            }
-            Err(error) => failures.push(error.to_string()),
-        }
-    }
-    for route in &snapshot.default_route_specs {
-        let arguments = route_with_device(route, bridge, uplink);
-        if let Err(error) = run_ip_owned(&arguments) {
-            failures.push(error.to_string());
-        }
-    }
-    failures
-}
-
-fn cleanup_lan_attempt(
-    bridge: &str,
-    tap: &str,
-    bridge_existed: bool,
-    transition: Option<&UplinkTransition>,
-    applied: &[NetworkResource],
-) -> Vec<String> {
-    let mut failures = Vec::new();
-    if applied.contains(&NetworkResource::Tap)
-        && let Err(error) = delete_link_if_present(tap)
-    {
-        failures.push(error.to_string());
-    }
-    if let Some(transition) = transition {
-        failures.extend(restore_uplink_state(
-            &transition.uplink,
-            bridge,
-            &transition.snapshot,
-        ));
-    }
-    if !bridge_existed && let Err(error) = delete_link_if_present(bridge) {
-        failures.push(error.to_string());
-    }
-    failures
-}
-
-fn interface_has_address(interface: &str, address: &str) -> Result<bool, SdkError> {
-    let output = command_output("ip", &["-o", "addr", "show", "dev", interface])?;
-    if !output.status.success() {
-        return Ok(false);
-    }
-    Ok(String::from_utf8_lossy(&output.stdout)
-        .split_whitespace()
-        .any(|field| field == address))
-}
-
-fn route_with_device(route: &[String], current_device: &str, replacement: &str) -> Vec<String> {
-    let (family, mut index) = match route.first().map(String::as_str) {
-        Some("-4") => (Some("-4"), 1),
-        Some("-6") => (Some("-6"), 1),
-        _ => (None, 0),
-    };
-    let mut arguments = Vec::new();
-    if let Some(family) = family {
-        arguments.push(family.to_owned());
-    }
-    arguments.push("route".to_owned());
-    arguments.push("replace".to_owned());
-    while index < route.len() {
-        if route[index] == "dev"
-            && route
-                .get(index + 1)
-                .is_some_and(|device| device == current_device)
-        {
-            arguments.push("dev".to_owned());
-            arguments.push(replacement.to_owned());
-            index += 2;
-        } else {
-            arguments.push(route[index].clone());
-            index += 1;
-        }
-    }
-    arguments
+fn private_guest_network(guest: Ipv4Addr) -> Ipv4Addr {
+    Ipv4Addr::from(u32::from(guest) & !3)
 }
 
 fn live_ipv4_addresses() -> Result<Vec<(String, IpAddr, String)>, SdkError> {
@@ -921,18 +794,14 @@ fn live_ipv4_addresses() -> Result<Vec<(String, IpAddr, String)>, SdkError> {
 
 fn cleanup_host_only_attempt(
     tap: &str,
+    private_network: Ipv4Addr,
     applied: &[NetworkResource],
     forwarding_was_enabled: bool,
-    nat_table_existed: bool,
-    nat_chain_existed: bool,
 ) -> Vec<String> {
     let mut failures = Vec::new();
-    if applied.contains(&NetworkResource::Nat)
-        && let Err(error) = run_nft_delete(tap)
+    if applied.contains(&NetworkResource::IptablesNat)
+        && let Err(error) = delete_iptables_spec(&host_only_nat_spec(tap, private_network))
     {
-        failures.push(error.to_string());
-    }
-    if let Err(error) = cleanup_created_nat_container(nat_table_existed, nat_chain_existed) {
         failures.push(error.to_string());
     }
     if applied.contains(&NetworkResource::Tap)
@@ -952,19 +821,15 @@ fn cleanup_host_only_attempt(
 fn cleanup_reconciled_host_only(
     tap: &str,
     gateway: Ipv4Addr,
+    private_network: Ipv4Addr,
     tap_existed: bool,
     applied: &[NetworkResource],
     forwarding_was_enabled: bool,
-    nat_table_existed: bool,
-    nat_chain_existed: bool,
 ) -> Vec<String> {
     let mut failures = Vec::new();
-    if applied.contains(&NetworkResource::Nat)
-        && let Err(error) = run_nft_delete(tap)
+    if applied.contains(&NetworkResource::IptablesNat)
+        && let Err(error) = delete_iptables_spec(&host_only_nat_spec(tap, private_network))
     {
-        failures.push(error.to_string());
-    }
-    if let Err(error) = cleanup_created_nat_container(nat_table_existed, nat_chain_existed) {
         failures.push(error.to_string());
     }
     if applied.contains(&NetworkResource::TapAddress)
@@ -987,26 +852,30 @@ fn cleanup_reconciled_host_only(
     failures
 }
 
-fn cleanup_created_nat_container(table_existed: bool, chain_existed: bool) -> Result<(), SdkError> {
-    if table_existed && chain_existed {
-        return Ok(());
-    }
-    if !nft_table_exists()? {
-        return Ok(());
-    }
-    if !chain_existed && nft_chain_exists()? {
-        if !nft_chain_has_rules()? {
-            run_command(
-                "nft",
-                &["delete", "chain", "ip", "taumaru_microvm", "postrouting"],
-            )?;
-        } else {
-            return Ok(());
-        }
-    }
-    if !table_existed && !nft_chain_exists()? && nft_table_has_no_chains()? {
-        run_command("nft", &["delete", "table", "ip", "taumaru_microvm"])?;
-    }
+fn host_only_nat_spec(tap: &str, private_network: Ipv4Addr) -> Vec<String> {
+    vec![
+        "POSTROUTING".to_owned(),
+        "-s".to_owned(),
+        format!("{private_network}/30"),
+        "!".to_owned(),
+        "-o".to_owned(),
+        tap.to_owned(),
+        "-j".to_owned(),
+        "MASQUERADE".to_owned(),
+        "-m".to_owned(),
+        "comment".to_owned(),
+        "--comment".to_owned(),
+        iptables_comment(tap, "nat"),
+    ]
+}
+
+fn ensure_iptables_host_only(
+    tap: &str,
+    private_network: Ipv4Addr,
+    applied: &mut Vec<NetworkResource>,
+) -> Result<(), SdkError> {
+    run_iptables_spec(&host_only_nat_spec(tap, private_network))?;
+    applied.push(NetworkResource::IptablesNat);
     Ok(())
 }
 
@@ -1022,14 +891,6 @@ pub(crate) fn guest_mac(vm_name: &str) -> String {
     let digest = Sha256::digest(vm_name.as_bytes());
     format!(
         "02:fc:{:02x}:{:02x}:{:02x}:{:02x}",
-        digest[0], digest[1], digest[2], digest[3]
-    )
-}
-
-fn bridge_name(uplink: &str) -> String {
-    let digest = Sha256::digest(uplink.as_bytes());
-    format!(
-        "tb-{:02x}{:02x}{:02x}{:02x}",
         digest[0], digest[1], digest[2], digest[3]
     )
 }
@@ -1083,6 +944,285 @@ fn detect_default_uplink() -> Result<String, SdkError> {
     Ok((*uplink).to_owned())
 }
 
+fn detect_uplink_identity() -> Result<UplinkIdentity, SdkError> {
+    let uplink = detect_default_uplink()?;
+    let output = command_output("ip", &["-o", "-4", "addr", "show", "dev", &uplink])?;
+    if !output.status.success() {
+        return Err(host_command_error(
+            "ip",
+            &["-o", "-4", "addr", "show", "dev", &uplink],
+            &output,
+        ));
+    }
+    let mut cidr = None;
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let fields = line.split_whitespace().collect::<Vec<_>>();
+        let Some(index) = fields.iter().position(|field| *field == "inet") else {
+            continue;
+        };
+        let Some(spec) = fields.get(index + 1) else {
+            continue;
+        };
+        if spec.contains("/scope link") || *spec == "127.0.0.1/8" {
+            continue;
+        }
+        if let Some((address, prefix)) = spec.split_once('/')
+            && let (Ok(address), Ok(prefix)) = (address.parse::<Ipv4Addr>(), prefix.parse::<u8>())
+            && !address.is_loopback()
+            && !address.is_link_local()
+        {
+            cidr = Some((address, prefix, format!("{address}/{prefix}")));
+            break;
+        }
+    }
+    let Some((address, prefix_length, cidr)) = cidr else {
+        return Err(SdkError::Network {
+            mode: NetworkMode::Lan.to_string(),
+            operation: "detect uplink address".to_owned(),
+            resource: uplink.clone(),
+            reason: "the uplink has no global IPv4 address".to_owned(),
+        });
+    };
+    let gateway = default_gateway_for_uplink(&uplink)?;
+    Ok(UplinkIdentity {
+        interface: uplink,
+        address,
+        prefix_length,
+        gateway,
+        cidr,
+    })
+}
+
+fn default_gateway_for_uplink(uplink: &str) -> Result<Option<Ipv4Addr>, SdkError> {
+    let output = command_output("ip", &["-4", "route", "show", "default", "dev", uplink])?;
+    if !output.status.success() {
+        return Err(host_command_error(
+            "ip",
+            &["-4", "route", "show", "default", "dev", uplink],
+            &output,
+        ));
+    }
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let fields = line.split_whitespace().collect::<Vec<_>>();
+        if let Some(index) = fields.iter().position(|field| *field == "via")
+            && let Some(gateway) = fields.get(index + 1)
+            && let Ok(gateway) = gateway.parse::<Ipv4Addr>()
+        {
+            return Ok(Some(gateway));
+        }
+    }
+    Ok(None)
+}
+
+fn select_lan_offer(
+    uplink: &UplinkIdentity,
+    lan_override: Option<Ipv4Addr>,
+    previous: Option<Ipv4Addr>,
+    used_addresses: &[(String, IpAddr, String)],
+) -> Result<LanAddressOffer, SdkError> {
+    use crate::ports::network::LanOfferSource;
+
+    let (network, prefix) = parse_uplink_cidr(&uplink.cidr)?;
+    let host = uplink.address;
+    let gateway = uplink.gateway;
+    let check = |candidate: Ipv4Addr| -> Result<(), SdkError> {
+        validate_lan_candidate(candidate, network, prefix, host, gateway)?;
+        if lan_address_in_use(candidate, used_addresses) {
+            return Err(SdkError::Network {
+                mode: NetworkMode::Lan.to_string(),
+                operation: "allocate LAN address".to_owned(),
+                resource: candidate.to_string(),
+                reason: "the LAN address is already used by another VM".to_owned(),
+            });
+        }
+        probe_lan_candidate(&uplink.interface, candidate)?;
+        Ok(())
+    };
+    if let Some(candidate) = lan_override {
+        check(candidate)?;
+        return Ok(LanAddressOffer {
+            address: candidate,
+            source: LanOfferSource::ExplicitOverride,
+            uplink_cidr: uplink.cidr.clone(),
+        });
+    }
+    if let Some(candidate) = previous
+        && lan_candidate_in_subnet(candidate, network, prefix)
+        && !lan_address_in_use(candidate, used_addresses)
+        && probe_lan_candidate(&uplink.interface, candidate).is_ok()
+    {
+        return Ok(LanAddressOffer {
+            address: candidate,
+            source: LanOfferSource::PreviousAssignment,
+            uplink_cidr: uplink.cidr.clone(),
+        });
+    }
+    for candidate in automatic_lan_candidates(network, prefix, host, gateway) {
+        if lan_address_in_use(candidate, used_addresses) {
+            continue;
+        }
+        if probe_lan_candidate(&uplink.interface, candidate).is_ok() {
+            return Ok(LanAddressOffer {
+                address: candidate,
+                source: LanOfferSource::AutomaticSearch,
+                uplink_cidr: uplink.cidr.clone(),
+            });
+        }
+    }
+    Err(SdkError::Network {
+        mode: NetworkMode::Lan.to_string(),
+        operation: "allocate LAN address".to_owned(),
+        resource: uplink.cidr.clone(),
+        reason: "no apparently free LAN address exists in the uplink subnet".to_owned(),
+    })
+}
+
+fn parse_uplink_cidr(cidr: &str) -> Result<(u32, u8), SdkError> {
+    let Some((address, prefix)) = cidr.split_once('/') else {
+        return Err(SdkError::Network {
+            mode: NetworkMode::Lan.to_string(),
+            operation: "parse uplink subnet".to_owned(),
+            resource: cidr.to_owned(),
+            reason: "the uplink CIDR is not valid".to_owned(),
+        });
+    };
+    let address = address.parse::<Ipv4Addr>().map_err(|_| SdkError::Network {
+        mode: NetworkMode::Lan.to_string(),
+        operation: "parse uplink subnet".to_owned(),
+        resource: cidr.to_owned(),
+        reason: "the uplink address is not valid IPv4".to_owned(),
+    })?;
+    let prefix = prefix.parse::<u8>().map_err(|_| SdkError::Network {
+        mode: NetworkMode::Lan.to_string(),
+        operation: "parse uplink subnet".to_owned(),
+        resource: cidr.to_owned(),
+        reason: "the uplink prefix is not valid".to_owned(),
+    })?;
+    if prefix > 30 {
+        return Err(SdkError::Network {
+            mode: NetworkMode::Lan.to_string(),
+            operation: "parse uplink subnet".to_owned(),
+            resource: cidr.to_owned(),
+            reason: "the uplink subnet leaves no usable host address".to_owned(),
+        });
+    }
+    let mask = if prefix == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix)
+    };
+    Ok((u32::from(address) & mask, prefix))
+}
+
+fn lan_candidate_in_subnet(candidate: Ipv4Addr, network: u32, prefix: u8) -> bool {
+    let mask = if prefix == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix)
+    };
+    (u32::from(candidate) & mask) == network
+}
+
+fn validate_lan_candidate(
+    candidate: Ipv4Addr,
+    network: u32,
+    prefix: u8,
+    host: Ipv4Addr,
+    gateway: Option<Ipv4Addr>,
+) -> Result<(), SdkError> {
+    let mask = if prefix == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix)
+    };
+    let value = u32::from(candidate);
+    let broadcast = network | !mask;
+    if (value & mask) != network
+        || value == network
+        || value == broadcast
+        || candidate == host
+        || Some(candidate) == gateway
+    {
+        return Err(SdkError::Network {
+            mode: NetworkMode::Lan.to_string(),
+            operation: "validate LAN address".to_owned(),
+            resource: candidate.to_string(),
+            reason: "the LAN address is outside the uplink subnet or reserved".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn lan_address_in_use(candidate: Ipv4Addr, used_addresses: &[(String, IpAddr, String)]) -> bool {
+    used_addresses.iter().any(|(_, address, _)| match address {
+        IpAddr::V4(value) => *value == candidate,
+        _ => false,
+    })
+}
+
+fn automatic_lan_candidates(
+    network: u32,
+    prefix: u8,
+    host: Ipv4Addr,
+    gateway: Option<Ipv4Addr>,
+) -> Vec<Ipv4Addr> {
+    let mask = if prefix == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix)
+    };
+    let broadcast = network | !mask;
+    let host_value = u32::from(host);
+    let gateway_value = gateway.map(u32::from);
+    let mut candidates = Vec::new();
+    let mut value = broadcast.saturating_sub(1);
+    let low = network.saturating_add(2);
+    let stop = broadcast.saturating_sub(200).max(low);
+    while value >= low && value >= stop {
+        if value != host_value && Some(value) != gateway_value {
+            candidates.push(Ipv4Addr::from(value));
+        }
+        if value == low {
+            break;
+        }
+        value -= 1;
+    }
+    candidates
+}
+
+fn probe_lan_candidate(interface: &str, candidate: Ipv4Addr) -> Result<(), SdkError> {
+    let address = candidate.to_string();
+    let arping = command_output(
+        "arping",
+        &["-D", "-I", interface, "-c", "2", "-w", "2", &address],
+    );
+    match arping {
+        Ok(output) if output.status.success() => return Ok(()),
+        Ok(output) => {
+            let stderr = command_stderr(&output);
+            if !is_privilege_denied(&stderr) && !stderr.contains("not found") {
+                return Err(SdkError::Network {
+                    mode: NetworkMode::Lan.to_string(),
+                    operation: "probe LAN address".to_owned(),
+                    resource: address,
+                    reason: "the LAN address appears to be in use".to_owned(),
+                });
+            }
+        }
+        Err(_) => {}
+    }
+    let ping = command_output("ping", &["-c", "1", "-W", "1", &address])?;
+    if ping.status.success() {
+        return Err(SdkError::Network {
+            mode: NetworkMode::Lan.to_string(),
+            operation: "probe LAN address".to_owned(),
+            resource: address,
+            reason: "the LAN address appears to be in use".to_owned(),
+        });
+    }
+    Ok(())
+}
+
 fn ensure_tap(
     tap: &str,
     applied: &mut Vec<NetworkResource>,
@@ -1133,111 +1273,356 @@ fn forwarding_enabled() -> Result<bool, SdkError> {
     Ok(String::from_utf8_lossy(&output.stdout).trim() == "1")
 }
 
-fn ensure_nat(tap: &str, applied: &mut Vec<NetworkResource>) -> Result<(), SdkError> {
-    let table_exists = nft_table_exists()?;
-    if !table_exists {
-        run_command("nft", &["add", "table", "ip", "taumaru_microvm"])?;
-        run_command(
-            "nft",
-            &[
-                "add",
-                "chain",
-                "ip",
-                "taumaru_microvm",
-                "postrouting",
-                "{",
-                "type",
-                "nat",
-                "hook",
-                "postrouting",
-                "priority",
-                "100",
-                ";",
-                "}",
-            ],
-        )?;
-    } else if !nft_chain_exists()? {
-        run_command(
-            "nft",
-            &[
-                "add",
-                "chain",
-                "ip",
-                "taumaru_microvm",
-                "postrouting",
-                "{",
-                "type",
-                "nat",
-                "hook",
-                "postrouting",
-                "priority",
-                "100",
-                ";",
-                "}",
-            ],
-        )?;
+fn proxy_arp_enabled(uplink: &str) -> Result<bool, SdkError> {
+    let key = format!("net.ipv4.conf.{uplink}.proxy_arp");
+    let output = command_output("sysctl", &["-n", &key])?;
+    if !output.status.success() {
+        return Err(host_command_error("sysctl", &["-n", &key], &output));
     }
-    let comment = format!("comment \"{SDK_OWNERSHIP}:{tap}\"");
-    run_command(
-        "nft",
-        &[
-            "add",
-            "rule",
-            "ip",
-            "taumaru_microvm",
-            "postrouting",
-            "oifname",
-            "!=",
-            tap,
-            "ip",
-            "saddr",
-            "172.30.0.0/16",
-            "masquerade",
-            &comment,
-        ],
-    )?;
-    applied.push(NetworkResource::Nat);
-    Ok(())
+    Ok(String::from_utf8_lossy(&output.stdout).trim() == "1")
 }
 
-fn ensure_bridge(bridge: &str, applied: &mut Vec<NetworkResource>) -> Result<(), SdkError> {
-    if link_exists(bridge)? {
-        if !link_is_bridge(bridge)? {
-            return Err(SdkError::Network {
-                mode: NetworkMode::Lan.to_string(),
-                operation: "claim managed bridge".to_owned(),
-                resource: bridge.to_owned(),
-                reason: "an existing non-bridge interface uses the SDK-managed name".to_owned(),
-            });
-        }
-    } else {
-        run_ip(&["link", "add", "name", bridge, "type", "bridge"])?;
-        applied.push(NetworkResource::Bridge);
-        run_ip(&["link", "set", "dev", bridge, "up"])?;
+fn ensure_proxy_arp(uplink: &str, applied: &mut Vec<NetworkResource>) -> Result<(), SdkError> {
+    if !proxy_arp_enabled(uplink)? {
+        let key = format!("net.ipv4.conf.{uplink}.proxy_arp=1");
+        run_command("sysctl", &["-w", &key])?;
+        applied.push(NetworkResource::Forwarding);
     }
     Ok(())
 }
 
-fn ensure_bridge_attachment(
-    member: &str,
-    bridge: &str,
-    resource_kind: NetworkResource,
+fn ensure_routed_host(
+    uplink: &UplinkIdentity,
+    tap: &str,
+    lan: Ipv4Addr,
+    gateway: Ipv4Addr,
     applied: &mut Vec<NetworkResource>,
 ) -> Result<(), SdkError> {
-    if let Some(current_master) = link_master(member)? {
-        if current_master == bridge {
-            return Ok(());
-        }
-        return Err(SdkError::Network {
-            mode: NetworkMode::Lan.to_string(),
-            operation: "claim bridge attachment".to_owned(),
-            resource: member.to_owned(),
-            reason: format!("the interface is already attached to foreign bridge {current_master}"),
-        });
-    }
-    run_ip(&["link", "set", "dev", member, "master", bridge])?;
-    applied.push(resource_kind);
+    run_command("ip", &["-4", "addr", "flush", "dev", tap])?;
+    run_ip(&["addr", "add", &format!("{gateway}/30"), "dev", tap])?;
+    applied.push(NetworkResource::TapAddress);
+    run_ip(&["route", "replace", &format!("{lan}/32"), "dev", tap])?;
+    applied.push(NetworkResource::HostRoute);
+    run_ip(&[
+        "neigh",
+        "replace",
+        "proxy",
+        &lan.to_string(),
+        "dev",
+        &uplink.interface,
+    ])?;
+    applied.push(NetworkResource::ProxyArpEntry);
     Ok(())
+}
+
+fn iptables_comment(tap: &str, scope: &str) -> String {
+    format!("{SDK_OWNERSHIP}:{tap}:{scope}")
+}
+
+fn iptables_rule_exists(spec: &[&str]) -> Result<bool, SdkError> {
+    let mut arguments = vec!["-C"];
+    arguments.extend(spec.iter().copied());
+    let output = command_output("iptables", &arguments)?;
+    if output.status.success() {
+        return Ok(true);
+    }
+    let stderr = command_stderr(&output);
+    if stderr.contains("No chain/target/match by that name")
+        || stderr.contains("Bad rule")
+        || stderr.contains("No such")
+    {
+        return Ok(false);
+    }
+    Err(host_command_error("iptables", &arguments, &output))
+}
+
+fn iptables_add_rule(spec: &[&str]) -> Result<(), SdkError> {
+    if iptables_rule_exists(spec)? {
+        return Ok(());
+    }
+    let mut arguments = vec!["-A"];
+    arguments.extend(spec.iter().copied());
+    run_command("iptables", &arguments)?;
+    Ok(())
+}
+
+fn iptables_delete_rule(spec: &[&str]) -> Result<(), SdkError> {
+    if !iptables_rule_exists(spec)? {
+        return Ok(());
+    }
+    let mut arguments = vec!["-D"];
+    arguments.extend(spec.iter().copied());
+    run_command("iptables", &arguments)?;
+    Ok(())
+}
+
+fn routed_forward_specs(
+    uplink: &str,
+    tap: &str,
+    private_guest: Ipv4Addr,
+    lan: Ipv4Addr,
+) -> Vec<Vec<String>> {
+    vec![
+        vec![
+            "FORWARD".to_owned(),
+            "-i".to_owned(),
+            tap.to_owned(),
+            "-o".to_owned(),
+            uplink.to_owned(),
+            "-j".to_owned(),
+            "ACCEPT".to_owned(),
+            "-m".to_owned(),
+            "comment".to_owned(),
+            "--comment".to_owned(),
+            iptables_comment(tap, "forward-out"),
+        ],
+        vec![
+            "FORWARD".to_owned(),
+            "-i".to_owned(),
+            uplink.to_owned(),
+            "-o".to_owned(),
+            tap.to_owned(),
+            "-d".to_owned(),
+            format!("{private_guest}/32"),
+            "-m".to_owned(),
+            "conntrack".to_owned(),
+            "--ctstate".to_owned(),
+            "RELATED,ESTABLISHED".to_owned(),
+            "-j".to_owned(),
+            "ACCEPT".to_owned(),
+            "-m".to_owned(),
+            "comment".to_owned(),
+            "--comment".to_owned(),
+            iptables_comment(tap, "forward-in-private"),
+        ],
+        vec![
+            "FORWARD".to_owned(),
+            "-i".to_owned(),
+            uplink.to_owned(),
+            "-o".to_owned(),
+            tap.to_owned(),
+            "-d".to_owned(),
+            format!("{lan}/32"),
+            "-j".to_owned(),
+            "ACCEPT".to_owned(),
+            "-m".to_owned(),
+            "comment".to_owned(),
+            "--comment".to_owned(),
+            iptables_comment(tap, "forward-in-lan"),
+        ],
+    ]
+}
+
+fn routed_nat_spec(uplink: &str, tap: &str, private_network: Ipv4Addr) -> Vec<String> {
+    vec![
+        "POSTROUTING".to_owned(),
+        "-s".to_owned(),
+        format!("{private_network}/30"),
+        "-o".to_owned(),
+        uplink.to_owned(),
+        "-j".to_owned(),
+        "MASQUERADE".to_owned(),
+        "-m".to_owned(),
+        "comment".to_owned(),
+        "--comment".to_owned(),
+        iptables_comment(tap, "nat"),
+    ]
+}
+
+fn run_iptables_spec(spec: &[String]) -> Result<(), SdkError> {
+    let arguments = spec.iter().map(String::as_str).collect::<Vec<_>>();
+    if arguments.first() == Some(&"POSTROUTING") {
+        let mut with_table = vec!["-t", "nat", "-A"];
+        with_table.extend(arguments.iter().copied());
+        run_command("iptables", &with_table)?;
+    } else {
+        iptables_add_rule(&arguments)?;
+    }
+    Ok(())
+}
+
+fn delete_iptables_spec(spec: &[String]) -> Result<(), SdkError> {
+    let arguments = spec.iter().map(String::as_str).collect::<Vec<_>>();
+    if arguments.first() == Some(&"POSTROUTING") {
+        let mut with_table = vec!["-t", "nat", "-D"];
+        with_table.extend(arguments.iter().copied());
+        run_command("iptables", &with_table)?;
+    } else {
+        iptables_delete_rule(&arguments)?;
+    }
+    Ok(())
+}
+
+fn ensure_iptables_routed(
+    uplink: &str,
+    tap: &str,
+    private_network: Ipv4Addr,
+    private_guest: Ipv4Addr,
+    lan: Ipv4Addr,
+    applied: &mut Vec<NetworkResource>,
+) -> Result<(), SdkError> {
+    for spec in routed_forward_specs(uplink, tap, private_guest, lan) {
+        run_iptables_spec(&spec)?;
+        applied.push(NetworkResource::ForwardRule);
+    }
+    run_iptables_spec(&routed_nat_spec(uplink, tap, private_network))?;
+    applied.push(NetworkResource::IptablesNat);
+    Ok(())
+}
+
+struct RoutedCleanup<'a> {
+    uplink: &'a str,
+    tap: &'a str,
+    lan: Ipv4Addr,
+    private_network: Ipv4Addr,
+    private_guest: Ipv4Addr,
+    applied: &'a [NetworkResource],
+    forwarding_was_enabled: bool,
+    proxy_was_enabled: bool,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cleanup_routed_attempt(
+    uplink: &str,
+    tap: &str,
+    lan: Ipv4Addr,
+    private_network: Ipv4Addr,
+    private_guest: Ipv4Addr,
+    applied: &[NetworkResource],
+    forwarding_was_enabled: bool,
+    proxy_was_enabled: bool,
+) -> Vec<String> {
+    cleanup_routed(&RoutedCleanup {
+        uplink,
+        tap,
+        lan,
+        private_network,
+        private_guest,
+        applied,
+        forwarding_was_enabled,
+        proxy_was_enabled,
+    })
+}
+
+fn cleanup_routed(state: &RoutedCleanup<'_>) -> Vec<String> {
+    let mut failures = Vec::new();
+    let rules_owned = state.applied.contains(&NetworkResource::IptablesNat)
+        || state.applied.contains(&NetworkResource::ForwardRule);
+    if rules_owned
+        && let Err(error) = cleanup_routed_rules(
+            state.uplink,
+            state.tap,
+            state.lan,
+            state.private_network,
+            state.private_guest,
+        )
+    {
+        failures.push(error.to_string());
+    }
+    if state.applied.contains(&NetworkResource::ProxyArpEntry)
+        && let Err(error) = run_ip(&[
+            "neigh",
+            "del",
+            "proxy",
+            &state.lan.to_string(),
+            "dev",
+            state.uplink,
+        ])
+    {
+        failures.push(error.to_string());
+    }
+    if state.applied.contains(&NetworkResource::HostRoute)
+        && let Err(error) = run_ip(&[
+            "route",
+            "del",
+            &format!("{}/32", state.lan),
+            "dev",
+            state.tap,
+        ])
+    {
+        failures.push(error.to_string());
+    }
+    if state.applied.contains(&NetworkResource::Tap)
+        && let Err(error) = delete_link_if_present(state.tap)
+    {
+        failures.push(error.to_string());
+    }
+    if state.applied.contains(&NetworkResource::Forwarding)
+        && !state.forwarding_was_enabled
+        && let Err(error) = run_command("sysctl", &["-w", "net.ipv4.ip_forward=0"])
+    {
+        failures.push(error.to_string());
+    }
+    if !state.proxy_was_enabled
+        && state.applied.contains(&NetworkResource::Forwarding)
+        && let Err(error) = run_command(
+            "sysctl",
+            &[&format!("net.ipv4.conf.{}.proxy_arp=0", state.uplink)],
+        )
+    {
+        failures.push(error.to_string());
+    }
+    failures
+}
+
+fn cleanup_routed_rules(
+    uplink: &str,
+    tap: &str,
+    lan: Ipv4Addr,
+    private_network: Ipv4Addr,
+    private_guest: Ipv4Addr,
+) -> Result<(), SdkError> {
+    for spec in routed_forward_specs(uplink, tap, private_guest, lan) {
+        delete_iptables_spec(&spec)?;
+    }
+    delete_iptables_spec(&routed_nat_spec(uplink, tap, private_network))?;
+    Ok(())
+}
+
+fn apply_guest_routed_setup(
+    private_key_path: &std::path::Path,
+    private_address: Ipv4Addr,
+    lan_address: Ipv4Addr,
+    gateway: Ipv4Addr,
+) -> Result<(), SdkError> {
+    let target = private_address.to_string();
+    let script = format!(
+        "set -e\nip link set {GUEST_INTERFACE} up\nip addr replace {private_address}/30 dev {GUEST_INTERFACE}\nip addr replace {lan_address}/32 dev {GUEST_INTERFACE}\nip route replace default via {gateway} dev {GUEST_INTERFACE} src {private_address}\ncat > /etc/resolv.conf <<'DNS'\nnameserver 1.1.1.1\nnameserver 8.8.8.8\noptions single-request-reopen\nDNS\n"
+    );
+    let output = Command::new("ssh")
+        .args([
+            "-i",
+            &private_key_path.display().to_string(),
+            "-o",
+            "StrictHostKeyChecking=no",
+            "-o",
+            "UserKnownHostsFile=/dev/null",
+            "-o",
+            "ConnectTimeout=2",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "LogLevel=ERROR",
+            &format!("root@{target}"),
+            &script,
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|error| SdkError::HostCommand {
+            program: "ssh".to_owned(),
+            reason: error.to_string(),
+        })?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(host_command_error(
+            "ssh",
+            &["guest", "routed", "setup"],
+            &output,
+        ))
+    }
 }
 
 fn reconcile_tap(
@@ -1322,73 +1707,24 @@ fn reconcile_forwarding(
     Ok(())
 }
 
-fn reconcile_nat(
+fn reconcile_iptables_nat(
     tap: &str,
+    private_network: Ipv4Addr,
     applied: &mut Vec<NetworkResource>,
     skipped: &mut Vec<NetworkResource>,
 ) -> Result<(), SdkError> {
-    if nft_rule_exists(tap)? {
-        skipped.push(NetworkResource::Nat);
+    let spec = host_only_nat_spec(tap, private_network);
+    let arguments = spec.iter().map(String::as_str).collect::<Vec<_>>();
+    let mut with_table = vec!["-t", "nat", "-C"];
+    with_table.extend(arguments.iter().copied());
+    if iptables_rule_exists(&with_table)? {
+        skipped.push(NetworkResource::IptablesNat);
         Ok(())
     } else {
-        ensure_nat(tap, applied)
+        run_iptables_spec(&spec)?;
+        applied.push(NetworkResource::IptablesNat);
+        Ok(())
     }
-}
-
-fn reconcile_bridge(
-    bridge: &str,
-    applied: &mut Vec<NetworkResource>,
-    skipped: &mut Vec<NetworkResource>,
-) -> Result<(), SdkError> {
-    if link_exists(bridge)? {
-        if !link_is_bridge(bridge)? {
-            return Err(SdkError::Network {
-                mode: NetworkMode::Lan.to_string(),
-                operation: "validate persisted bridge".to_owned(),
-                resource: bridge.to_owned(),
-                reason: "the persisted bridge name is owned by a non-bridge device".to_owned(),
-            });
-        }
-        skipped.push(NetworkResource::Bridge);
-        return Ok(());
-    }
-    ensure_bridge(bridge, applied)
-}
-
-fn reconcile_attachment(
-    member: &str,
-    bridge: &str,
-    resource_kind: NetworkResource,
-    applied: &mut Vec<NetworkResource>,
-    skipped: &mut Vec<NetworkResource>,
-) -> Result<(), SdkError> {
-    let output = command_output("ip", &["link", "show", "dev", member])?;
-    if !output.status.success() {
-        return Err(SdkError::Network {
-            mode: NetworkMode::Lan.to_string(),
-            operation: "inspect bridge attachment".to_owned(),
-            resource: member.to_owned(),
-            reason: format!(
-                "interface does not exist (ip exited with {})",
-                output.status
-            ),
-        });
-    }
-    let bridge_marker = format!("master {bridge}");
-    if String::from_utf8_lossy(&output.stdout).contains(&bridge_marker) {
-        skipped.push(resource_kind);
-    } else if let Some(current_master) = extract_master(&String::from_utf8_lossy(&output.stdout)) {
-        return Err(SdkError::Network {
-            mode: NetworkMode::Lan.to_string(),
-            operation: "validate bridge attachment ownership".to_owned(),
-            resource: member.to_owned(),
-            reason: format!("the interface is already attached to foreign bridge {current_master}"),
-        });
-    } else {
-        run_ip(&["link", "set", "dev", member, "master", bridge])?;
-        applied.push(resource_kind);
-    }
-    Ok(())
 }
 
 fn link_exists(name: &str) -> Result<bool, SdkError> {
@@ -1400,7 +1736,7 @@ fn link_output(name: &str) -> Result<Option<String>, SdkError> {
         .args(["-d", "link", "show", "dev", name])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .output()
         .map_err(|error| SdkError::HostCommand {
             program: "ip".to_owned(),
@@ -1408,17 +1744,20 @@ fn link_output(name: &str) -> Result<Option<String>, SdkError> {
         })?;
     if output.status.success() {
         Ok(Some(String::from_utf8_lossy(&output.stdout).into_owned()))
-    } else {
+    } else if is_link_missing(&output) {
         Ok(None)
+    } else {
+        Err(host_command_error(
+            "ip",
+            &["-d", "link", "show", "dev", name],
+            &output,
+        ))
     }
 }
 
-fn link_is_bridge(name: &str) -> Result<bool, SdkError> {
-    Ok(link_output(name)?.is_some_and(|output| {
-        output
-            .lines()
-            .any(|line| line.trim_start().starts_with("bridge "))
-    }))
+fn is_link_missing(output: &std::process::Output) -> bool {
+    let stderr = command_stderr(output);
+    stderr.contains("does not exist") && !is_privilege_denied(&stderr)
 }
 
 fn link_is_tap(name: &str) -> Result<bool, SdkError> {
@@ -1428,18 +1767,6 @@ fn link_is_tap(name: &str) -> Result<bool, SdkError> {
             line.starts_with("tun ") || line.starts_with("tap ") || line.contains(" tun ")
         })
     }))
-}
-
-fn link_master(name: &str) -> Result<Option<String>, SdkError> {
-    Ok(link_output(name)?.and_then(|output| extract_master(&output)))
-}
-
-fn extract_master(output: &str) -> Option<String> {
-    let fields = output.split_whitespace().collect::<Vec<_>>();
-    fields
-        .windows(2)
-        .find(|pair| pair[0] == "master")
-        .map(|pair| pair[1].to_owned())
 }
 
 fn command_output(program: &str, arguments: &[&str]) -> Result<std::process::Output, SdkError> {
@@ -1514,11 +1841,6 @@ fn run_ip(arguments: &[&str]) -> Result<(), SdkError> {
     run_command("ip", arguments)
 }
 
-fn run_ip_owned(arguments: &[String]) -> Result<(), SdkError> {
-    let arguments = arguments.iter().map(String::as_str).collect::<Vec<_>>();
-    run_ip(&arguments)
-}
-
 fn delete_link_if_present(name: &str) -> Result<(), SdkError> {
     if !link_exists(name)? {
         return Ok(());
@@ -1530,141 +1852,13 @@ fn delete_link_if_present(name: &str) -> Result<(), SdkError> {
     }
 }
 
-fn run_nft_delete(tap: &str) -> Result<(), SdkError> {
-    let arguments = [
-        "-a",
-        "list",
-        "chain",
-        "ip",
-        "taumaru_microvm",
-        "postrouting",
-    ];
-    let output = command_output("nft", &arguments)?;
-    if !output.status.success() {
-        if is_nft_missing(&command_stderr(&output)) {
-            return Ok(());
-        }
-        return Err(host_command_error("nft", &arguments, &output));
-    }
-    let marker = format!("{SDK_OWNERSHIP}:{tap}");
-    let Some(handle) = String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .find_map(|line| {
-            if !line.contains(&marker) {
-                return None;
-            }
-            line.split("# handle ")
-                .nth(1)
-                .and_then(|value| value.split_whitespace().next())
-                .map(str::to_owned)
-        })
-    else {
-        return Ok(());
-    };
-    run_command(
-        "nft",
-        &[
-            "delete",
-            "rule",
-            "ip",
-            "taumaru_microvm",
-            "postrouting",
-            "handle",
-            &handle,
-        ],
-    )
-}
-fn nft_table_exists() -> Result<bool, SdkError> {
-    nft_object_exists(&["list", "table", "ip", "taumaru_microvm"])
-}
-
-fn nft_chain_exists() -> Result<bool, SdkError> {
-    nft_object_exists(&["list", "chain", "ip", "taumaru_microvm", "postrouting"])
-}
-
-fn nft_object_exists(arguments: &[&str]) -> Result<bool, SdkError> {
-    let output = command_output("nft", arguments)?;
-    if output.status.success() {
-        return Ok(true);
-    }
-    let stderr = command_stderr(&output);
-    if is_nft_missing(&stderr) {
-        return Ok(false);
-    }
-    Err(host_command_error("nft", arguments, &output))
-}
-
-fn is_nft_missing(stderr: &str) -> bool {
-    let normalized = stderr.to_lowercase();
-    normalized.contains("no such file or directory") && !is_privilege_denied(stderr)
-}
-
-fn nft_rule_exists(tap: &str) -> Result<bool, SdkError> {
-    let arguments = [
-        "-a",
-        "list",
-        "chain",
-        "ip",
-        "taumaru_microvm",
-        "postrouting",
-    ];
-    let output = command_output("nft", &arguments)?;
-    if output.status.success() {
-        return Ok(
-            String::from_utf8_lossy(&output.stdout).contains(&format!("{SDK_OWNERSHIP}:{tap}"))
-        );
-    }
-    let stderr = command_stderr(&output);
-    if is_nft_missing(&stderr) {
-        return Ok(false);
-    }
-    Err(host_command_error("nft", &arguments, &output))
-}
-
-fn nft_chain_has_rules() -> Result<bool, SdkError> {
-    let arguments = [
-        "-a",
-        "list",
-        "chain",
-        "ip",
-        "taumaru_microvm",
-        "postrouting",
-    ];
-    let output = command_output("nft", &arguments)?;
-    if output.status.success() {
-        return Ok(String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .any(|line| line.contains("# handle ")));
-    }
-    let stderr = command_stderr(&output);
-    if is_nft_missing(&stderr) {
-        return Ok(false);
-    }
-    Err(host_command_error("nft", &arguments, &output))
-}
-
-fn nft_table_has_no_chains() -> Result<bool, SdkError> {
-    let arguments = ["list", "table", "ip", "taumaru_microvm"];
-    let output = command_output("nft", &arguments)?;
-    if output.status.success() {
-        return Ok(!String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .any(|line| line.trim_start().starts_with("chain ")));
-    }
-    let stderr = command_stderr(&output);
-    if is_nft_missing(&stderr) {
-        return Ok(true);
-    }
-    Err(host_command_error("nft", &arguments, &output))
-}
-
 #[cfg(test)]
 mod tests {
     use std::net::{IpAddr, Ipv4Addr};
 
     use super::{
-        GUEST_INTERFACE, allocate_subnet, bridge_name, guest_mac, is_nft_missing,
-        is_privilege_denied, route_with_device, tap_name,
+        GUEST_INTERFACE, allocate_subnet, automatic_lan_candidates, guest_mac, is_privilege_denied,
+        parse_uplink_cidr, tap_name, validate_lan_candidate,
     };
 
     #[test]
@@ -1690,33 +1884,80 @@ mod tests {
         assert_eq!(tap_name("build_vm"), tap_name("build_vm"));
         assert_eq!(guest_mac("build_vm"), guest_mac("build_vm"));
         assert!(tap_name("build_vm").len() <= 15);
-        assert!(bridge_name("enp0s3").len() <= 15);
         assert!(guest_mac("build_vm").starts_with("02:fc:"));
     }
 
     #[test]
-    fn route_rewrite_preserves_the_ip_family() {
-        let route = vec![
-            "-6".to_owned(),
-            "default".to_owned(),
-            "via".to_owned(),
-            "2001:db8::1".to_owned(),
-            "dev".to_owned(),
-            "eth0".to_owned(),
-        ];
+    fn lan_candidates_prefer_the_upper_subnet_and_skip_reserved() {
+        let (network, prefix) = parse_uplink_cidr("192.168.3.12/24").expect("CIDR should parse");
+        let host = Ipv4Addr::new(192, 168, 3, 12);
+        let gateway = Ipv4Addr::new(192, 168, 3, 1);
+        let candidates = automatic_lan_candidates(network, prefix, host, Some(gateway));
 
-        assert_eq!(
-            route_with_device(&route, "eth0", "tb-bridge"),
-            vec![
-                "-6",
-                "route",
-                "replace",
-                "default",
-                "via",
-                "2001:db8::1",
-                "dev",
-                "tb-bridge"
-            ]
+        assert!(!candidates.is_empty());
+        assert_eq!(candidates[0], Ipv4Addr::new(192, 168, 3, 254));
+        assert!(!candidates.contains(&host));
+        assert!(!candidates.contains(&gateway));
+        assert!(!candidates.contains(&Ipv4Addr::new(192, 168, 3, 0)));
+        assert!(!candidates.contains(&Ipv4Addr::new(192, 168, 3, 255)));
+    }
+
+    #[test]
+    fn lan_override_validation_rejects_reserved_addresses() {
+        let (network, prefix) = parse_uplink_cidr("192.168.3.12/24").expect("CIDR should parse");
+        let host = Ipv4Addr::new(192, 168, 3, 12);
+        let gateway = Some(Ipv4Addr::new(192, 168, 3, 1));
+
+        assert!(
+            validate_lan_candidate(
+                Ipv4Addr::new(192, 168, 3, 50),
+                network,
+                prefix,
+                host,
+                gateway
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_lan_candidate(
+                Ipv4Addr::new(192, 168, 3, 0),
+                network,
+                prefix,
+                host,
+                gateway
+            )
+            .is_err()
+        );
+        assert!(
+            validate_lan_candidate(
+                Ipv4Addr::new(192, 168, 3, 255),
+                network,
+                prefix,
+                host,
+                gateway
+            )
+            .is_err()
+        );
+        assert!(validate_lan_candidate(host, network, prefix, host, gateway).is_err());
+        assert!(
+            validate_lan_candidate(
+                Ipv4Addr::new(192, 168, 3, 1),
+                network,
+                prefix,
+                host,
+                gateway
+            )
+            .is_err()
+        );
+        assert!(
+            validate_lan_candidate(
+                Ipv4Addr::new(192, 168, 4, 50),
+                network,
+                prefix,
+                host,
+                gateway
+            )
+            .is_err()
         );
     }
 
@@ -1730,11 +1971,8 @@ mod tests {
     }
 
     #[test]
-    fn nft_absence_requires_a_missing_object_without_denial() {
-        assert!(is_nft_missing("Error: No such file or directory"));
-        assert!(!is_nft_missing(
-            "Error: Operation not permitted (perhaps you must be root?)"
-        ));
+    fn iptables_comments_carry_sdk_ownership() {
+        assert!(super::iptables_comment("tm-test", "nat").starts_with("sdk:taumaru:tm-test"));
     }
 
     #[test]

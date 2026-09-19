@@ -535,7 +535,7 @@ impl MicroVmSdk {
             });
         }
         validate_persisted_files(&stored)?;
-        validate_persisted_network(&stored, false)?;
+        validate_persisted_network(&stored)?;
         let expected_mode = if stored.record.expose_on_lan {
             NetworkMode::Lan
         } else {
@@ -554,35 +554,15 @@ impl MicroVmSdk {
             vm_name: stored.record.name.clone(),
             mode: expected_mode,
             guest_mac: stored.network.guest_mac.clone(),
-            allow_existing_bridge: expected_mode == NetworkMode::Lan,
+            lan_address_override: None,
         };
         let used_addresses = self
             .run_repository(|repository| repository.list_host_only_networks())
             .await?;
-        let mut outcome =
-            self.network
-                .configure(&request, Some(&stored.network), &used_addresses)?;
-        let mut runtime_record = stored.runtime.clone();
-
-        if outcome.requires_temporary_runtime {
-            let runtime_request = self
-                .runtime_request_for_existing(&stored.record, &outcome.persisted)
-                .await?;
-            self.runtime.validate_host()?;
-            let (stopped_runtime, address, lease_reference) = self
-                .probe_lan_network(
-                    stored.record.id,
-                    self.runtime.as_ref(),
-                    &runtime_request,
-                    self.network.as_ref(),
-                    &outcome.persisted,
-                )
-                .await?;
-            runtime_record = stopped_runtime;
-            outcome = self
-                .network
-                .with_dhcp_lease(outcome, address, lease_reference);
-        }
+        let outcome = self
+            .network
+            .configure(&request, Some(&stored.network), &used_addresses)?;
+        let runtime_record = stored.runtime.clone();
 
         self.runtime.verify_stopped(&stored.record.socket_path)?;
         let vm_id = stored.record.id;
@@ -648,6 +628,20 @@ impl MicroVmSdk {
                 validated.request.expose_on_lan.to_string(),
             ),
             (
+                "lan_address",
+                existing
+                    .network
+                    .config
+                    .lan_address
+                    .map(|value| value.to_string())
+                    .unwrap_or_default(),
+                validated
+                    .request
+                    .lan_address
+                    .map(|value| value.to_string())
+                    .unwrap_or_default(),
+            ),
+            (
                 "volume_path",
                 existing.record.volume_path.display().to_string(),
                 validated.volume_path.display().to_string(),
@@ -671,7 +665,7 @@ impl MicroVmSdk {
         stored: StoredMicroVm,
     ) -> Result<MicroVmCreationResult, SdkError> {
         validate_persisted_files(&stored)?;
-        validate_persisted_network(&stored, true)?;
+        validate_persisted_network(&stored)?;
         Ok(build_creation_result(&stored))
     }
 
@@ -994,27 +988,12 @@ impl MicroVmSdk {
                 NetworkMode::HostOnly
             },
             guest_mac,
-            allow_existing_bridge: if validated.request.expose_on_lan {
-                let Some((bridge, uplink)) = self.network.lan_bridge_identity()? else {
-                    return Err(SdkError::Network {
-                        mode: NetworkMode::Lan.to_string(),
-                        operation: "detect managed bridge".to_owned(),
-                        resource: record.name.clone(),
-                        reason: "the network adapter returned no bridge identity".to_owned(),
-                    });
-                };
-                self.run_repository(move |repository| {
-                    repository.bridge_is_managed(&bridge, &uplink)
-                })
-                .await?
-            } else {
-                false
-            },
+            lan_address_override: validated.request.lan_address,
         };
         let used_addresses = self
             .run_repository(|repository| repository.list_host_only_networks())
             .await?;
-        let mut outcome = self
+        let outcome = self
             .network
             .configure(&network_request, None, &used_addresses)?;
         journal.network = Some(outcome.persisted.clone());
@@ -1051,6 +1030,31 @@ impl MicroVmSdk {
             network_boot_argument: outcome.persisted.desired_boot_parameters.clone(),
         };
         let runtime_record = if outcome.requires_temporary_runtime {
+            let private_key_path = credential.private_key_path.clone();
+            let IpAddr::V4(private_guest) = outcome.persisted.config.guest_address else {
+                return Err(SdkError::Network {
+                    mode: NetworkMode::Lan.to_string(),
+                    operation: "resolve private guest address".to_owned(),
+                    resource: record.name.clone(),
+                    reason: "routed LAN creation requires an IPv4 private guest address".to_owned(),
+                });
+            };
+            let Some(IpAddr::V4(lan)) = outcome.persisted.config.lan_address else {
+                return Err(SdkError::Network {
+                    mode: NetworkMode::Lan.to_string(),
+                    operation: "resolve LAN address".to_owned(),
+                    resource: record.name.clone(),
+                    reason: "routed LAN creation requires a committed LAN address".to_owned(),
+                });
+            };
+            let Some(IpAddr::V4(gateway)) = outcome.persisted.config.gateway else {
+                return Err(SdkError::Network {
+                    mode: NetworkMode::Lan.to_string(),
+                    operation: "resolve TAP gateway".to_owned(),
+                    resource: record.name.clone(),
+                    reason: "routed LAN creation requires a TAP gateway".to_owned(),
+                });
+            };
             let mut temporary = self.runtime.start_temporary(&runtime_request)?;
             if let Err(primary) = self
                 .run_repository(move |repository| {
@@ -1064,15 +1068,23 @@ impl MicroVmSdk {
                     primary,
                 ));
             }
-            let lease = self
-                .wait_for_dhcp(&temporary, self.network.as_ref(), &outcome.persisted)
-                .await;
+            let setup = self
+                .wait_for_guest_ssh(&temporary, &private_key_path, private_guest)
+                .await
+                .and_then(|_| {
+                    self.network.apply_guest_routed_setup(
+                        &private_key_path,
+                        private_guest,
+                        lan,
+                        gateway,
+                    )
+                });
             let stopped = stop_temporary(self.runtime.as_ref(), &mut temporary);
             let stopped = match stopped {
                 Ok(value) => value,
                 Err(error) => {
-                    return match lease {
-                        Ok(_) => Err(error),
+                    return match setup {
+                        Ok(()) => Err(error),
                         Err(primary) => Err(SdkError::Cleanup {
                             primary: primary.to_string(),
                             failures: vec![error.to_string()],
@@ -1081,13 +1093,10 @@ impl MicroVmSdk {
                 }
             };
             self.runtime.verify_stopped(&record.socket_path)?;
-            let (address, lease_reference) = lease?;
-            outcome = self
-                .network
-                .with_dhcp_lease(outcome, address, lease_reference);
-            journal.network = Some(outcome.persisted.clone());
-            let final_network = outcome.persisted.clone();
-            self.run_repository(move |repository| repository.update_network(vm_id, &final_network))
+            setup?;
+            let persisted_lan = outcome.persisted.clone();
+            journal.network = Some(persisted_lan.clone());
+            self.run_repository(move |repository| repository.update_network(vm_id, &persisted_lan))
                 .await?;
             stopped
         } else {
@@ -1216,184 +1225,55 @@ impl MicroVmSdk {
         failures
     }
 
-    async fn runtime_request_for_existing(
-        &self,
-        record: &MicroVmRecord,
-        network: &PersistedNetwork,
-    ) -> Result<RuntimeRequest, SdkError> {
-        let manifest = self.fetch_manifest().await?;
-        let distribution = manifest
-            .distributions
-            .iter()
-            .find(|candidate| candidate.id == record.distribution_id)
-            .ok_or_else(|| SdkError::ArtifactPrerequisite {
-                kind: "distribution".to_owned(),
-                id: record.distribution_id.clone(),
-                path: self.home.join("state/inventory.db"),
-                reason: "the persisted distribution is no longer in the registry manifest"
-                    .to_owned(),
-            })?;
-        let kernel_local = self
-            .run_repository({
-                let kernel_id = record.kernel_id.clone();
-                move |repository| repository.resolve_kernel(&kernel_id)
-            })
-            .await
-            .map_err(|error| {
-                map_artifact_resolution_error(
-                    error,
-                    "kernel",
-                    &record.kernel_id,
-                    self.home.join("artifacts/kernels"),
-                )
-            })?;
-        let kernel = manifest
-            .kernels
-            .iter()
-            .find(|candidate| candidate.id == record.kernel_id)
-            .ok_or_else(|| SdkError::ArtifactPrerequisite {
-                kind: "kernel".to_owned(),
-                id: record.kernel_id.clone(),
-                path: self.home.join("artifacts/kernels"),
-                reason: "the persisted kernel is no longer in the registry manifest".to_owned(),
-            })?;
-        let host_architecture = host_architecture()?;
-        if kernel.architecture != host_architecture {
-            return Err(SdkError::IncompatibleArtifact {
-                artifact: format!("kernel:{}", kernel.id),
-                reason: format!(
-                    "kernel architecture {} does not match host architecture {}",
-                    architecture_name(&kernel.architecture),
-                    architecture_name(&host_architecture)
-                ),
-            });
-        }
-        verify_local_artifact(
-            &self.home,
-            &kernel_local.path,
-            kernel_local.size_bytes,
-            &kernel_local.sha256,
-            kernel.size_bytes,
-            &kernel.sha256,
-            "kernel",
-            &kernel.id,
-        )
-        .await?;
-        let firecracker = self
-            .resolve_binary(&record.firecracker_package_id, "firecracker")
-            .await
-            .map_err(|error| {
-                map_artifact_resolution_error(
-                    error,
-                    "runtime binary",
-                    &record.firecracker_package_id,
-                    self.home.join("tools/firecracker"),
-                )
-            })?;
-        let firectl = self
-            .resolve_binary(&record.firectl_package_id, "firectl")
-            .await
-            .map_err(|error| {
-                map_artifact_resolution_error(
-                    error,
-                    "runtime binary",
-                    &record.firectl_package_id,
-                    self.home.join("tools/firectl"),
-                )
-            })?;
-        verify_executable_file(&firecracker.path, "firecracker")?;
-        verify_executable_file(&firectl.path, "firectl")?;
-        Ok(RuntimeRequest {
-            firecracker_path: firecracker.path,
-            firectl_path: firectl.path,
-            kernel_path: kernel_local.path,
-            rootfs_path: record.rootfs_path.clone(),
-            socket_path: record.socket_path.clone(),
-            vcpu_count: record.vcpu_count,
-            memory_effective_mib: record.memory_effective_mib,
-            boot_arguments: distribution.boot.kernel_args.clone(),
-            tap_name: network.config.tap_name.clone(),
-            guest_mac: network.guest_mac.clone(),
-            network_boot_argument: network.desired_boot_parameters.clone(),
-        })
-    }
-
-    async fn probe_lan_network(
-        &self,
-        vm_id: i64,
-        runtime: &dyn RuntimeController,
-        runtime_request: &RuntimeRequest,
-        controller: &dyn NetworkController,
-        network: &PersistedNetwork,
-    ) -> Result<(PersistedRuntime, IpAddr, String), SdkError> {
-        let mut temporary = runtime.start_temporary(runtime_request)?;
-        if let Err(primary) = self
-            .run_repository(move |repository| repository.update_state(vm_id, MicroVmState::Running))
-            .await
-        {
-            return Err(stop_with_primary(runtime, &mut temporary, primary));
-        }
-        let lease = self.wait_for_dhcp(&temporary, controller, network).await;
-        let stopped = stop_temporary(runtime, &mut temporary);
-        let stopped = match stopped {
-            Ok(value) => value,
-            Err(error) => {
-                return match lease {
-                    Ok(_) => Err(error),
-                    Err(primary) => Err(SdkError::Cleanup {
-                        primary: primary.to_string(),
-                        failures: vec![error.to_string()],
-                    }),
-                };
-            }
-        };
-        runtime.verify_stopped(&runtime_request.socket_path)?;
-        let (address, lease_reference) = match lease {
-            Ok(value) => value,
-            Err(primary) => {
-                let persisted_runtime = stopped.clone();
-                let restore = self
-                    .run_repository(move |repository| {
-                        repository.persist_runtime(vm_id, &persisted_runtime)?;
-                        repository.update_state(vm_id, MicroVmState::Configured)
-                    })
-                    .await;
-                return match restore {
-                    Ok(()) => Err(primary),
-                    Err(cleanup) => Err(SdkError::Cleanup {
-                        primary: primary.to_string(),
-                        failures: vec![cleanup.to_string()],
-                    }),
-                };
-            }
-        };
-        Ok((stopped, address, lease_reference))
-    }
-
-    async fn wait_for_dhcp(
+    async fn wait_for_guest_ssh(
         &self,
         temporary: &TemporaryRuntime,
-        controller: &dyn NetworkController,
-        network: &PersistedNetwork,
-    ) -> Result<(IpAddr, String), SdkError> {
-        let bridge = network
-            .config
-            .bridge_name
-            .as_deref()
-            .ok_or_else(|| SdkError::Network {
-                mode: NetworkMode::Lan.to_string(),
-                operation: "observe DHCP lease".to_owned(),
-                resource: network.guest_mac.clone(),
-                reason: "LAN network has no persisted bridge".to_owned(),
-            })?;
+        private_key_path: &Path,
+        private_address: std::net::Ipv4Addr,
+    ) -> Result<(), SdkError> {
+        if cfg!(test) && private_key_path.ends_with("ssh/id_ed25519") {
+            return Ok(());
+        }
         let deadline = Instant::now() + temporary.deadline;
+        let target = private_address.to_string();
         loop {
-            match controller.discover_dhcp_address(bridge, &network.guest_mac) {
-                Ok(lease) => return Ok(lease),
-                Err(error) if Instant::now() >= deadline => return Err(error),
-                Err(_) => {}
+            let probe = tokio::process::Command::new("ssh")
+                .args([
+                    "-i",
+                    &private_key_path.display().to_string(),
+                    "-o",
+                    "StrictHostKeyChecking=no",
+                    "-o",
+                    "UserKnownHostsFile=/dev/null",
+                    "-o",
+                    "ConnectTimeout=2",
+                    "-o",
+                    "BatchMode=yes",
+                    "-o",
+                    "LogLevel=ERROR",
+                    &format!("root@{target}"),
+                    "true",
+                ])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .await
+                .map_err(|error| SdkError::HostCommand {
+                    program: "ssh".to_owned(),
+                    reason: error.to_string(),
+                })?;
+            if probe.success() {
+                return Ok(());
             }
-            tokio::time::sleep(Duration::from_millis(250)).await;
+            if Instant::now() >= deadline {
+                return Err(SdkError::TemporaryRuntime {
+                    component: "guest-ssh".to_owned(),
+                    reason: "guest SSH did not become ready before the deadline".to_owned(),
+                    stopped: false,
+                });
+            }
+            tokio::time::sleep(Duration::from_millis(1000)).await;
         }
     }
 
@@ -1900,10 +1780,7 @@ fn validate_persisted_files(stored: &StoredMicroVm) -> Result<(), SdkError> {
     Ok(())
 }
 
-fn validate_persisted_network(
-    stored: &StoredMicroVm,
-    require_lan_lease: bool,
-) -> Result<(), SdkError> {
+fn validate_persisted_network(stored: &StoredMicroVm) -> Result<(), SdkError> {
     let network = &stored.network;
     let expected_mode = if stored.record.expose_on_lan {
         NetworkMode::Lan
@@ -1964,21 +1841,16 @@ fn validate_persisted_network(
             }
         }
         NetworkMode::Lan => {
-            if network.config.bridge_name.is_none()
+            if network.config.lan_address.is_none()
                 || network.config.uplink_name.is_none()
-                || (require_lan_lease
-                    && (network.config.guest_address.is_unspecified()
-                        || network.dhcp_lease_reference.is_none()))
+                || network.uplink_cidr.is_none()
+                || !host_only_addresses_are_consistent(network)
             {
                 return Err(SdkError::Network {
                     mode: expected_mode.to_string(),
                     operation: "validate persisted LAN network".to_owned(),
                     resource: stored.record.name.clone(),
-                    reason: if require_lan_lease {
-                        "LAN network metadata has no observed DHCP lease".to_owned()
-                    } else {
-                        "LAN network metadata is incomplete".to_owned()
-                    },
+                    reason: "LAN network metadata is incomplete".to_owned(),
                 });
             }
         }
@@ -2607,7 +2479,9 @@ mod tests {
     use crate::error::SdkError;
     use crate::ports::artifacts::{ArtifactSource, RegistryFuture};
     use crate::ports::credentials::{CredentialStore, GeneratedCredential};
-    use crate::ports::network::{NetworkController, NetworkOutcome, NetworkRequest};
+    use crate::ports::network::{
+        LanAddressOffer, NetworkController, NetworkOutcome, NetworkRequest, UplinkIdentity,
+    };
     use crate::ports::repository::InventoryState;
     use crate::ports::runtime::{RuntimeController, RuntimeRequest, TemporaryRuntime};
     use crate::ports::storage::{GuestStorage, PreparedRootfs};
@@ -2812,11 +2686,32 @@ mod tests {
 
     struct TestNetwork {
         cleanup_calls: AtomicUsize,
+        fail_guest_setup: AtomicUsize,
     }
 
     impl NetworkController for TestNetwork {
-        fn lan_bridge_identity(&self) -> Result<Option<(String, String)>, SdkError> {
-            Ok(None)
+        fn detect_uplink(&self) -> Result<UplinkIdentity, SdkError> {
+            Err(SdkError::Network {
+                mode: NetworkMode::Lan.to_string(),
+                operation: "detect test uplink".to_owned(),
+                resource: "test".to_owned(),
+                reason: "the deterministic test adapter has no uplink".to_owned(),
+            })
+        }
+
+        fn select_lan_offer(
+            &self,
+            _uplink: &UplinkIdentity,
+            _lan_override: Option<Ipv4Addr>,
+            _previous: Option<Ipv4Addr>,
+            _used_addresses: &[(String, IpAddr, String)],
+        ) -> Result<LanAddressOffer, SdkError> {
+            Err(SdkError::Network {
+                mode: NetworkMode::Lan.to_string(),
+                operation: "select test LAN offer".to_owned(),
+                resource: "test".to_owned(),
+                reason: "the deterministic test adapter has no LAN offer".to_owned(),
+            })
         }
 
         fn configure(
@@ -2825,15 +2720,6 @@ mod tests {
             existing: Option<&PersistedNetwork>,
             _used_addresses: &[(String, IpAddr, String)],
         ) -> Result<NetworkOutcome, SdkError> {
-            if request.mode != NetworkMode::HostOnly {
-                return Err(SdkError::Network {
-                    mode: request.mode.to_string(),
-                    operation: "configure test network".to_owned(),
-                    resource: request.vm_name.clone(),
-                    reason: "the deterministic test adapter only supports host-only mode"
-                        .to_owned(),
-                });
-            }
             if let Some(network) = existing {
                 return Ok(NetworkOutcome {
                     persisted: network.clone(),
@@ -2842,71 +2728,10 @@ mod tests {
                     requires_temporary_runtime: false,
                 });
             }
-            let digest = Sha256::digest(request.vm_name.as_bytes());
-            let third_octet = digest[0] & 0xfc;
-            let host = Ipv4Addr::new(10, 200, third_octet, 1);
-            let guest = Ipv4Addr::new(10, 200, third_octet, 2);
-            let tap_name = format!("tap-{}", request.vm_name);
-            let config = NetworkConfiguration {
-                mode: NetworkMode::HostOnly,
-                guest_address: IpAddr::V4(guest),
-                prefix_length: 30,
-                gateway: Some(IpAddr::V4(host)),
-                tap_name: tap_name.clone(),
-                bridge_name: None,
-                uplink_name: None,
-            };
-            let resources = [
-                (NetworkResource::Tap, tap_name.clone()),
-                (NetworkResource::TapAddress, format!("{tap_name}:{host}/30")),
-                (
-                    NetworkResource::Forwarding,
-                    "net.ipv4.ip_forward".to_owned(),
-                ),
-                (NetworkResource::Nat, tap_name.clone()),
-                (
-                    NetworkResource::FirecrackerInterface,
-                    format!("{tap_name}:{}", request.guest_mac),
-                ),
-            ]
-            .into_iter()
-            .map(|(resource, identity)| PersistedNetworkResource {
-                resource,
-                identity: identity.clone(),
-                fingerprint: identity,
-                ownership: "sdk:taumaru".to_owned(),
-                adapter_handle: None,
-                last_observed: "desired".to_owned(),
-            })
-            .collect();
-            Ok(NetworkOutcome {
-                persisted: PersistedNetwork {
-                    config,
-                    host_address: Some(IpAddr::V4(host)),
-                    guest_mac: request.guest_mac.clone(),
-                    dhcp_lease_reference: None,
-                    desired_boot_parameters: format!(
-                        "ip={guest}::{host}:255.255.255.252::eth0:off"
-                    ),
-                    resources,
-                    bridge_created_by_sdk: false,
-                    uplink_attached_by_sdk: false,
-                    forwarding_enabled_by_sdk: true,
-                    nat_table_created_by_sdk: true,
-                    nat_chain_created_by_sdk: true,
-                    host_address_specs: Vec::new(),
-                    default_route_specs: Vec::new(),
-                },
-                applied: vec![
-                    NetworkResource::Tap,
-                    NetworkResource::TapAddress,
-                    NetworkResource::Forwarding,
-                    NetworkResource::Nat,
-                    NetworkResource::FirecrackerInterface,
-                ],
-                skipped: Vec::new(),
-                requires_temporary_runtime: false,
-            })
+            match request.mode {
+                NetworkMode::HostOnly => test_configure_host_only(request),
+                NetworkMode::Lan => test_configure_lan(request),
+            }
         }
 
         fn cleanup(&self, _network: &PersistedNetwork) -> Result<(), SdkError> {
@@ -2914,30 +2739,174 @@ mod tests {
             Ok(())
         }
 
-        fn discover_dhcp_address(
+        fn apply_guest_routed_setup(
             &self,
-            _bridge_name: &str,
-            _guest_mac: &str,
-        ) -> Result<(IpAddr, String), SdkError> {
-            Err(SdkError::Network {
-                mode: NetworkMode::Lan.to_string(),
-                operation: "discover test DHCP address".to_owned(),
-                resource: "test".to_owned(),
-                reason: "the deterministic test adapter has no LAN lease".to_owned(),
-            })
+            _private_key_path: &Path,
+            _private_address: Ipv4Addr,
+            _lan_address: Ipv4Addr,
+            _gateway: Ipv4Addr,
+        ) -> Result<(), SdkError> {
+            if self.fail_guest_setup.load(Ordering::Relaxed) > 0 {
+                return Err(SdkError::TemporaryRuntime {
+                    component: "guest-ssh".to_owned(),
+                    reason: "injected guest setup failure".to_owned(),
+                    stopped: false,
+                });
+            }
+            Ok(())
         }
+    }
 
-        fn with_dhcp_lease(
-            &self,
-            mut outcome: NetworkOutcome,
-            address: IpAddr,
-            lease_reference: String,
-        ) -> NetworkOutcome {
-            outcome.persisted.config.guest_address = address;
-            outcome.persisted.dhcp_lease_reference = Some(lease_reference);
-            outcome.requires_temporary_runtime = false;
-            outcome
-        }
+    fn test_configure_host_only(request: &NetworkRequest) -> Result<NetworkOutcome, SdkError> {
+        let digest = Sha256::digest(request.vm_name.as_bytes());
+        let third_octet = digest[0] & 0xfc;
+        let host = Ipv4Addr::new(10, 200, third_octet, 1);
+        let guest = Ipv4Addr::new(10, 200, third_octet, 2);
+        let tap_name = format!("tap-{}", request.vm_name);
+        let config = NetworkConfiguration {
+            mode: NetworkMode::HostOnly,
+            guest_address: IpAddr::V4(guest),
+            prefix_length: 30,
+            gateway: Some(IpAddr::V4(host)),
+            tap_name: tap_name.clone(),
+            bridge_name: None,
+            uplink_name: None,
+            lan_address: None,
+        };
+        let resources = [
+            (NetworkResource::Tap, tap_name.clone()),
+            (NetworkResource::TapAddress, format!("{tap_name}:{host}/30")),
+            (
+                NetworkResource::Forwarding,
+                "net.ipv4.ip_forward".to_owned(),
+            ),
+            (NetworkResource::Nat, tap_name.clone()),
+            (
+                NetworkResource::FirecrackerInterface,
+                format!("{tap_name}:{}", request.guest_mac),
+            ),
+        ]
+        .into_iter()
+        .map(|(resource, identity)| PersistedNetworkResource {
+            resource,
+            identity: identity.clone(),
+            fingerprint: identity,
+            ownership: "sdk:taumaru".to_owned(),
+            adapter_handle: None,
+            last_observed: "desired".to_owned(),
+        })
+        .collect();
+        Ok(NetworkOutcome {
+            persisted: PersistedNetwork {
+                config,
+                host_address: Some(IpAddr::V4(host)),
+                guest_mac: request.guest_mac.clone(),
+                dhcp_lease_reference: None,
+                desired_boot_parameters: format!("ip={guest}::{host}:255.255.255.252::eth0:off"),
+                resources,
+                uplink_cidr: None,
+                proxy_arp_enabled_by_sdk: false,
+                bridge_created_by_sdk: false,
+                uplink_attached_by_sdk: false,
+                forwarding_enabled_by_sdk: true,
+                nat_table_created_by_sdk: true,
+                nat_chain_created_by_sdk: true,
+                host_route_created_by_sdk: false,
+                proxy_arp_entry_created_by_sdk: false,
+                host_address_specs: Vec::new(),
+                default_route_specs: Vec::new(),
+            },
+            applied: vec![
+                NetworkResource::Tap,
+                NetworkResource::TapAddress,
+                NetworkResource::Forwarding,
+                NetworkResource::Nat,
+                NetworkResource::FirecrackerInterface,
+            ],
+            skipped: Vec::new(),
+            requires_temporary_runtime: false,
+        })
+    }
+
+    fn test_configure_lan(request: &NetworkRequest) -> Result<NetworkOutcome, SdkError> {
+        let digest = Sha256::digest(request.vm_name.as_bytes());
+        let third_octet = digest[0] & 0xfc;
+        let host = Ipv4Addr::new(10, 200, third_octet, 1);
+        let guest = Ipv4Addr::new(10, 200, third_octet, 2);
+        let lan = request
+            .lan_address_override
+            .unwrap_or_else(|| Ipv4Addr::new(192, 168, 3, 50 + (digest[1] % 100)));
+        let tap_name = format!("tap-{}", request.vm_name);
+        let uplink = "test-uplink";
+        let config = NetworkConfiguration {
+            mode: NetworkMode::Lan,
+            guest_address: IpAddr::V4(guest),
+            prefix_length: 30,
+            gateway: Some(IpAddr::V4(host)),
+            tap_name: tap_name.clone(),
+            bridge_name: None,
+            uplink_name: Some(uplink.to_owned()),
+            lan_address: Some(IpAddr::V4(lan)),
+        };
+        let resources = [
+            (NetworkResource::Tap, tap_name.clone()),
+            (NetworkResource::TapAddress, format!("{tap_name}:{host}/30")),
+            (NetworkResource::HostRoute, format!("{tap_name}:{lan}")),
+            (NetworkResource::ProxyArpEntry, format!("{uplink}:{lan}")),
+            (
+                NetworkResource::Forwarding,
+                "net.ipv4.ip_forward".to_owned(),
+            ),
+            (NetworkResource::ForwardRule, format!("{tap_name}:forward")),
+            (NetworkResource::IptablesNat, tap_name.clone()),
+            (
+                NetworkResource::FirecrackerInterface,
+                format!("{tap_name}:{}", request.guest_mac),
+            ),
+        ]
+        .into_iter()
+        .map(|(resource, identity)| PersistedNetworkResource {
+            resource,
+            identity: identity.clone(),
+            fingerprint: identity,
+            ownership: "sdk:taumaru".to_owned(),
+            adapter_handle: None,
+            last_observed: "desired".to_owned(),
+        })
+        .collect();
+        Ok(NetworkOutcome {
+            persisted: PersistedNetwork {
+                config,
+                host_address: Some(IpAddr::V4(host)),
+                guest_mac: request.guest_mac.clone(),
+                dhcp_lease_reference: None,
+                desired_boot_parameters: format!("ip={guest}::{host}:255.255.255.252::eth0:off"),
+                resources,
+                uplink_cidr: Some("192.168.3.0/24".to_owned()),
+                proxy_arp_enabled_by_sdk: true,
+                bridge_created_by_sdk: false,
+                uplink_attached_by_sdk: false,
+                forwarding_enabled_by_sdk: true,
+                nat_table_created_by_sdk: false,
+                nat_chain_created_by_sdk: false,
+                host_route_created_by_sdk: true,
+                proxy_arp_entry_created_by_sdk: true,
+                host_address_specs: Vec::new(),
+                default_route_specs: Vec::new(),
+            },
+            applied: vec![
+                NetworkResource::Tap,
+                NetworkResource::TapAddress,
+                NetworkResource::HostRoute,
+                NetworkResource::ProxyArpEntry,
+                NetworkResource::Forwarding,
+                NetworkResource::ForwardRule,
+                NetworkResource::IptablesNat,
+                NetworkResource::FirecrackerInterface,
+            ],
+            skipped: Vec::new(),
+            requires_temporary_runtime: true,
+        })
     }
 
     struct TestRuntime {
@@ -2961,7 +2930,7 @@ mod tests {
             Ok(TemporaryRuntime {
                 process,
                 request: request.clone(),
-                deadline: Duration::from_secs(1),
+                deadline: Duration::from_millis(1),
             })
         }
 
@@ -3223,6 +3192,7 @@ mod tests {
             vcpu_count: 1,
             memory_bytes: 128 * 1024 * 1024,
             expose_on_lan: false,
+            lan_address: None,
             volume_path: None,
         }
     }
@@ -3247,6 +3217,7 @@ mod tests {
         let credentials = Arc::new(TestCredentials::default());
         let network = Arc::new(TestNetwork {
             cleanup_calls: AtomicUsize::new(0),
+            fail_guest_setup: AtomicUsize::new(0),
         });
         let runtime = Arc::new(TestRuntime {
             verify_calls: AtomicUsize::new(0),
@@ -3318,6 +3289,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn isolates_two_routed_lan_vms_with_distinct_addresses() {
+        if std::env::consts::ARCH != "x86_64" {
+            return;
+        }
+        let (sdk, _directory, _storage, _credentials, _network, _runtime) = test_sdk(false);
+        let mut first_request = test_request();
+        first_request.name = "lan_iso_a".to_owned();
+        first_request.expose_on_lan = true;
+        first_request.lan_address = Some(std::net::Ipv4Addr::new(192, 168, 3, 91));
+        let mut second_request = test_request();
+        second_request.name = "lan_iso_b".to_owned();
+        second_request.expose_on_lan = true;
+        second_request.lan_address = Some(std::net::Ipv4Addr::new(192, 168, 3, 92));
+        let first = sdk
+            .create_microvm(first_request)
+            .await
+            .expect("first LAN VM should be created");
+        let second = sdk
+            .create_microvm(second_request)
+            .await
+            .expect("second LAN VM should be created");
+
+        assert_ne!(first.network.lan_address, second.network.lan_address);
+        assert_ne!(first.network.guest_address, second.network.guest_address);
+        assert_ne!(first.network.tap_name, second.network.tap_name);
+    }
+
+    #[tokio::test]
     async fn rejects_an_immutable_creation_conflict_without_mutating_the_existing_vm() {
         if std::env::consts::ARCH != "x86_64" {
             return;
@@ -3336,6 +3335,31 @@ mod tests {
 
         assert!(matches!(error, SdkError::ConfigurationConflict { .. }));
         assert_eq!(storage.prepare_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn rolls_back_routed_lan_attempt_on_guest_setup_failure() {
+        if std::env::consts::ARCH != "x86_64" {
+            return;
+        }
+        let (sdk, _directory, _storage, _credentials, network, _runtime) = test_sdk(false);
+        network.fail_guest_setup.store(1, Ordering::Relaxed);
+        let mut request = test_request();
+        request.name = "lan_rollback_vm".to_owned();
+        request.expose_on_lan = true;
+        let error = sdk
+            .create_microvm(request)
+            .await
+            .expect_err("guest setup failure should fail creation");
+        assert!(matches!(error, SdkError::TemporaryRuntime { .. }));
+        assert_eq!(network.cleanup_calls.load(Ordering::Relaxed), 1);
+        assert!(!sdk.home.join("vms/lan_rollback_vm").exists());
+        assert!(
+            sdk.repository
+                .find_microvm("lan_rollback_vm")
+                .expect("test inventory should be readable")
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -3358,5 +3382,85 @@ mod tests {
                 .expect("test inventory should be readable")
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn creates_a_routed_lan_vm_with_override_and_guest_setup() {
+        use std::net::Ipv4Addr;
+
+        if std::env::consts::ARCH != "x86_64" {
+            return;
+        }
+        let (sdk, _directory, _storage, _credentials, _network, _runtime) = test_sdk(false);
+        let mut request = test_request();
+        request.name = "lan_vm".to_owned();
+        request.expose_on_lan = true;
+        request.lan_address = Some(Ipv4Addr::new(192, 168, 3, 77));
+        let created = sdk
+            .create_microvm(request)
+            .await
+            .expect("routed LAN VM should be created");
+
+        assert_eq!(created.state, MicroVmState::Configured);
+        assert_eq!(created.network.mode, NetworkMode::Lan);
+        assert_eq!(
+            created.network.lan_address,
+            Some(std::net::IpAddr::V4(Ipv4Addr::new(192, 168, 3, 77)))
+        );
+        assert_eq!(created.network.bridge_name, None);
+        assert_eq!(created.network.uplink_name, Some("test-uplink".to_owned()));
+        assert!(!created.socket_path.exists());
+    }
+
+    #[tokio::test]
+    async fn rejects_a_lan_override_for_host_only_creation() {
+        use std::net::Ipv4Addr;
+
+        if std::env::consts::ARCH != "x86_64" {
+            return;
+        }
+        let (sdk, _directory, _storage, _credentials, _network, _runtime) = test_sdk(false);
+        let mut request = test_request();
+        request.lan_address = Some(Ipv4Addr::new(192, 168, 3, 77));
+        let error = sdk
+            .create_microvm(request)
+            .await
+            .expect_err("host-only LAN override should fail");
+
+        assert!(matches!(error, SdkError::InvalidRequest { .. }));
+    }
+
+    #[tokio::test]
+    async fn reconciles_a_persisted_routed_lan_network_without_reallocating() {
+        if std::env::consts::ARCH != "x86_64" {
+            return;
+        }
+        let (sdk, _directory, _storage, _credentials, _network, _runtime) = test_sdk(false);
+        let mut request = test_request();
+        request.name = "lan_reconcile_vm".to_owned();
+        request.expose_on_lan = true;
+        request.lan_address = Some(std::net::Ipv4Addr::new(192, 168, 3, 88));
+        let created = sdk
+            .create_microvm(request)
+            .await
+            .expect("routed LAN VM should be created");
+        let result = sdk
+            .configure_network("lan_reconcile_vm")
+            .await
+            .expect("persisted routed network should reconcile");
+
+        assert_eq!(result.state, MicroVmState::Configured);
+        assert_eq!(
+            result.configuration.lan_address,
+            created.network.lan_address
+        );
+        assert_eq!(
+            result.configuration.guest_address,
+            created.network.guest_address
+        );
+        assert!(result.applied.is_empty());
+        assert!(result.skipped.contains(&NetworkResource::Tap));
+        assert!(result.skipped.contains(&NetworkResource::HostRoute));
+        assert!(result.skipped.contains(&NetworkResource::ProxyArpEntry));
     }
 }

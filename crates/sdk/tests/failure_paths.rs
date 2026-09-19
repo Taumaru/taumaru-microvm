@@ -262,3 +262,27 @@ async fn cancellation_emits_a_typed_terminal_phase_and_leaves_no_partial_file()
     }));
     Ok(())
 }
+
+#[test]
+fn unprivileged_link_probe_reports_command_diagnostics_not_absence() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+
+    let directory = tempdir().expect("temporary directory should be created");
+    let fake_ip = directory.path().join("ip");
+    std::fs::write(
+        &fake_ip,
+        "#!/bin/sh\necho 'RTNETLINK answers: Operation not permitted' >&2\nexit 1\n",
+    )
+    .expect("fake ip should be written");
+    std::fs::set_permissions(&fake_ip, std::fs::Permissions::from_mode(0o755))
+        .expect("fake ip should be executable");
+    let output = Command::new(&fake_ip)
+        .args(["-d", "link", "show", "dev", "tm-test"])
+        .output()
+        .expect("fake ip should execute");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("Operation not permitted"));
+}

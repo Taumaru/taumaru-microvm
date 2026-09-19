@@ -19,6 +19,12 @@ impl CreateMicroVmRequest {
         validate_vm_name(&self.name)?;
         validate_identifier(&self.distribution_id, "distribution_id")?;
         validate_identifier(&self.image_id, "image_id")?;
+        if !self.expose_on_lan && self.lan_address.is_some() {
+            return Err(SdkError::InvalidRequest {
+                field: "lan_address".to_owned(),
+                reason: "an explicit LAN address requires LAN exposure".to_owned(),
+            });
+        }
         validate_positive_u64(self.disk_size_bytes, "disk_size_bytes")?;
         validate_positive_u32(self.vcpu_count, "vcpu_count")?;
         validate_positive_u64(self.memory_bytes, "memory_bytes")?;
@@ -190,6 +196,7 @@ mod tests {
             vcpu_count: 1,
             memory_bytes: 1,
             expose_on_lan: false,
+            lan_address: None,
             volume_path: None,
         };
         let validated = request
@@ -208,6 +215,7 @@ mod tests {
             vcpu_count: 1,
             memory_bytes: 1024 * 1024 + 1,
             expose_on_lan: false,
+            lan_address: None,
             volume_path: None,
         };
 
@@ -227,6 +235,7 @@ mod tests {
             vcpu_count: 1,
             memory_bytes: 1,
             expose_on_lan: false,
+            lan_address: None,
             volume_path: None,
         };
 
