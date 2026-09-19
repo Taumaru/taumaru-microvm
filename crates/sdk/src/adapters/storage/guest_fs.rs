@@ -1,228 +1,595 @@
-use std::fs::{self, OpenOptions};
-use std::io::{Read, Write};
-use std::path::Path;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::error::SdkError;
 
-static MOUNT_COUNTER: AtomicU64 = AtomicU64::new(0);
+static INJECT_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Injects one public SSH key into an offline ext4 image.
+///
+/// The image is edited with `debugfs` in userspace. A kernel loop mount would
+/// require `CAP_SYS_ADMIN`, so `mount -o loop` fails with exit status 32 for
+/// regular unprivileged users.
 pub(crate) fn inject_public_key(rootfs_path: &Path, public_key: &str) -> Result<(), SdkError> {
-    let sequence = MOUNT_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let mount_parent = match rootfs_path.parent() {
-        Some(parent) => parent,
-        None => Path::new("/tmp"),
-    };
-    let mount_path = mount_parent.join(format!(".guest-mount-{sequence}"));
-    fs::create_dir(&mount_path)
-        .map_err(|error| SdkError::filesystem("create guest mountpoint", &mount_path, error))?;
-
-    let mount_result = Command::new("mount")
-        .args(["-o", "loop"])
-        .arg(rootfs_path)
-        .arg(&mount_path)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .output();
-    let mount_output = match mount_result {
-        Ok(output) if output.status.success() => output,
-        Ok(output) => {
-            let _ = fs::remove_dir(&mount_path);
-            return Err(SdkError::GuestFilesystem {
-                operation: "mount rootfs for SSH injection".to_owned(),
-                path: rootfs_path.to_path_buf(),
-                reason: format!("mount exited with {}", output.status),
-            });
-        }
-        Err(error) => {
-            let _ = fs::remove_dir(&mount_path);
-            return Err(SdkError::HostCommand {
-                program: "mount".to_owned(),
-                reason: error.to_string(),
-            });
-        }
-    };
-    drop(mount_output);
-
-    let operation_result = update_authorized_keys(&mount_path, public_key);
-    let unmount_result = Command::new("umount")
-        .arg(&mount_path)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .output();
-    let remove_result = fs::remove_dir(&mount_path);
-    let unmount_error = inspect_unmount_result(unmount_result, rootfs_path).err();
-    let remove_error = remove_result.err();
-
-    if let Err(error) = operation_result {
-        let mut failures = Vec::new();
-        if let Some(cleanup) = unmount_error {
-            failures.push(cleanup.to_string());
-        }
-        if let Some(cleanup) = remove_error {
-            failures.push(format!("remove guest mountpoint: {cleanup}"));
-        }
-        return if failures.is_empty() {
-            Err(error)
-        } else {
-            Err(SdkError::Cleanup {
-                primary: error.to_string(),
-                failures,
-            })
-        };
-    }
-    if let Some(error) = unmount_error {
-        let mut failures = Vec::new();
-        if let Some(cleanup) = remove_error {
-            failures.push(format!("remove guest mountpoint: {cleanup}"));
-        }
-        return if failures.is_empty() {
-            Err(error)
-        } else {
-            Err(SdkError::Cleanup {
-                primary: error.to_string(),
-                failures,
-            })
-        };
-    }
-    if let Some(error) = remove_error {
-        return Err(SdkError::filesystem(
-            "remove guest mountpoint",
-            &mount_path,
-            error,
-        ));
-    }
-    Ok(())
-}
-
-fn inspect_unmount_result(
-    result: std::io::Result<std::process::Output>,
-    rootfs_path: &Path,
-) -> Result<(), SdkError> {
-    match result {
-        Ok(output) if output.status.success() => Ok(()),
-        Ok(output) => Err(SdkError::GuestFilesystem {
-            operation: "unmount rootfs after SSH injection".to_owned(),
+    let key_line = public_key.trim_end_matches(['\r', '\n']);
+    if key_line.is_empty() {
+        return Err(SdkError::GuestFilesystem {
+            operation: "verify public SSH key".to_owned(),
             path: rootfs_path.to_path_buf(),
-            reason: format!("umount exited with {}", output.status),
-        }),
-        Err(error) => Err(SdkError::HostCommand {
-            program: "umount".to_owned(),
-            reason: error.to_string(),
-        }),
-    }
-}
-
-fn update_authorized_keys(mount_path: &Path, public_key: &str) -> Result<(), SdkError> {
-    let root_directory = mount_path.join("root");
-    let root_metadata =
-        fs::symlink_metadata(&root_directory).map_err(|error| SdkError::GuestFilesystem {
-            operation: "inspect guest root directory".to_owned(),
-            path: root_directory.clone(),
-            reason: error.to_string(),
-        })?;
-    if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
-        return Err(SdkError::GuestFilesystem {
-            operation: "verify guest root directory".to_owned(),
-            path: root_directory,
-            reason: "the expected /root directory is unavailable".to_owned(),
+            reason: "the public key is empty".to_owned(),
         });
     }
-    let ssh_directory = mount_path.join("root/.ssh");
-    let metadata =
-        fs::symlink_metadata(&ssh_directory).map_err(|error| SdkError::GuestFilesystem {
-            operation: "inspect guest SSH directory".to_owned(),
-            path: ssh_directory.clone(),
-            reason: error.to_string(),
-        })?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+    if key_line.contains('\n') || key_line.contains('\r') {
         return Err(SdkError::GuestFilesystem {
-            operation: "verify guest SSH directory".to_owned(),
-            path: ssh_directory,
-            reason: "the expected /root/.ssh directory is unavailable".to_owned(),
-        });
-    }
-    set_mode(&ssh_directory, 0o700)?;
-    let authorized_keys = mount_path.join("root/.ssh/authorized_keys");
-    if let Ok(metadata) = fs::symlink_metadata(&authorized_keys)
-        && (metadata.file_type().is_symlink() || !metadata.is_file())
-    {
-        return Err(SdkError::GuestFilesystem {
-            operation: "verify guest authorized_keys".to_owned(),
-            path: authorized_keys,
-            reason: "the expected authorized_keys path is not a regular file".to_owned(),
+            operation: "verify public SSH key".to_owned(),
+            path: rootfs_path.to_path_buf(),
+            reason: "the public key must be a single line".to_owned(),
         });
     }
 
-    let mut existing = String::new();
-    match fs::File::open(&authorized_keys) {
-        Ok(mut file) => {
-            file.read_to_string(&mut existing)
-                .map_err(|error| SdkError::GuestFilesystem {
-                    operation: "read guest authorized_keys".to_owned(),
-                    path: authorized_keys.clone(),
-                    reason: error.to_string(),
-                })?;
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => {
-            return Err(SdkError::GuestFilesystem {
-                operation: "open guest authorized_keys".to_owned(),
-                path: authorized_keys.clone(),
-                reason: error.to_string(),
-            });
-        }
-    }
-    let public_key_line = public_key.trim_end_matches(['\r', '\n']);
-    let already_present = existing.lines().any(|line| line.trim() == public_key_line);
-    if !already_present {
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&authorized_keys)
-            .map_err(|error| SdkError::GuestFilesystem {
-                operation: "open guest authorized_keys for update".to_owned(),
-                path: authorized_keys.clone(),
-                reason: error.to_string(),
-            })?;
-        if !existing.is_empty() && !existing.ends_with('\n') {
-            file.write_all(b"\n")
-                .map_err(|error| SdkError::GuestFilesystem {
-                    operation: "separate guest authorized_keys entries".to_owned(),
-                    path: authorized_keys.clone(),
-                    reason: error.to_string(),
-                })?;
-        }
-        file.write_all(public_key_line.as_bytes())
-            .and_then(|_| file.write_all(b"\n"))
-            .and_then(|_| file.sync_all())
-            .map_err(|error| SdkError::GuestFilesystem {
-                operation: "inject public SSH key".to_owned(),
-                path: authorized_keys.clone(),
-                reason: error.to_string(),
-            })?;
-    }
-    set_mode(&authorized_keys, 0o600)
-}
+    ensure_guest_directory(
+        rootfs_path,
+        "root",
+        "inspect guest root directory",
+        "verify guest root directory",
+        "create guest root directory",
+        "the expected /root directory is unavailable",
+    )?;
+    ensure_guest_directory(
+        rootfs_path,
+        "root/.ssh",
+        "inspect guest SSH directory",
+        "verify guest SSH directory",
+        "create guest SSH directory",
+        "the expected /root/.ssh directory is unavailable",
+    )?;
+    chmod_guest(rootfs_path, "root/.ssh", "040700")?;
 
-fn set_mode(path: &Path, mode: u32) -> Result<(), SdkError> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-
-        fs::set_permissions(path, fs::Permissions::from_mode(mode)).map_err(|error| {
-            SdkError::GuestFilesystem {
-                operation: "set guest SSH permissions".to_owned(),
-                path: path.to_path_buf(),
-                reason: error.to_string(),
+    match stat_guest(
+        rootfs_path,
+        "root/.ssh/authorized_keys",
+        "inspect guest authorized_keys",
+    )? {
+        None => {
+            let mut contents = String::with_capacity(key_line.len() + 1);
+            contents.push_str(key_line);
+            contents.push('\n');
+            write_guest_file(
+                rootfs_path,
+                "root/.ssh/authorized_keys",
+                contents.as_bytes(),
+                "inject public SSH key",
+            )?;
+        }
+        Some(stat) => {
+            if stat.is_symlink || !stat.is_regular {
+                return Err(SdkError::GuestFilesystem {
+                    operation: "verify guest authorized_keys".to_owned(),
+                    path: rootfs_path.to_path_buf(),
+                    reason: "the expected authorized_keys path is not a regular file".to_owned(),
+                });
             }
-        })?;
+            let existing = cat_guest(rootfs_path, "root/.ssh/authorized_keys")?;
+            if !existing.lines().any(|line| line.trim() == key_line) {
+                let mut updated = existing;
+                if !updated.is_empty() && !updated.ends_with('\n') {
+                    updated.push('\n');
+                }
+                updated.push_str(key_line);
+                updated.push('\n');
+                replace_guest_file(rootfs_path, "root/.ssh/authorized_keys", updated.as_bytes())?;
+            }
+        }
     }
-    #[cfg(not(unix))]
-    let _ = (path, mode);
+
+    chmod_guest(rootfs_path, "root/.ssh/authorized_keys", "0100600")
+}
+
+struct GuestStat {
+    is_symlink: bool,
+    is_directory: bool,
+    is_regular: bool,
+}
+
+fn ensure_guest_directory(
+    rootfs_path: &Path,
+    guest_path: &str,
+    inspect_operation: &str,
+    verify_operation: &str,
+    create_operation: &str,
+    unavailable_reason: &str,
+) -> Result<(), SdkError> {
+    let stat = stat_guest(rootfs_path, guest_path, inspect_operation)?;
+    let stat = match stat {
+        Some(stat) => stat,
+        None => {
+            mkdir_guest(rootfs_path, guest_path, create_operation)?;
+            stat_guest(rootfs_path, guest_path, inspect_operation)?.ok_or_else(|| {
+                SdkError::GuestFilesystem {
+                    operation: verify_operation.to_owned(),
+                    path: rootfs_path.to_path_buf(),
+                    reason: unavailable_reason.to_owned(),
+                }
+            })?
+        }
+    };
+    if stat.is_symlink || !stat.is_directory {
+        return Err(SdkError::GuestFilesystem {
+            operation: verify_operation.to_owned(),
+            path: rootfs_path.to_path_buf(),
+            reason: unavailable_reason.to_owned(),
+        });
+    }
     Ok(())
+}
+
+fn stat_guest(
+    rootfs_path: &Path,
+    guest_path: &str,
+    inspect_operation: &str,
+) -> Result<Option<GuestStat>, SdkError> {
+    let output = run_debugfs(rootfs_path, &format!("stat {guest_path}"), false)?;
+    if !output.status.success() {
+        return Err(SdkError::GuestFilesystem {
+            operation: inspect_operation.to_owned(),
+            path: rootfs_path.to_path_buf(),
+            reason: format!("debugfs exited with {}", output.status),
+        });
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    if let Some(stat) = parse_stat(&stdout) {
+        return Ok(Some(stat));
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    if stderr.contains("File not found") {
+        return Ok(None);
+    }
+    Err(SdkError::GuestFilesystem {
+        operation: inspect_operation.to_owned(),
+        path: rootfs_path.to_path_buf(),
+        reason: guest_debugfs_reason(&stderr),
+    })
+}
+
+fn parse_stat(stdout: &str) -> Option<GuestStat> {
+    if !stdout.contains("Inode:") {
+        return None;
+    }
+    let kind = stdout.split("Type:").nth(1)?.split_whitespace().next()?;
+    Some(GuestStat {
+        is_symlink: kind == "symlink",
+        is_directory: kind == "directory",
+        is_regular: kind == "regular",
+    })
+}
+
+fn cat_guest(rootfs_path: &Path, guest_path: &str) -> Result<String, SdkError> {
+    let output = run_debugfs(rootfs_path, &format!("cat {guest_path}"), false)?;
+    if !output.status.success() {
+        return Err(SdkError::GuestFilesystem {
+            operation: "read guest authorized_keys".to_owned(),
+            path: rootfs_path.to_path_buf(),
+            reason: format!("debugfs exited with {}", output.status),
+        });
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    if stderr.contains("File not found") || debugfs_failed(&stderr) {
+        return Err(SdkError::GuestFilesystem {
+            operation: "read guest authorized_keys".to_owned(),
+            path: rootfs_path.to_path_buf(),
+            reason: guest_debugfs_reason(&stderr),
+        });
+    }
+    String::from_utf8(output.stdout).map_err(|_| SdkError::GuestFilesystem {
+        operation: "read guest authorized_keys".to_owned(),
+        path: rootfs_path.to_path_buf(),
+        reason: "the file is not valid UTF-8".to_owned(),
+    })
+}
+
+fn mkdir_guest(rootfs_path: &Path, guest_path: &str, operation: &str) -> Result<(), SdkError> {
+    let output = run_debugfs(rootfs_path, &format!("mkdir {guest_path}"), true)?;
+    if !output.status.success() {
+        return Err(SdkError::GuestFilesystem {
+            operation: operation.to_owned(),
+            path: rootfs_path.to_path_buf(),
+            reason: format!("debugfs exited with {}", output.status),
+        });
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    if stderr.contains("already exists") {
+        return Ok(());
+    }
+    if debugfs_failed(&stderr) {
+        return Err(SdkError::GuestFilesystem {
+            operation: operation.to_owned(),
+            path: rootfs_path.to_path_buf(),
+            reason: guest_debugfs_reason(&stderr),
+        });
+    }
+    Ok(())
+}
+
+fn replace_guest_file(
+    rootfs_path: &Path,
+    guest_path: &str,
+    contents: &[u8],
+) -> Result<(), SdkError> {
+    let output = run_debugfs(rootfs_path, &format!("rm {guest_path}"), true)?;
+    if !output.status.success() {
+        return Err(SdkError::GuestFilesystem {
+            operation: "remove guest authorized_keys for update".to_owned(),
+            path: rootfs_path.to_path_buf(),
+            reason: format!("debugfs exited with {}", output.status),
+        });
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    if !stderr.contains("File not found") && debugfs_failed(&stderr) {
+        return Err(SdkError::GuestFilesystem {
+            operation: "remove guest authorized_keys for update".to_owned(),
+            path: rootfs_path.to_path_buf(),
+            reason: guest_debugfs_reason(&stderr),
+        });
+    }
+    write_guest_file(rootfs_path, guest_path, contents, "inject public SSH key")
+}
+
+fn write_guest_file(
+    rootfs_path: &Path,
+    guest_path: &str,
+    contents: &[u8],
+    operation: &str,
+) -> Result<(), SdkError> {
+    let host_path = write_temp_payload(contents)?;
+    let request = format!("write {} {guest_path}", quote_host_path(&host_path));
+    let output = match run_debugfs(rootfs_path, &request, true) {
+        Ok(output) => output,
+        Err(error) => {
+            let _ = fs::remove_file(&host_path);
+            return Err(error);
+        }
+    };
+    let _ = fs::remove_file(&host_path);
+    if !output.status.success() {
+        return Err(SdkError::GuestFilesystem {
+            operation: operation.to_owned(),
+            path: rootfs_path.to_path_buf(),
+            reason: format!("debugfs exited with {}", output.status),
+        });
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    if stderr.contains("already exists") {
+        return Err(SdkError::GuestFilesystem {
+            operation: operation.to_owned(),
+            path: rootfs_path.to_path_buf(),
+            reason: "the guest file already exists".to_owned(),
+        });
+    }
+    if debugfs_failed(&stderr) {
+        return Err(SdkError::GuestFilesystem {
+            operation: operation.to_owned(),
+            path: rootfs_path.to_path_buf(),
+            reason: guest_debugfs_reason(&stderr),
+        });
+    }
+    if !stdout.contains("Allocated inode") {
+        return Err(SdkError::GuestFilesystem {
+            operation: operation.to_owned(),
+            path: rootfs_path.to_path_buf(),
+            reason: "debugfs did not confirm the write".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn chmod_guest(rootfs_path: &Path, guest_path: &str, mode: &str) -> Result<(), SdkError> {
+    let output = run_debugfs(rootfs_path, &format!("sif {guest_path} mode {mode}"), true)?;
+    if !output.status.success() {
+        return Err(SdkError::GuestFilesystem {
+            operation: "set guest SSH permissions".to_owned(),
+            path: rootfs_path.to_path_buf(),
+            reason: format!("debugfs exited with {}", output.status),
+        });
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    if debugfs_failed(&stderr) {
+        return Err(SdkError::GuestFilesystem {
+            operation: "set guest SSH permissions".to_owned(),
+            path: rootfs_path.to_path_buf(),
+            reason: guest_debugfs_reason(&stderr),
+        });
+    }
+    Ok(())
+}
+
+fn quote_host_path(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    if text.chars().any(|candidate| {
+        candidate.is_whitespace() || matches!(candidate, '"' | '\\' | '\'' | '`' | '$' | '!' | '*')
+    }) {
+        let mut quoted = String::with_capacity(text.len() + 2);
+        quoted.push('"');
+        for character in text.chars() {
+            if matches!(character, '"' | '\\') {
+                quoted.push('\\');
+            }
+            quoted.push(character);
+        }
+        quoted.push('"');
+        quoted
+    } else {
+        text.into_owned()
+    }
+}
+
+fn write_temp_payload(contents: &[u8]) -> Result<PathBuf, SdkError> {
+    let sequence = INJECT_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!(
+        ".taumaru-ssh-{}-{sequence}.tmp",
+        std::process::id()
+    ));
+    fs::write(&path, contents)
+        .map_err(|error| SdkError::filesystem("write SSH injection payload", &path, error))?;
+    Ok(path)
+}
+
+fn run_debugfs(
+    rootfs_path: &Path,
+    request: &str,
+    write: bool,
+) -> Result<std::process::Output, SdkError> {
+    let mut command = Command::new("debugfs");
+    if write {
+        command.arg("-w");
+    }
+    command
+        .arg("-R")
+        .arg(request)
+        .arg(rootfs_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    command.output().map_err(|error| SdkError::HostCommand {
+        program: "debugfs".to_owned(),
+        reason: error.to_string(),
+    })
+}
+
+/// Reports whether `debugfs` stderr carries a real failure.
+///
+/// `debugfs` always prints its version banner, and some commands print
+/// library notices, so only known failure markers count as errors.
+fn debugfs_failed(stderr: &str) -> bool {
+    const MARKERS: &[&str] = &[
+        "file not found",
+        "already exists",
+        "bad magic",
+        "not open",
+        "read-only",
+        "denied",
+        "no such",
+        "invalid",
+        "could not",
+        "cannot",
+        "failed",
+        "error",
+    ];
+    let relevant: Vec<&str> = stderr
+        .lines()
+        .map(str::trim)
+        .filter(|line| {
+            !line.is_empty()
+                && !line.starts_with("debugfs")
+                && !line.contains("Using EXT2FS Library")
+        })
+        .collect();
+    if relevant.is_empty() {
+        return false;
+    }
+    let joined = relevant.join("\n").to_lowercase();
+    MARKERS.iter().any(|marker| joined.contains(marker))
+}
+
+fn guest_debugfs_reason(stderr: &str) -> String {
+    stderr
+        .lines()
+        .map(str::trim)
+        .rfind(|line| {
+            !line.is_empty()
+                && !line.starts_with("debugfs")
+                && !line.contains("Using EXT2FS Library")
+        })
+        .unwrap_or("debugfs reported an error")
+        .to_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::path::Path;
+    use std::process::{Command, Stdio};
+
+    use tempfile::tempdir;
+
+    use super::{inject_public_key, quote_host_path};
+    use crate::error::SdkError;
+
+    const FIRST_KEY: &str = "ssh-ed25519 AAAAC3NzaC1taumaru-first taumaru-test";
+    const SECOND_KEY: &str = "ssh-ed25519 AAAAC3NzaC1taumaru-second taumaru-test";
+
+    fn host_tool_available(program: &str) -> bool {
+        Command::new(program)
+            .arg("-V")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .is_ok()
+    }
+
+    fn e2fsprogs_available() -> bool {
+        host_tool_available("debugfs") && host_tool_available("mkfs.ext4")
+    }
+
+    fn create_ext4_image(path: &Path) {
+        const IMAGE_SIZE_BYTES: u64 = 64 * 1024 * 1024;
+        let file = fs::File::create(path).expect("image file should be created");
+        file.set_len(IMAGE_SIZE_BYTES)
+            .expect("image file should be sized");
+        drop(file);
+        let status = Command::new("mkfs.ext4")
+            .arg("-q")
+            .arg(path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("mkfs.ext4 should execute");
+        assert!(status.success(), "mkfs.ext4 should succeed");
+    }
+
+    fn debugfs_exec(image: &Path, request: &str) {
+        let output = Command::new("debugfs")
+            .args(["-w", "-R", request])
+            .arg(image)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("debugfs should execute");
+        assert!(
+            output.status.success(),
+            "debugfs {request} should succeed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn guest_file_content(image: &Path, guest_path: &str) -> String {
+        let output = Command::new("debugfs")
+            .args(["-R", &format!("cat {guest_path}")])
+            .arg(image)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output()
+            .expect("debugfs should execute");
+        assert!(output.status.success(), "debugfs cat should succeed");
+        String::from_utf8(output.stdout).expect("guest file should be UTF-8")
+    }
+
+    fn guest_stat(image: &Path, guest_path: &str) -> String {
+        let output = Command::new("debugfs")
+            .args(["-R", &format!("stat {guest_path}")])
+            .arg(image)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output()
+            .expect("debugfs should execute");
+        assert!(output.status.success(), "debugfs stat should succeed");
+        String::from_utf8(output.stdout).expect("debugfs stat should be UTF-8")
+    }
+
+    #[test]
+    fn injects_a_key_without_host_mount_privileges() {
+        if !e2fsprogs_available() {
+            return;
+        }
+        let directory = tempdir().expect("temporary directory should exist");
+        let image = directory.path().join("rootfs.ext4");
+        create_ext4_image(&image);
+
+        inject_public_key(&image, FIRST_KEY).expect("first injection should succeed");
+        inject_public_key(&image, FIRST_KEY).expect("repeated injection should succeed");
+
+        assert_eq!(
+            guest_file_content(&image, "root/.ssh/authorized_keys"),
+            format!("{FIRST_KEY}\n")
+        );
+        assert!(
+            guest_stat(&image, "root/.ssh").contains("0700"),
+            "guest SSH directory should be private"
+        );
+        assert!(
+            guest_stat(&image, "root/.ssh/authorized_keys").contains("0600"),
+            "guest authorized_keys should be private"
+        );
+    }
+
+    #[test]
+    fn appends_a_second_key_preserving_existing_entries() {
+        if !e2fsprogs_available() {
+            return;
+        }
+        let directory = tempdir().expect("temporary directory should exist");
+        let image = directory.path().join("rootfs.ext4");
+        create_ext4_image(&image);
+        debugfs_exec(&image, "mkdir root");
+        debugfs_exec(&image, "mkdir root/.ssh");
+        let initial = directory.path().join("initial.txt");
+        fs::write(&initial, FIRST_KEY).expect("initial key file should be written");
+        debugfs_exec(
+            &image,
+            &format!("write {} root/.ssh/authorized_keys", initial.display()),
+        );
+
+        inject_public_key(&image, SECOND_KEY).expect("injection should succeed");
+
+        assert_eq!(
+            guest_file_content(&image, "root/.ssh/authorized_keys"),
+            format!("{FIRST_KEY}\n{SECOND_KEY}\n")
+        );
+    }
+
+    #[test]
+    fn rejects_a_symlinked_authorized_keys_without_following_it() {
+        if !e2fsprogs_available() {
+            return;
+        }
+        let directory = tempdir().expect("temporary directory should exist");
+        let image = directory.path().join("rootfs.ext4");
+        create_ext4_image(&image);
+        debugfs_exec(&image, "mkdir root");
+        debugfs_exec(&image, "mkdir root/.ssh");
+        debugfs_exec(&image, "symlink root/.ssh/authorized_keys some-target");
+
+        let error =
+            inject_public_key(&image, FIRST_KEY).expect_err("symlink injection should fail");
+
+        assert!(
+            matches!(error, SdkError::GuestFilesystem { .. }),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn rejects_an_empty_public_key_before_touching_the_image() {
+        let directory = tempdir().expect("temporary directory should exist");
+        let image = directory.path().join("rootfs.ext4");
+
+        let error = inject_public_key(&image, "\n").expect_err("empty key should fail");
+
+        assert!(
+            matches!(error, SdkError::GuestFilesystem { .. }),
+            "unexpected error: {error}"
+        );
+        assert!(!image.exists());
+    }
+
+    #[test]
+    fn quotes_host_payload_paths_with_whitespace() {
+        use std::path::PathBuf;
+
+        assert_eq!(
+            quote_host_path(&PathBuf::from("/tmp/payload.tmp")),
+            "/tmp/payload.tmp"
+        );
+        assert_eq!(
+            quote_host_path(&PathBuf::from("/tmp/dir with space/payload.tmp")),
+            "\"/tmp/dir with space/payload.tmp\""
+        );
+    }
 }
