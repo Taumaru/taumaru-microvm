@@ -417,3 +417,61 @@ async fn cancelled_single_image_download_publishes_nothing()
     assert_eq!(server.artifact_request_count(), 0);
     Ok(())
 }
+
+#[tokio::test]
+async fn image_readiness_tracks_download_repair_and_rejection()
+-> Result<(), Box<dyn Error + Send + Sync>> {
+    let server = FixtureServer::start().await?;
+    let home = tempdir()?;
+    let sdk = MicroVmSdk::with_registry_base_url(home.path(), server.base_url())?;
+    let image_path = home
+        .path()
+        .join("artifacts/rootfs/alpine-test-1.0/alpine-test-minimal/alpine-test-minimal.ext4");
+
+    assert!(
+        !sdk.is_distribution_image_ready("alpine-test-1.0", "alpine-test-minimal")
+            .await?
+    );
+    assert!(!image_path.exists());
+
+    sdk.download_distribution_image("alpine-test-1.0", "alpine-test-minimal", |_| {})
+        .await?;
+    assert!(
+        sdk.is_distribution_image_ready("alpine-test-1.0", "alpine-test-minimal")
+            .await?
+    );
+    let requests_after_download = server.artifact_request_count();
+
+    std::fs::write(&image_path, b"stale-bytes")?;
+    assert!(
+        !sdk.is_distribution_image_ready("alpine-test-1.0", "alpine-test-minimal")
+            .await?
+    );
+
+    let unknown_distribution = sdk
+        .is_distribution_image_ready("no-such-distro", "alpine-test-minimal")
+        .await
+        .expect_err("unknown distribution should not report readiness");
+    assert!(
+        matches!(unknown_distribution, SdkError::NotFound { kind, id }
+            if kind == "distribution" && id == "no-such-distro")
+    );
+
+    let wrong_distribution = sdk
+        .is_distribution_image_ready("alpine-test-1.0", "no-such-image")
+        .await
+        .expect_err("unknown image should not report readiness");
+    assert!(matches!(wrong_distribution, SdkError::NotFound { kind, id }
+            if kind == "distribution image" && id == "no-such-image"));
+
+    for (distribution, image) in [("", "alpine-test-minimal"), ("alpine-test-1.0", "")] {
+        assert!(
+            sdk.is_distribution_image_ready(distribution, image)
+                .await
+                .is_err(),
+            "blank IDs should not report readiness"
+        );
+    }
+    assert_eq!(server.artifact_request_count(), requests_after_download);
+    Ok(())
+}

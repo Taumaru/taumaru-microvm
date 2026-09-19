@@ -3,10 +3,16 @@ use std::io;
 use taumaru_microvm::SdkError;
 
 #[derive(Debug)]
+#[allow(dead_code)]
 pub(crate) enum CliError {
     Home(String),
     Validation(String),
     Prompt(String),
+    Creation(String),
+    MissingValue(String),
+    Provisioning(String),
+    Conflict(String),
+    Cancelled,
     Sdk(SdkError),
     Io(io::Error),
 }
@@ -24,10 +30,67 @@ impl From<io::Error> for CliError {
 }
 
 impl CliError {
+    pub(crate) fn creation(
+        what: impl Into<String>,
+        why: impl Into<String>,
+        next: impl Into<String>,
+    ) -> Self {
+        Self::Creation(format!(
+            "{}\u{1f}{}\u{1f}{}",
+            what.into(),
+            why.into(),
+            next.into()
+        ))
+    }
+
+    pub(crate) fn missing_value(
+        field: impl Into<String>,
+        flag: impl Into<String>,
+        example: impl Into<String>,
+    ) -> Self {
+        Self::MissingValue(format!(
+            "Missing {}\u{1f}non-interactive mode requires {}\u{1f}{}",
+            field.into(),
+            flag.into(),
+            example.into()
+        ))
+    }
+
+    pub(crate) fn provisioning(
+        what: impl Into<String>,
+        why: impl Into<String>,
+        next: impl Into<String>,
+    ) -> Self {
+        Self::Provisioning(format!(
+            "{}\u{1f}{}\u{1f}{}",
+            what.into(),
+            why.into(),
+            next.into()
+        ))
+    }
+
+    pub(crate) fn conflict(
+        what: impl Into<String>,
+        why: impl Into<String>,
+        next: impl Into<String>,
+    ) -> Self {
+        Self::Conflict(format!(
+            "{}\u{1f}{}\u{1f}{}",
+            what.into(),
+            why.into(),
+            next.into()
+        ))
+    }
+
+    pub(crate) fn cancelled() -> Self {
+        Self::Cancelled
+    }
+
     pub(crate) fn exit_code(&self) -> u8 {
         match self {
             Self::Prompt(message) if message == "cancelled" => 130,
             Self::Sdk(SdkError::Cancelled) => 130,
+            Self::Cancelled => 130,
             _ => 1,
         }
     }
@@ -71,11 +134,28 @@ impl CliError {
                 error.to_string(),
                 "Check terminal permissions and try again".to_owned(),
             ),
+            Self::Creation(payload)
+            | Self::MissingValue(payload)
+            | Self::Provisioning(payload)
+            | Self::Conflict(payload) => {
+                let mut parts = payload.split("\u{1f}");
+                (
+                    parts.next().unwrap_or_default().to_owned(),
+                    parts.next().unwrap_or_default().to_owned(),
+                    parts.next().unwrap_or_default().to_owned(),
+                )
+            }
+            Self::Cancelled => (
+                "MicroVM creation cancelled".to_owned(),
+                "No MicroVM was created".to_owned(),
+                "Run `microvm new` again when you are ready".to_owned(),
+            ),
         };
         let marker = match self {
             Self::Prompt(message) if message == "cancelled" => paint("!", ANSI_YELLOW, color),
             Self::Sdk(SdkError::Cancelled) => paint("!", ANSI_YELLOW, color),
-            Self::Validation(_) => paint("!", ANSI_YELLOW, color),
+            Self::Cancelled => paint("!", ANSI_YELLOW, color),
+            Self::Validation(_) | Self::MissingValue(_) => paint("!", ANSI_YELLOW, color),
             _ => paint("×", ANSI_RED, color),
         };
         format!(

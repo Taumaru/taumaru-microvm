@@ -16,7 +16,7 @@ use crate::context::CliContext;
 use crate::error::CliError;
 use crate::output::ProgressSink;
 
-trait ArtifactClient {
+pub(crate) trait ArtifactClient {
     async fn list_kernels(&self) -> Result<Vec<Kernel>, SdkError>;
     async fn list_binaries(&self) -> Result<Vec<BinaryPackage>, SdkError>;
     async fn list_distributions(&self) -> Result<Vec<Distribution>, SdkError>;
@@ -50,12 +50,12 @@ trait ArtifactClient {
         F: FnMut(DownloadProgress) + Send;
 }
 
-struct SdkArtifactClient<'a> {
+pub(crate) struct SdkArtifactClient<'a> {
     sdk: &'a MicroVmSdk,
 }
 
 impl<'a> SdkArtifactClient<'a> {
-    fn new(sdk: &'a MicroVmSdk) -> Self {
+    pub(crate) fn new(sdk: &'a MicroVmSdk) -> Self {
         Self { sdk }
     }
 }
@@ -122,7 +122,7 @@ impl ArtifactClient for SdkArtifactClient<'_> {
     }
 }
 
-struct ProgressForwarder<'a, S: ProgressSink> {
+pub(crate) struct ProgressForwarder<'a, S: ProgressSink> {
     sink: &'a mut S,
     completed_plan_bytes: u64,
     plan_total_bytes: u64,
@@ -130,7 +130,7 @@ struct ProgressForwarder<'a, S: ProgressSink> {
 }
 
 impl<'a, S: ProgressSink> ProgressForwarder<'a, S> {
-    fn new(sink: &'a mut S, completed_plan_bytes: u64, plan_total_bytes: u64) -> Self {
+    pub(crate) fn new(sink: &'a mut S, completed_plan_bytes: u64, plan_total_bytes: u64) -> Self {
         Self {
             sink,
             completed_plan_bytes,
@@ -139,7 +139,7 @@ impl<'a, S: ProgressSink> ProgressForwarder<'a, S> {
         }
     }
 
-    fn forward(&mut self, progress: DownloadProgress) {
+    pub(crate) fn forward(&mut self, progress: DownloadProgress) {
         if self.mapping_error.is_some() {
             return;
         }
@@ -149,7 +149,7 @@ impl<'a, S: ProgressSink> ProgressForwarder<'a, S> {
         }
     }
 
-    fn take_error(&mut self) -> Option<CliError> {
+    pub(crate) fn take_error(&mut self) -> Option<CliError> {
         self.mapping_error.take()
     }
 }
@@ -168,7 +168,7 @@ pub(crate) struct DownloadProgressView {
     pub(crate) plan_total_bytes: u64,
 }
 
-fn normalize_progress(
+pub(crate) fn normalize_progress(
     progress: &DownloadProgress,
     completed_plan_bytes: u64,
     plan_total_bytes: u64,
@@ -246,7 +246,7 @@ pub(crate) struct DownloadPlan {
 }
 
 impl RegistryCatalog {
-    fn new(
+    pub(crate) fn new(
         mut kernels: Vec<Kernel>,
         mut binaries: Vec<BinaryPackage>,
         mut distributions: Vec<Distribution>,
@@ -273,7 +273,7 @@ impl RegistryCatalog {
         })
     }
 
-    fn compatible_distributions(&self) -> Vec<&Distribution> {
+    pub(crate) fn compatible_distributions(&self) -> Vec<&Distribution> {
         self.distributions
             .iter()
             .filter(|distribution| {
@@ -282,7 +282,7 @@ impl RegistryCatalog {
             .collect()
     }
 
-    fn compatible_images(&self) -> Vec<(&Distribution, &DistributionImage)> {
+    pub(crate) fn compatible_images(&self) -> Vec<(&Distribution, &DistributionImage)> {
         let mut pairs = Vec::new();
         for distribution in self.compatible_distributions() {
             for image in &distribution.images {
@@ -296,7 +296,7 @@ impl RegistryCatalog {
         pairs
     }
 
-    fn default_kernel(&self, distribution: &Distribution) -> Result<Kernel, CliError> {
+    pub(crate) fn default_kernel(&self, distribution: &Distribution) -> Result<Kernel, CliError> {
         if !same_architecture(&distribution.architecture, &self.host_architecture) {
             return Err(CliError::Validation(format!(
                 "distribution {} is not published for host architecture {}",
@@ -327,7 +327,7 @@ impl RegistryCatalog {
         Ok(kernel.clone())
     }
 
-    fn select_runtime_packages(&self) -> Result<RuntimeBinarySelection, CliError> {
+    pub(crate) fn select_runtime_packages(&self) -> Result<RuntimeBinarySelection, CliError> {
         let mut candidates = self
             .binaries
             .iter()
@@ -385,7 +385,7 @@ impl RegistryCatalog {
         })
     }
 
-    fn distribution(&self, id: &str) -> Option<&Distribution> {
+    pub(crate) fn distribution(&self, id: &str) -> Option<&Distribution> {
         self.distributions
             .iter()
             .find(|distribution| distribution.id == id)
@@ -421,7 +421,7 @@ where
     Ok(())
 }
 
-fn same_architecture(left: &Architecture, right: &Architecture) -> bool {
+pub(crate) fn same_architecture(left: &Architecture, right: &Architecture) -> bool {
     matches!(
         (left, right),
         (Architecture::X86_64, Architecture::X86_64)
@@ -432,7 +432,7 @@ fn same_architecture(left: &Architecture, right: &Architecture) -> bool {
     )
 }
 
-fn architecture_label(architecture: &Architecture) -> &'static str {
+pub(crate) fn architecture_label(architecture: &Architecture) -> &'static str {
     match architecture {
         Architecture::X86_64 => "x86_64",
         Architecture::Aarch64 => "aarch64",
@@ -442,7 +442,7 @@ fn architecture_label(architecture: &Architecture) -> &'static str {
     }
 }
 
-fn host_architecture() -> Result<Architecture, CliError> {
+pub(crate) fn host_architecture() -> Result<Architecture, CliError> {
     match std::env::consts::ARCH {
         "x86_64" => Ok(Architecture::X86_64),
         "aarch64" => Ok(Architecture::Aarch64),
@@ -455,14 +455,14 @@ fn host_architecture() -> Result<Architecture, CliError> {
     }
 }
 
-fn has_runtime_component(package: &BinaryPackage, required_component: &str) -> bool {
+pub(crate) fn has_runtime_component(package: &BinaryPackage, required_component: &str) -> bool {
     package
         .files
         .iter()
         .any(|file| file.name == required_component)
 }
 
-fn binary_package_size(package: &BinaryPackage) -> Result<u64, CliError> {
+pub(crate) fn binary_package_size(package: &BinaryPackage) -> Result<u64, CliError> {
     package.files.iter().try_fold(0_u64, |total, file| {
         total.checked_add(file.size_bytes).ok_or_else(|| {
             CliError::Validation(format!(
@@ -473,7 +473,7 @@ fn binary_package_size(package: &BinaryPackage) -> Result<u64, CliError> {
     })
 }
 
-fn parse_image_selections(values: &[String]) -> Result<Vec<(String, String)>, CliError> {
+pub(crate) fn parse_image_selections(values: &[String]) -> Result<Vec<(String, String)>, CliError> {
     let mut selections = Vec::with_capacity(values.len());
     for value in values {
         let parts = value.split('=').collect::<Vec<_>>();
@@ -487,7 +487,7 @@ fn parse_image_selections(values: &[String]) -> Result<Vec<(String, String)>, Cl
     Ok(selections)
 }
 
-fn build_plan(
+pub(crate) fn build_plan(
     catalog: &RegistryCatalog,
     selected_images: &[(String, String)],
 ) -> Result<DownloadPlan, CliError> {
@@ -582,7 +582,7 @@ fn build_plan(
     })
 }
 
-fn checked_size_add(total: u64, value: u64, kind: &str) -> Result<u64, CliError> {
+pub(crate) fn checked_size_add(total: u64, value: u64, kind: &str) -> Result<u64, CliError> {
     total.checked_add(value).ok_or_else(|| {
         CliError::Validation(format!(
             "{kind} sizes exceed the supported download size range"
@@ -670,12 +670,12 @@ impl DownloadOutcome {
     }
 }
 
-enum OperationResult<T> {
+pub(crate) enum OperationResult<T> {
     Finished(Result<T, SdkError>),
     Cancelled,
 }
 
-async fn call_with_signal<T, O, Sig>(
+pub(crate) async fn call_with_signal<T, O, Sig>(
     operation: O,
     cancellation: &DownloadCancellation,
     signal: Sig,
@@ -914,7 +914,7 @@ where
     Ok(outcome)
 }
 
-fn availability_for_files(files: &[taumaru_microvm::DownloadedFile]) -> Availability {
+pub(crate) fn availability_for_files(files: &[taumaru_microvm::DownloadedFile]) -> Availability {
     let mut dispositions = files.iter().map(|file| &file.disposition);
     let Some(first) = dispositions.next() else {
         return Availability::Downloaded;
@@ -1003,7 +1003,9 @@ impl fmt::Display for SelectionOption {
     }
 }
 
-async fn load_catalog<C: ArtifactClient>(client: &C) -> Result<RegistryCatalog, CliError> {
+pub(crate) async fn load_catalog<C: ArtifactClient>(
+    client: &C,
+) -> Result<RegistryCatalog, CliError> {
     let host_architecture = host_architecture()?;
     let (kernels, binaries, distributions) = tokio::try_join!(
         client.list_kernels(),
@@ -1021,7 +1023,7 @@ fn build_explicit_plan(
     build_plan(catalog, &selections)
 }
 
-fn prompt_render_config(color: bool) -> RenderConfig<'static> {
+pub(crate) fn prompt_render_config(color: bool) -> RenderConfig<'static> {
     let mut config = if color {
         RenderConfig::default_colored()
     } else {
@@ -1121,7 +1123,7 @@ fn prompt_selections(
     )
 }
 
-fn format_image_bytes(size_bytes: u64) -> String {
+pub(crate) fn format_image_bytes(size_bytes: u64) -> String {
     const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
     let mut value = size_bytes as f64;
     let mut unit = 0_usize;
@@ -1136,7 +1138,7 @@ fn format_image_bytes(size_bytes: u64) -> String {
     }
 }
 
-fn prompt_error(error: InquireError) -> CliError {
+pub(crate) fn prompt_error(error: InquireError) -> CliError {
     let message = error.to_string();
     let normalized = message.to_ascii_lowercase();
     if normalized.contains("cancel") || normalized.contains("interrupt") {

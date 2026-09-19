@@ -547,6 +547,67 @@ impl MicroVmSdk {
         Ok(binary)
     }
 
+    /// Reports whether a distribution image is verified locally.
+    ///
+    /// Returns `true` only when the per-image inventory relationship exists and the
+    /// physical file is present below the SDK home with matching size and digest.
+    /// Returns `false` for missing, incomplete, or stale entries: the same conditions
+    /// that make creation return [`SdkError::ArtifactPrerequisite`]. Unknown
+    /// distributions and images outside their named distribution return typed
+    /// [`SdkError::NotFound`] errors. The query performs no download, mutation,
+    /// repair, or persistence write, and emits no output, logs, or global state.
+    pub async fn is_distribution_image_ready(
+        &self,
+        distribution_id: &str,
+        image_id: &str,
+    ) -> Result<bool, SdkError> {
+        validate_requested_id(distribution_id, "distribution")?;
+        validate_requested_id(image_id, "distribution image")?;
+        let manifest = self.fetch_manifest().await?;
+        let distribution = manifest
+            .distributions
+            .iter()
+            .find(|candidate| candidate.id == distribution_id)
+            .ok_or_else(|| SdkError::NotFound {
+                kind: "distribution".to_owned(),
+                id: distribution_id.to_owned(),
+            })?;
+        let image = distribution
+            .images
+            .iter()
+            .find(|candidate| candidate.id == image_id)
+            .ok_or_else(|| SdkError::NotFound {
+                kind: "distribution image".to_owned(),
+                id: image_id.to_owned(),
+            })?;
+        let distribution_id = distribution.id.clone();
+        let image_id = image.id.clone();
+        let expected_size = image.size_bytes;
+        let expected_sha256 = image.sha256.clone();
+        let local = match self
+            .run_repository(move |repository| {
+                repository.resolve_distribution_image(&distribution_id, &image_id)
+            })
+            .await
+        {
+            Ok(local) => local,
+            Err(SdkError::NotFound { .. } | SdkError::ArtifactPrerequisite { .. }) => {
+                return Ok(false);
+            }
+            Err(error) => return Err(error),
+        };
+        if !path_is_below_home(&self.home, &local.path) {
+            return Ok(false);
+        }
+        if local.size_bytes != expected_size || local.sha256 != expected_sha256 {
+            return Ok(false);
+        }
+        let Some(integrity) = calculate_file_integrity(&local.path).await? else {
+            return Ok(false);
+        };
+        Ok(integrity.size_bytes == expected_size && integrity.sha256 == expected_sha256)
+    }
+
     /// Creates and initially configures one stopped MicroVM.
     ///
     /// Creation resolves only artifacts already downloaded into this SDK home. It copies the
