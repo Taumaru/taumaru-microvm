@@ -13,6 +13,7 @@ use crate::ports::network::{NetworkController, NetworkOutcome, NetworkRequest};
 const PRIVATE_POOL_START: u32 = (172_u32 << 24) | (30_u32 << 16);
 const PRIVATE_POOL_END: u32 = (172_u32 << 24) | (31_u32 << 16) | 0xff00;
 const SDK_OWNERSHIP: &str = "sdk:taumaru";
+const PRIVILEGE_HINT: &str = "the operation requires elevated network privileges (CAP_NET_ADMIN); run as root or grant the capability";
 
 /// Linux host-network adapter using `ip`, `sysctl`, and `nft` argument vectors.
 #[derive(Clone, Copy, Debug, Default)]
@@ -1172,7 +1173,7 @@ fn ensure_nat(tap: &str, applied: &mut Vec<NetworkResource>) -> Result<(), SdkEr
             ],
         )?;
     }
-    let comment = format!("comment {SDK_OWNERSHIP}:{tap}");
+    let comment = format!("comment \"{SDK_OWNERSHIP}:{tap}\"");
     run_command(
         "nft",
         &[
@@ -1442,7 +1443,7 @@ fn command_output(program: &str, arguments: &[&str]) -> Result<std::process::Out
         .args(arguments)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .output()
         .map_err(|error| SdkError::HostCommand {
             program: program.to_owned(),
@@ -1455,11 +1456,54 @@ fn run_command(program: &str, arguments: &[&str]) -> Result<(), SdkError> {
     if output.status.success() {
         Ok(())
     } else {
-        Err(SdkError::HostCommand {
-            program: program.to_owned(),
-            reason: format!("command exited with {}", output.status),
-        })
+        Err(host_command_error(program, arguments, &output))
     }
+}
+
+fn host_command_error(
+    program: &str,
+    arguments: &[&str],
+    output: &std::process::Output,
+) -> SdkError {
+    let command = if arguments.is_empty() {
+        program.to_owned()
+    } else {
+        format!("{program} {}", arguments.join(" "))
+    };
+    SdkError::HostCommand {
+        program: program.to_owned(),
+        reason: format!("{command} {}", output_failure_reason(output)),
+    }
+}
+
+fn output_failure_reason(output: &std::process::Output) -> String {
+    let stderr = command_stderr(output);
+    let mut reason = format!("command exited with {}", output.status);
+    if !stderr.is_empty() {
+        const LIMIT: usize = 500;
+        let truncated = if stderr.len() > LIMIT {
+            format!("{}...", stderr[..LIMIT].trim_end())
+        } else {
+            stderr.clone()
+        };
+        let flattened = truncated.split_whitespace().collect::<Vec<_>>().join(" ");
+        reason.push_str(": ");
+        reason.push_str(&flattened);
+    }
+    if is_privilege_denied(&stderr) {
+        reason.push_str("; ");
+        reason.push_str(PRIVILEGE_HINT);
+    }
+    reason
+}
+
+fn command_stderr(output: &std::process::Output) -> String {
+    String::from_utf8_lossy(&output.stderr).trim().to_owned()
+}
+
+fn is_privilege_denied(text: &str) -> bool {
+    let normalized = text.to_lowercase();
+    normalized.contains("operation not permitted") || normalized.contains("permission denied")
 }
 
 fn run_ip(arguments: &[&str]) -> Result<(), SdkError> {
@@ -1483,19 +1527,20 @@ fn delete_link_if_present(name: &str) -> Result<(), SdkError> {
 }
 
 fn run_nft_delete(tap: &str) -> Result<(), SdkError> {
-    let output = command_output(
-        "nft",
-        &[
-            "-a",
-            "list",
-            "chain",
-            "ip",
-            "taumaru_microvm",
-            "postrouting",
-        ],
-    )?;
+    let arguments = [
+        "-a",
+        "list",
+        "chain",
+        "ip",
+        "taumaru_microvm",
+        "postrouting",
+    ];
+    let output = command_output("nft", &arguments)?;
     if !output.status.success() {
-        return Ok(());
+        if is_nft_missing(&command_stderr(&output)) {
+            return Ok(());
+        }
+        return Err(host_command_error("nft", &arguments, &output));
     }
     let marker = format!("{SDK_OWNERSHIP}:{tap}");
     let Some(handle) = String::from_utf8_lossy(&output.stdout)
@@ -1525,77 +1570,98 @@ fn run_nft_delete(tap: &str) -> Result<(), SdkError> {
         ],
     )
 }
-
 fn nft_table_exists() -> Result<bool, SdkError> {
-    Ok(
-        command_output("nft", &["list", "table", "ip", "taumaru_microvm"])?
-            .status
-            .success(),
-    )
+    nft_object_exists(&["list", "table", "ip", "taumaru_microvm"])
 }
 
 fn nft_chain_exists() -> Result<bool, SdkError> {
-    Ok(command_output(
-        "nft",
-        &["list", "chain", "ip", "taumaru_microvm", "postrouting"],
-    )?
-    .status
-    .success())
+    nft_object_exists(&["list", "chain", "ip", "taumaru_microvm", "postrouting"])
+}
+
+fn nft_object_exists(arguments: &[&str]) -> Result<bool, SdkError> {
+    let output = command_output("nft", arguments)?;
+    if output.status.success() {
+        return Ok(true);
+    }
+    let stderr = command_stderr(&output);
+    if is_nft_missing(&stderr) {
+        return Ok(false);
+    }
+    Err(host_command_error("nft", arguments, &output))
+}
+
+fn is_nft_missing(stderr: &str) -> bool {
+    let normalized = stderr.to_lowercase();
+    normalized.contains("no such file or directory") && !is_privilege_denied(stderr)
 }
 
 fn nft_rule_exists(tap: &str) -> Result<bool, SdkError> {
-    let output = command_output(
-        "nft",
-        &[
-            "-a",
-            "list",
-            "chain",
-            "ip",
-            "taumaru_microvm",
-            "postrouting",
-        ],
-    )?;
-    if !output.status.success() {
+    let arguments = [
+        "-a",
+        "list",
+        "chain",
+        "ip",
+        "taumaru_microvm",
+        "postrouting",
+    ];
+    let output = command_output("nft", &arguments)?;
+    if output.status.success() {
+        return Ok(
+            String::from_utf8_lossy(&output.stdout).contains(&format!("{SDK_OWNERSHIP}:{tap}"))
+        );
+    }
+    let stderr = command_stderr(&output);
+    if is_nft_missing(&stderr) {
         return Ok(false);
     }
-    Ok(String::from_utf8_lossy(&output.stdout).contains(&format!("{SDK_OWNERSHIP}:{tap}")))
+    Err(host_command_error("nft", &arguments, &output))
 }
 
 fn nft_chain_has_rules() -> Result<bool, SdkError> {
-    let output = command_output(
-        "nft",
-        &[
-            "-a",
-            "list",
-            "chain",
-            "ip",
-            "taumaru_microvm",
-            "postrouting",
-        ],
-    )?;
-    if !output.status.success() {
+    let arguments = [
+        "-a",
+        "list",
+        "chain",
+        "ip",
+        "taumaru_microvm",
+        "postrouting",
+    ];
+    let output = command_output("nft", &arguments)?;
+    if output.status.success() {
+        return Ok(String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .any(|line| line.contains("# handle ")));
+    }
+    let stderr = command_stderr(&output);
+    if is_nft_missing(&stderr) {
         return Ok(false);
     }
-    Ok(String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .any(|line| line.contains("# handle ")))
+    Err(host_command_error("nft", &arguments, &output))
 }
 
 fn nft_table_has_no_chains() -> Result<bool, SdkError> {
-    let output = command_output("nft", &["list", "table", "ip", "taumaru_microvm"])?;
-    if !output.status.success() {
+    let arguments = ["list", "table", "ip", "taumaru_microvm"];
+    let output = command_output("nft", &arguments)?;
+    if output.status.success() {
+        return Ok(!String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .any(|line| line.trim_start().starts_with("chain ")));
+    }
+    let stderr = command_stderr(&output);
+    if is_nft_missing(&stderr) {
         return Ok(true);
     }
-    Ok(!String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .any(|line| line.trim_start().starts_with("chain ")))
+    Err(host_command_error("nft", &arguments, &output))
 }
 
 #[cfg(test)]
 mod tests {
     use std::net::{IpAddr, Ipv4Addr};
 
-    use super::{allocate_subnet, bridge_name, guest_mac, route_with_device, tap_name};
+    use super::{
+        allocate_subnet, bridge_name, guest_mac, is_nft_missing, is_privilege_denied,
+        route_with_device, tap_name,
+    };
 
     #[test]
     fn allocates_the_next_private_subnet_after_a_persisted_collision() {
@@ -1648,5 +1714,22 @@ mod tests {
                 "tb-bridge"
             ]
         );
+    }
+
+    #[test]
+    fn privilege_denied_detection_covers_common_kernel_messages() {
+        assert!(is_privilege_denied(
+            "RTNETLINK answers: Operation not permitted"
+        ));
+        assert!(is_privilege_denied("sysctl: permission denied on key"));
+        assert!(!is_privilege_denied("Device does not exist"));
+    }
+
+    #[test]
+    fn nft_absence_requires_a_missing_object_without_denial() {
+        assert!(is_nft_missing("Error: No such file or directory"));
+        assert!(!is_nft_missing(
+            "Error: Operation not permitted (perhaps you must be root?)"
+        ));
     }
 }
