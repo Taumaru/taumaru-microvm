@@ -208,6 +208,31 @@ pub(crate) fn write_guest_network_config(
     guest_address: std::net::Ipv4Addr,
     gateway: std::net::Ipv4Addr,
 ) -> Result<(), SdkError> {
+    write_guest_network_unit(rootfs_path, guest_address, gateway, None)
+}
+
+/// Writes the static network unit for routed LAN mode.
+///
+/// Besides the private `/30` address, the unit carries the LAN address as a
+/// `/32` on the same interface plus a default route through the TAP gateway
+/// with the private address as source. Everything is written offline into the
+/// VM-local rootfs copy, so creation never needs to boot or SSH into the
+/// guest.
+pub(crate) fn write_guest_lan_config(
+    rootfs_path: &Path,
+    guest_address: std::net::Ipv4Addr,
+    gateway: std::net::Ipv4Addr,
+    lan_address: std::net::Ipv4Addr,
+) -> Result<(), SdkError> {
+    write_guest_network_unit(rootfs_path, guest_address, gateway, Some(lan_address))
+}
+
+fn write_guest_network_unit(
+    rootfs_path: &Path,
+    guest_address: std::net::Ipv4Addr,
+    gateway: std::net::Ipv4Addr,
+    lan_address: Option<std::net::Ipv4Addr>,
+) -> Result<(), SdkError> {
     for parent in ["etc", "etc/systemd"] {
         ensure_guest_directory(
             rootfs_path,
@@ -226,9 +251,14 @@ pub(crate) fn write_guest_network_config(
         "create guest network directory",
         "the expected /etc/systemd/network directory is unavailable",
     )?;
-    let contents = format!(
+    let mut contents = format!(
         "[Match]\nName=eth0\n\n[Network]\nAddress={guest_address}/30\nGateway={gateway}\nDNS=1.1.1.1\nDNS=8.8.8.8\nDHCP=no\n"
     );
+    if let Some(lan) = lan_address {
+        contents.push_str(&format!(
+            "Address={lan}/32\n\n[Route]\nGateway={gateway}\nGatewayOnLink=yes\nPreferredSource={guest_address}\n"
+        ));
+    }
     match stat_guest(
         rootfs_path,
         "etc/systemd/network/10-taumaru.network",
@@ -998,6 +1028,31 @@ mod tests {
         assert_eq!(
             guest_file_content(&image, "etc/resolv.conf"),
             "nameserver 1.1.1.1\nnameserver 8.8.8.8\noptions single-request-reopen\n"
+        );
+    }
+
+    #[test]
+    fn writes_a_lan_unit_with_private_and_lan_addresses() {
+        use std::net::Ipv4Addr;
+
+        if !e2fsprogs_available() {
+            return;
+        }
+        let directory = tempdir().expect("temporary directory should exist");
+        let image = directory.path().join("rootfs.ext4");
+        create_ext4_image(&image);
+
+        super::write_guest_lan_config(
+            &image,
+            Ipv4Addr::new(10, 200, 4, 2),
+            Ipv4Addr::new(10, 200, 4, 1),
+            Ipv4Addr::new(192, 168, 3, 50),
+        )
+        .expect("LAN unit should be written");
+
+        assert_eq!(
+            guest_file_content(&image, "etc/systemd/network/10-taumaru.network"),
+            "[Match]\nName=eth0\n\n[Network]\nAddress=10.200.4.2/30\nGateway=10.200.4.1\nDNS=1.1.1.1\nDNS=8.8.8.8\nDHCP=no\nAddress=192.168.3.50/32\n\n[Route]\nGateway=10.200.4.1\nGatewayOnLink=yes\nPreferredSource=10.200.4.2\n"
         );
     }
 }

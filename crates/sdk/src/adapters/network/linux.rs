@@ -108,16 +108,6 @@ impl NetworkController for LinuxNetworkController {
             })
         }
     }
-
-    fn apply_guest_routed_setup(
-        &self,
-        private_key_path: &std::path::Path,
-        private_address: Ipv4Addr,
-        lan_address: Ipv4Addr,
-        gateway: Ipv4Addr,
-    ) -> Result<(), SdkError> {
-        apply_guest_routed_setup(private_key_path, private_address, lan_address, gateway)
-    }
 }
 
 impl LinuxNetworkController {
@@ -212,7 +202,6 @@ impl LinuxNetworkController {
                 persisted,
                 applied: applied.clone(),
                 skipped: Vec::new(),
-                requires_temporary_runtime: false,
             })
         })();
         match result {
@@ -346,7 +335,6 @@ impl LinuxNetworkController {
                     },
                     applied: applied.clone(),
                     skipped: Vec::new(),
-                    requires_temporary_runtime: true,
                 })
             }
             Err(primary) => {
@@ -394,9 +382,6 @@ impl LinuxNetworkController {
             persisted: updated,
             applied,
             skipped,
-            requires_temporary_runtime: request.mode == NetworkMode::Lan
-                && (network.dhcp_lease_reference.is_none()
-                    || network.config.guest_address.is_unspecified()),
         })
     }
 
@@ -1641,52 +1626,6 @@ fn cleanup_routed_rules(
     }
     delete_iptables_spec(&routed_nat_spec(uplink, tap, private_network))?;
     Ok(())
-}
-
-fn apply_guest_routed_setup(
-    private_key_path: &std::path::Path,
-    private_address: Ipv4Addr,
-    lan_address: Ipv4Addr,
-    gateway: Ipv4Addr,
-) -> Result<(), SdkError> {
-    let target = private_address.to_string();
-    let script = format!(
-        "set -e\nip link set {GUEST_INTERFACE} up\nip addr replace {private_address}/30 dev {GUEST_INTERFACE}\nip addr replace {lan_address}/32 dev {GUEST_INTERFACE}\nip route replace default via {gateway} dev {GUEST_INTERFACE} src {private_address}\ncat > /etc/resolv.conf <<'DNS'\nnameserver 1.1.1.1\nnameserver 8.8.8.8\noptions single-request-reopen\nDNS\n"
-    );
-    let output = Command::new("ssh")
-        .args([
-            "-i",
-            &private_key_path.display().to_string(),
-            "-o",
-            "StrictHostKeyChecking=no",
-            "-o",
-            "UserKnownHostsFile=/dev/null",
-            "-o",
-            "ConnectTimeout=2",
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            "LogLevel=ERROR",
-            &format!("root@{target}"),
-            &script,
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(|error| SdkError::HostCommand {
-            program: "ssh".to_owned(),
-            reason: error.to_string(),
-        })?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(host_command_error(
-            "ssh",
-            &["guest", "routed", "setup"],
-            &output,
-        ))
-    }
 }
 
 fn reconcile_tap(

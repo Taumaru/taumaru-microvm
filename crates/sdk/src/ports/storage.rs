@@ -26,4 +26,12 @@ pub(crate) trait GuestStorage: Send + Sync {
         guest_address: std::net::Ipv4Addr,
         gateway: std::net::Ipv4Addr,
     ) -> Result<(), SdkError>;
+
+    fn write_guest_lan_config(
+        &self,
+        rootfs_path: &Path,
+        guest_address: std::net::Ipv4Addr,
+        gateway: std::net::Ipv4Addr,
+        lan_address: std::net::Ipv4Addr,
+    ) -> Result<(), SdkError>;
 }

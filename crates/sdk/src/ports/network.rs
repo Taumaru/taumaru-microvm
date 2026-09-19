@@ -46,7 +46,6 @@ pub(crate) struct NetworkOutcome {
     pub persisted: PersistedNetwork,
     pub applied: Vec<NetworkResource>,
     pub skipped: Vec<NetworkResource>,
-    pub requires_temporary_runtime: bool,
 }
 
 /// Replaceable host-network reconciliation boundary.
@@ -69,12 +68,4 @@ pub(crate) trait NetworkController: Send + Sync {
     ) -> Result<NetworkOutcome, SdkError>;
 
     fn cleanup(&self, network: &PersistedNetwork) -> Result<(), SdkError>;
-
-    fn apply_guest_routed_setup(
-        &self,
-        private_key_path: &std::path::Path,
-        private_address: Ipv4Addr,
-        lan_address: Ipv4Addr,
-        gateway: Ipv4Addr,
-    ) -> Result<(), SdkError>;
 }

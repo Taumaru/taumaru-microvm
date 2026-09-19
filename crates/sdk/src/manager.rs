@@ -4,7 +4,7 @@ use std::net::IpAddr;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 use tokio::fs as async_fs;
@@ -37,7 +37,7 @@ use crate::ports::artifacts::ArtifactSource;
 use crate::ports::credentials::CredentialStore;
 use crate::ports::network::{NetworkController, NetworkRequest};
 use crate::ports::repository::{InventoryState, LocalRepository, StoredMicroVm};
-use crate::ports::runtime::{RuntimeController, RuntimeRequest, TemporaryRuntime};
+use crate::ports::runtime::RuntimeController;
 use crate::ports::storage::GuestStorage;
 use semver::Version;
 
@@ -102,10 +102,8 @@ pub struct MicroVmSdk {
 
 #[derive(Clone, Debug)]
 struct CreationPrerequisites {
-    distribution: Distribution,
     image_path: PathBuf,
     kernel: Kernel,
-    kernel_path: PathBuf,
     firecracker: InstalledBinary,
     firectl: InstalledBinary,
 }
@@ -816,15 +814,12 @@ impl MicroVmSdk {
             .select_runtime_binary(&manifest.binaries, "firectl", &host_architecture)
             .await?;
         Ok(CreationPrerequisites {
-            distribution,
             image_path: image_local.path,
             kernel,
-            kernel_path: kernel_local.path,
             firecracker,
             firectl,
         })
     }
-
     async fn select_runtime_binary(
         &self,
         packages: &[BinaryPackage],
@@ -996,12 +991,28 @@ impl MicroVmSdk {
         let outcome = self
             .network
             .configure(&network_request, None, &used_addresses)?;
-        if let (std::net::IpAddr::V4(guest_address), Some(std::net::IpAddr::V4(gateway))) = (
+        match (
             outcome.persisted.config.guest_address,
             outcome.persisted.config.gateway,
+            outcome.persisted.config.lan_address,
         ) {
-            self.storage
-                .write_guest_network_config(&prepared.path, guest_address, gateway)?;
+            (
+                std::net::IpAddr::V4(guest_address),
+                Some(std::net::IpAddr::V4(gateway)),
+                Some(std::net::IpAddr::V4(lan_address)),
+            ) => {
+                self.storage.write_guest_lan_config(
+                    &prepared.path,
+                    guest_address,
+                    gateway,
+                    lan_address,
+                )?;
+            }
+            (std::net::IpAddr::V4(guest_address), Some(std::net::IpAddr::V4(gateway)), _) => {
+                self.storage
+                    .write_guest_network_config(&prepared.path, guest_address, gateway)?;
+            }
+            _ => {}
         }
         journal.network = Some(outcome.persisted.clone());
         let credential = PersistedCredential {
@@ -1023,97 +1034,12 @@ impl MicroVmSdk {
         })
         .await?;
 
-        let runtime_request = RuntimeRequest {
+        let runtime_record = PersistedRuntime {
             firecracker_path: prerequisites.firecracker.path.clone(),
             firectl_path: prerequisites.firectl.path.clone(),
-            kernel_path: prerequisites.kernel_path.clone(),
-            rootfs_path: prepared.path.clone(),
             socket_path: record.socket_path.clone(),
-            vcpu_count: record.vcpu_count,
-            memory_effective_mib: record.memory_effective_mib,
-            boot_arguments: prerequisites.distribution.boot.kernel_args.clone(),
-            tap_name: outcome.persisted.config.tap_name.clone(),
-            guest_mac: outcome.persisted.guest_mac.clone(),
-            network_boot_argument: outcome.persisted.desired_boot_parameters.clone(),
-        };
-        let runtime_record = if outcome.requires_temporary_runtime {
-            let private_key_path = credential.private_key_path.clone();
-            let IpAddr::V4(private_guest) = outcome.persisted.config.guest_address else {
-                return Err(SdkError::Network {
-                    mode: NetworkMode::Lan.to_string(),
-                    operation: "resolve private guest address".to_owned(),
-                    resource: record.name.clone(),
-                    reason: "routed LAN creation requires an IPv4 private guest address".to_owned(),
-                });
-            };
-            let Some(IpAddr::V4(lan)) = outcome.persisted.config.lan_address else {
-                return Err(SdkError::Network {
-                    mode: NetworkMode::Lan.to_string(),
-                    operation: "resolve LAN address".to_owned(),
-                    resource: record.name.clone(),
-                    reason: "routed LAN creation requires a committed LAN address".to_owned(),
-                });
-            };
-            let Some(IpAddr::V4(gateway)) = outcome.persisted.config.gateway else {
-                return Err(SdkError::Network {
-                    mode: NetworkMode::Lan.to_string(),
-                    operation: "resolve TAP gateway".to_owned(),
-                    resource: record.name.clone(),
-                    reason: "routed LAN creation requires a TAP gateway".to_owned(),
-                });
-            };
-            let mut temporary = self.runtime.start_temporary(&runtime_request)?;
-            if let Err(primary) = self
-                .run_repository(move |repository| {
-                    repository.update_state(vm_id, MicroVmState::Running)
-                })
-                .await
-            {
-                return Err(stop_with_primary(
-                    self.runtime.as_ref(),
-                    &mut temporary,
-                    primary,
-                ));
-            }
-            let setup = self
-                .wait_for_guest_ssh(&temporary, &private_key_path, private_guest)
-                .await
-                .and_then(|_| {
-                    self.network.apply_guest_routed_setup(
-                        &private_key_path,
-                        private_guest,
-                        lan,
-                        gateway,
-                    )
-                });
-            let stopped = stop_temporary(self.runtime.as_ref(), &mut temporary);
-            let stopped = match stopped {
-                Ok(value) => value,
-                Err(error) => {
-                    return match setup {
-                        Ok(()) => Err(error),
-                        Err(primary) => Err(SdkError::Cleanup {
-                            primary: primary.to_string(),
-                            failures: vec![error.to_string()],
-                        }),
-                    };
-                }
-            };
-            self.runtime.verify_stopped(&record.socket_path)?;
-            setup?;
-            let persisted_lan = outcome.persisted.clone();
-            journal.network = Some(persisted_lan.clone());
-            self.run_repository(move |repository| repository.update_network(vm_id, &persisted_lan))
-                .await?;
-            stopped
-        } else {
-            PersistedRuntime {
-                firecracker_path: prerequisites.firecracker.path.clone(),
-                firectl_path: prerequisites.firectl.path.clone(),
-                socket_path: record.socket_path.clone(),
-                process_id: None,
-                process_state: "stopped".to_owned(),
-            }
+            process_id: None,
+            process_state: "stopped".to_owned(),
         };
         self.runtime.verify_stopped(&record.socket_path)?;
         let persisted_runtime = runtime_record.clone();
@@ -1230,58 +1156,6 @@ impl MicroVmSdk {
             failures.push(error.to_string());
         }
         failures
-    }
-
-    async fn wait_for_guest_ssh(
-        &self,
-        temporary: &TemporaryRuntime,
-        private_key_path: &Path,
-        private_address: std::net::Ipv4Addr,
-    ) -> Result<(), SdkError> {
-        if cfg!(test) && private_key_path.ends_with("ssh/id_ed25519") {
-            return Ok(());
-        }
-        let deadline = Instant::now() + temporary.deadline;
-        let target = private_address.to_string();
-        loop {
-            let probe = tokio::process::Command::new("ssh")
-                .args([
-                    "-i",
-                    &private_key_path.display().to_string(),
-                    "-o",
-                    "StrictHostKeyChecking=no",
-                    "-o",
-                    "UserKnownHostsFile=/dev/null",
-                    "-o",
-                    "ConnectTimeout=2",
-                    "-o",
-                    "BatchMode=yes",
-                    "-o",
-                    "LogLevel=ERROR",
-                    &format!("root@{target}"),
-                    "true",
-                ])
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-                .await
-                .map_err(|error| SdkError::HostCommand {
-                    program: "ssh".to_owned(),
-                    reason: error.to_string(),
-                })?;
-            if probe.success() {
-                return Ok(());
-            }
-            if Instant::now() >= deadline {
-                return Err(SdkError::TemporaryRuntime {
-                    component: "guest-ssh".to_owned(),
-                    reason: "guest SSH did not become ready before the deadline".to_owned(),
-                    stopped: false,
-                });
-            }
-            tokio::time::sleep(Duration::from_millis(1000)).await;
-        }
     }
 
     pub(crate) async fn fetch_manifest(&self) -> Result<TaumaruRegistry, SdkError> {
@@ -2087,68 +1961,6 @@ fn unix_timestamp() -> Result<i64, SdkError> {
         .map_err(|_| SdkError::Migration("system clock exceeds SQLite timestamp range".to_owned()))
 }
 
-fn stop_temporary(
-    runtime: &dyn RuntimeController,
-    temporary: &mut TemporaryRuntime,
-) -> Result<PersistedRuntime, SdkError> {
-    match runtime.stop(temporary) {
-        Ok(runtime_record) => Ok(runtime_record),
-        Err(primary) => {
-            let mut failures = Vec::new();
-            let running = match temporary.process.try_wait() {
-                Ok(Some(_)) => false,
-                Ok(None) => true,
-                Err(error) => {
-                    failures.push(format!("inspect temporary process: {error}"));
-                    true
-                }
-            };
-            if running {
-                if let Err(error) = temporary.process.kill() {
-                    failures.push(format!("kill temporary process: {error}"));
-                }
-                if let Err(error) = temporary.process.wait() {
-                    failures.push(format!("wait for temporary process: {error}"));
-                }
-            }
-            match fs::symlink_metadata(&temporary.request.socket_path) {
-                Ok(_) => {
-                    if let Err(error) = fs::remove_file(&temporary.request.socket_path) {
-                        failures.push(format!(
-                            "remove temporary socket {}: {error}",
-                            temporary.request.socket_path.display()
-                        ));
-                    }
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => failures.push(format!(
-                    "inspect temporary socket {}: {error}",
-                    temporary.request.socket_path.display()
-                )),
-            }
-            failures.insert(0, primary.to_string());
-            Err(SdkError::Cleanup {
-                primary: "temporary runtime stop failed".to_owned(),
-                failures,
-            })
-        }
-    }
-}
-
-fn stop_with_primary(
-    runtime: &dyn RuntimeController,
-    temporary: &mut TemporaryRuntime,
-    primary: SdkError,
-) -> SdkError {
-    match stop_temporary(runtime, temporary) {
-        Ok(_) => primary,
-        Err(cleanup) => SdkError::Cleanup {
-            primary: primary.to_string(),
-            failures: vec![cleanup.to_string()],
-        },
-    }
-}
-
 struct DownloadSpecInput {
     artifact_kind: ArtifactKind,
     artifact_id: String,
@@ -2468,10 +2280,8 @@ mod tests {
     use std::fs::{self, OpenOptions};
     use std::net::{IpAddr, Ipv4Addr};
     use std::path::{Path, PathBuf};
-    use std::process::Command;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::time::Duration;
 
     use sha2::{Digest, Sha256};
     use tempfile::tempdir;
@@ -2480,7 +2290,7 @@ mod tests {
     use crate::domain::lifecycle::{MicroVmState, NetworkMode};
     use crate::domain::microvm::{
         CreateMicroVmRequest, NetworkConfiguration, NetworkResource, PersistedNetwork,
-        PersistedNetworkResource, PersistedRuntime,
+        PersistedNetworkResource,
     };
     use crate::domain::registry::TaumaruRegistry;
     use crate::error::SdkError;
@@ -2490,7 +2300,7 @@ mod tests {
         LanAddressOffer, NetworkController, NetworkOutcome, NetworkRequest, UplinkIdentity,
     };
     use crate::ports::repository::InventoryState;
-    use crate::ports::runtime::{RuntimeController, RuntimeRequest, TemporaryRuntime};
+    use crate::ports::runtime::RuntimeController;
     use crate::ports::storage::{GuestStorage, PreparedRootfs};
 
     use super::{
@@ -2656,6 +2466,23 @@ mod tests {
             }
             Ok(())
         }
+
+        fn write_guest_lan_config(
+            &self,
+            rootfs_path: &Path,
+            _guest_address: std::net::Ipv4Addr,
+            _gateway: std::net::Ipv4Addr,
+            _lan_address: std::net::Ipv4Addr,
+        ) -> Result<(), SdkError> {
+            if !rootfs_path.is_file() {
+                return Err(SdkError::GuestFilesystem {
+                    operation: "write test LAN unit".to_owned(),
+                    path: rootfs_path.to_path_buf(),
+                    reason: "test rootfs is missing".to_owned(),
+                });
+            }
+            Ok(())
+        }
     }
 
     #[derive(Default)]
@@ -2709,7 +2536,6 @@ mod tests {
 
     struct TestNetwork {
         cleanup_calls: AtomicUsize,
-        fail_guest_setup: AtomicUsize,
     }
 
     impl NetworkController for TestNetwork {
@@ -2748,7 +2574,6 @@ mod tests {
                     persisted: network.clone(),
                     applied: Vec::new(),
                     skipped: network.resources.iter().map(|item| item.resource).collect(),
-                    requires_temporary_runtime: false,
                 });
             }
             match request.mode {
@@ -2759,23 +2584,6 @@ mod tests {
 
         fn cleanup(&self, _network: &PersistedNetwork) -> Result<(), SdkError> {
             self.cleanup_calls.fetch_add(1, Ordering::Relaxed);
-            Ok(())
-        }
-
-        fn apply_guest_routed_setup(
-            &self,
-            _private_key_path: &Path,
-            _private_address: Ipv4Addr,
-            _lan_address: Ipv4Addr,
-            _gateway: Ipv4Addr,
-        ) -> Result<(), SdkError> {
-            if self.fail_guest_setup.load(Ordering::Relaxed) > 0 {
-                return Err(SdkError::TemporaryRuntime {
-                    component: "guest-ssh".to_owned(),
-                    reason: "injected guest setup failure".to_owned(),
-                    stopped: false,
-                });
-            }
             Ok(())
         }
     }
@@ -2849,7 +2657,6 @@ mod tests {
                 NetworkResource::FirecrackerInterface,
             ],
             skipped: Vec::new(),
-            requires_temporary_runtime: false,
         })
     }
 
@@ -2930,7 +2737,6 @@ mod tests {
                 NetworkResource::FirecrackerInterface,
             ],
             skipped: Vec::new(),
-            requires_temporary_runtime: true,
         })
     }
 
@@ -2942,58 +2748,6 @@ mod tests {
     impl RuntimeController for TestRuntime {
         fn validate_host(&self) -> Result<(), SdkError> {
             Ok(())
-        }
-
-        fn start_temporary(&self, request: &RuntimeRequest) -> Result<TemporaryRuntime, SdkError> {
-            let process = Command::new("sleep").arg("60").spawn().map_err(|error| {
-                SdkError::TemporaryRuntime {
-                    component: "test-runtime".to_owned(),
-                    reason: error.to_string(),
-                    stopped: true,
-                }
-            })?;
-            Ok(TemporaryRuntime {
-                process,
-                request: request.clone(),
-                deadline: Duration::from_millis(1),
-            })
-        }
-
-        fn stop(&self, runtime: &mut TemporaryRuntime) -> Result<PersistedRuntime, SdkError> {
-            let process_id = runtime.process.id();
-            let _ = runtime.process.kill();
-            runtime
-                .process
-                .wait()
-                .map_err(|error| SdkError::TemporaryRuntime {
-                    component: "test-runtime".to_owned(),
-                    reason: error.to_string(),
-                    stopped: false,
-                })?;
-            match fs::symlink_metadata(&runtime.request.socket_path) {
-                Ok(_) => fs::remove_file(&runtime.request.socket_path).map_err(|error| {
-                    SdkError::TemporaryRuntime {
-                        component: "test-socket".to_owned(),
-                        reason: error.to_string(),
-                        stopped: false,
-                    }
-                })?,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    return Err(SdkError::filesystem(
-                        "inspect test socket",
-                        &runtime.request.socket_path,
-                        error,
-                    ));
-                }
-            }
-            Ok(PersistedRuntime {
-                firecracker_path: runtime.request.firecracker_path.clone(),
-                firectl_path: runtime.request.firectl_path.clone(),
-                socket_path: runtime.request.socket_path.clone(),
-                process_id: Some(process_id),
-                process_state: "stopped".to_owned(),
-            })
         }
 
         fn verify_stopped(&self, socket_path: &Path) -> Result<(), SdkError> {
@@ -3242,7 +2996,6 @@ mod tests {
         let credentials = Arc::new(TestCredentials::default());
         let network = Arc::new(TestNetwork {
             cleanup_calls: AtomicUsize::new(0),
-            fail_guest_setup: AtomicUsize::new(0),
         });
         let runtime = Arc::new(TestRuntime {
             verify_calls: AtomicUsize::new(0),
@@ -3360,31 +3113,6 @@ mod tests {
 
         assert!(matches!(error, SdkError::ConfigurationConflict { .. }));
         assert_eq!(storage.prepare_calls.load(Ordering::Relaxed), 1);
-    }
-
-    #[tokio::test]
-    async fn rolls_back_routed_lan_attempt_on_guest_setup_failure() {
-        if std::env::consts::ARCH != "x86_64" {
-            return;
-        }
-        let (sdk, _directory, _storage, _credentials, network, _runtime) = test_sdk(false);
-        network.fail_guest_setup.store(1, Ordering::Relaxed);
-        let mut request = test_request();
-        request.name = "lan_rollback_vm".to_owned();
-        request.expose_on_lan = true;
-        let error = sdk
-            .create_microvm(request)
-            .await
-            .expect_err("guest setup failure should fail creation");
-        assert!(matches!(error, SdkError::TemporaryRuntime { .. }));
-        assert_eq!(network.cleanup_calls.load(Ordering::Relaxed), 1);
-        assert!(!sdk.home.join("vms/lan_rollback_vm").exists());
-        assert!(
-            sdk.repository
-                .find_microvm("lan_rollback_vm")
-                .expect("test inventory should be readable")
-                .is_none()
-        );
     }
 
     #[tokio::test]

@@ -119,8 +119,17 @@ impl GuestStorage for Ext4Storage {
     ) -> Result<(), SdkError> {
         guest_fs::write_guest_network_config(rootfs_path, guest_address, gateway)
     }
-}
 
+    fn write_guest_lan_config(
+        &self,
+        rootfs_path: &Path,
+        guest_address: std::net::Ipv4Addr,
+        gateway: std::net::Ipv4Addr,
+        lan_address: std::net::Ipv4Addr,
+    ) -> Result<(), SdkError> {
+        guest_fs::write_guest_lan_config(rootfs_path, guest_address, gateway, lan_address)
+    }
+}
 fn verify_ext4_filesystem(path: &Path) -> Result<(), SdkError> {
     let output = Command::new("blkid")
         .args(["-p", "-o", "value", "-s", "TYPE"])
