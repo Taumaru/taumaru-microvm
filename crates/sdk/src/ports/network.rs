@@ -65,6 +65,7 @@ pub(crate) trait NetworkController: Send + Sync {
         request: &NetworkRequest,
         existing: Option<&PersistedNetwork>,
         used_addresses: &[(String, IpAddr, String)],
+        used_lan_addresses: &[(String, IpAddr, String)],
     ) -> Result<NetworkOutcome, SdkError>;
 
     fn cleanup(&self, network: &PersistedNetwork) -> Result<(), SdkError>;

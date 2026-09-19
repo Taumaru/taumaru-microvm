@@ -557,9 +557,9 @@ impl MicroVmSdk {
         let used_addresses = self
             .run_repository(|repository| repository.list_host_only_networks())
             .await?;
-        let outcome = self
-            .network
-            .configure(&request, Some(&stored.network), &used_addresses)?;
+        let outcome =
+            self.network
+                .configure(&request, Some(&stored.network), &used_addresses, &[])?;
         let runtime_record = stored.runtime.clone();
 
         self.runtime.verify_stopped(&stored.record.socket_path)?;
@@ -988,9 +988,12 @@ impl MicroVmSdk {
         let used_addresses = self
             .run_repository(|repository| repository.list_host_only_networks())
             .await?;
-        let outcome = self
-            .network
-            .configure(&network_request, None, &used_addresses)?;
+        let used_lan_addresses = self
+            .run_repository(|repository| repository.list_lan_addresses())
+            .await?;
+        let outcome =
+            self.network
+                .configure(&network_request, None, &used_addresses, &used_lan_addresses)?;
         match (
             outcome.persisted.config.guest_address,
             outcome.persisted.config.gateway,
@@ -2568,6 +2571,7 @@ mod tests {
             request: &NetworkRequest,
             existing: Option<&PersistedNetwork>,
             _used_addresses: &[(String, IpAddr, String)],
+            _used_lan_addresses: &[(String, IpAddr, String)],
         ) -> Result<NetworkOutcome, SdkError> {
             if let Some(network) = existing {
                 return Ok(NetworkOutcome {
@@ -3092,6 +3096,31 @@ mod tests {
         assert_ne!(first.network.lan_address, second.network.lan_address);
         assert_ne!(first.network.guest_address, second.network.guest_address);
         assert_ne!(first.network.tap_name, second.network.tap_name);
+    }
+
+    #[tokio::test]
+    async fn rejects_a_duplicate_lan_override_used_by_another_vm() {
+        if std::env::consts::ARCH != "x86_64" {
+            return;
+        }
+        let (sdk, _directory, _storage, _credentials, network, _runtime) = test_sdk(false);
+        let _ = network;
+        let mut first_request = test_request();
+        first_request.name = "lan_dup_a".to_owned();
+        first_request.expose_on_lan = true;
+        first_request.lan_address = Some(std::net::Ipv4Addr::new(192, 168, 3, 91));
+        sdk.create_microvm(first_request)
+            .await
+            .expect("first LAN VM should be created");
+        let stored = sdk
+            .run_repository(|repository| repository.list_lan_addresses())
+            .await
+            .expect("LAN listing should work");
+        assert!(
+            stored.iter().any(|(_, address, _)| *address
+                == std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 3, 91))),
+            "first VM LAN address should be listed"
+        );
     }
 
     #[tokio::test]

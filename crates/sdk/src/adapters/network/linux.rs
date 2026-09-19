@@ -46,12 +46,13 @@ impl NetworkController for LinuxNetworkController {
         request: &NetworkRequest,
         existing: Option<&PersistedNetwork>,
         used_addresses: &[(String, IpAddr, String)],
+        used_lan_addresses: &[(String, IpAddr, String)],
     ) -> Result<NetworkOutcome, SdkError> {
         match existing {
             Some(network) => self.reconcile(request, network),
             None => match request.mode {
                 NetworkMode::HostOnly => self.create_host_only(request, used_addresses),
-                NetworkMode::Lan => self.create_lan(request),
+                NetworkMode::Lan => self.create_lan(request, used_lan_addresses),
             },
         }
     }
@@ -226,7 +227,11 @@ impl LinuxNetworkController {
         }
     }
 
-    fn create_lan(&self, request: &NetworkRequest) -> Result<NetworkOutcome, SdkError> {
+    fn create_lan(
+        &self,
+        request: &NetworkRequest,
+        used_lan_addresses: &[(String, IpAddr, String)],
+    ) -> Result<NetworkOutcome, SdkError> {
         let uplink = self.detect_uplink()?;
         let mut occupied = Vec::new();
         occupied.extend(live_ipv4_addresses()?);
@@ -239,7 +244,12 @@ impl LinuxNetworkController {
                     .to_owned(),
             })?;
         let tap = tap_name(&request.vm_name);
-        let offer = self.select_lan_offer(&uplink, request.lan_address_override, None, &[])?;
+        let offer = self.select_lan_offer(
+            &uplink,
+            request.lan_address_override,
+            None,
+            used_lan_addresses,
+        )?;
         let config = NetworkConfiguration {
             mode: NetworkMode::Lan,
             guest_address: IpAddr::V4(guest),

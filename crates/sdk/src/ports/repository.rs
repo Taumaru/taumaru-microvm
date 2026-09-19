@@ -91,6 +91,8 @@ pub(crate) trait MicroVmRepository: Send + Sync {
 
     fn list_host_only_networks(&self) -> Result<Vec<(String, IpAddr, String)>, SdkError>;
 
+    fn list_lan_addresses(&self) -> Result<Vec<(String, IpAddr, String)>, SdkError>;
+
     fn insert_creating(&self, record: &MicroVmRecord) -> Result<i64, SdkError>;
 
     fn persist_network(&self, vm_id: i64, network: &PersistedNetwork) -> Result<(), SdkError>;

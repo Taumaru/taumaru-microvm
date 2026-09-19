@@ -40,6 +40,30 @@ impl SqliteRepository {
     fn connection(&self) -> Result<Connection, SdkError> {
         open_connection(&self.database_path)
     }
+
+    fn list_network_addresses(
+        &self,
+        query: &str,
+        kind: &str,
+    ) -> Result<Vec<(String, IpAddr, String)>, SdkError> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(query)?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let (name, address, tap) = row?;
+            let address = address.parse::<IpAddr>().map_err(|error| {
+                SdkError::Migration(format!("invalid persisted {kind} for {name}: {error}"))
+            })?;
+            Ok((name, address, tap))
+        })
+        .collect()
+    }
 }
 
 impl ArtifactRepository for SqliteRepository {
@@ -744,27 +768,21 @@ impl MicroVmRepository for SqliteRepository {
     }
 
     fn list_host_only_networks(&self) -> Result<Vec<(String, IpAddr, String)>, SdkError> {
-        let connection = self.connection()?;
-        let mut statement = connection.prepare(
+        self.list_network_addresses(
             "SELECT m.name, n.guest_ip, n.tap_name
              FROM microvms m JOIN vm_networks n ON n.microvm_id = m.id
              WHERE n.mode = 'host_only'",
-        )?;
-        let rows = statement.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-            ))
-        })?;
-        rows.map(|row| {
-            let (name, address, tap) = row?;
-            let address = address.parse::<IpAddr>().map_err(|error| {
-                SdkError::Migration(format!("invalid persisted guest IP for {name}: {error}"))
-            })?;
-            Ok((name, address, tap))
-        })
-        .collect()
+            "guest IP",
+        )
+    }
+
+    fn list_lan_addresses(&self) -> Result<Vec<(String, IpAddr, String)>, SdkError> {
+        self.list_network_addresses(
+            "SELECT m.name, n.lan_ip, n.tap_name
+             FROM microvms m JOIN vm_networks n ON n.microvm_id = m.id
+             WHERE n.mode = 'lan' AND n.lan_ip IS NOT NULL",
+            "LAN IP",
+        )
     }
 
     fn insert_creating(&self, record: &MicroVmRecord) -> Result<i64, SdkError> {
