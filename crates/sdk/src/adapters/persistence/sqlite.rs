@@ -131,21 +131,36 @@ impl ArtifactRepository for SqliteRepository {
         })?;
         let expected_relative_path = spec.relative_path.to_string_lossy();
         let expected_absolute_path = spec.absolute_path.to_string_lossy();
-        let physical_match = integrity.is_some_and(|value| {
-            artifact_type == artifact_type_name(&spec.artifact_kind)
-                && registry_path == spec.registry_path
-                && registry_url == spec.registry_url
-                && filename == spec.filename
-                && relative_path == expected_relative_path
-                && absolute_path == expected_absolute_path
-                && value.size_bytes == spec.expected_size
-                && value.sha256 == spec.expected_sha256
-                && value.size_bytes == expected_size
-                && value.sha256 == expected_sha256
-                && actual_size == value.size_bytes
-                && actual_sha256 == value.sha256
-                && status == "verified"
-        });
+        let inventory_match = artifact_type == artifact_type_name(&spec.artifact_kind)
+            && registry_path == spec.registry_path
+            && registry_url == spec.registry_url
+            && filename == spec.filename
+            && relative_path == expected_relative_path
+            && absolute_path == expected_absolute_path
+            && expected_size == spec.expected_size
+            && expected_sha256 == spec.expected_sha256
+            && actual_size == expected_size
+            && actual_sha256 == expected_sha256
+            && status == "verified";
+        if integrity.is_none() {
+            if !inventory_match {
+                return Ok(InventoryState::Missing);
+            }
+            return if member_relation_exists(&connection, spec, download_id)? {
+                Ok(InventoryState::Complete)
+            } else {
+                Ok(InventoryState::Incomplete)
+            };
+        }
+        let physical_match = inventory_match
+            && integrity.is_some_and(|value| {
+                value.size_bytes == spec.expected_size
+                    && value.sha256 == spec.expected_sha256
+                    && value.size_bytes == expected_size
+                    && value.sha256 == expected_sha256
+                    && actual_size == value.size_bytes
+                    && actual_sha256 == value.sha256
+            });
 
         if !physical_match {
             return Ok(InventoryState::Missing);

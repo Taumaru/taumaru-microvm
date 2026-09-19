@@ -477,6 +477,74 @@ async fn image_readiness_tracks_download_repair_and_rejection()
 }
 
 #[tokio::test]
+async fn repeated_kernel_and_image_downloads_skip_hashing_but_repair_stale_files()
+-> Result<(), Box<dyn Error + Send + Sync>> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let server = FixtureServer::start().await?;
+    let home = tempdir()?;
+    let sdk = MicroVmSdk::with_registry_base_url(home.path(), server.base_url())?;
+
+    let kernel = sdk.download_kernel("linux-test-x86_64", |_| {}).await?;
+    let image = sdk
+        .download_distribution_image("alpine-test-1.0", "alpine-test-minimal", |_| {})
+        .await?;
+    let requests_after_first = server.artifact_request_count();
+
+    // Warm-cache repeats: no new transfer, no re-hash (mtime sentinel proves the
+    // file was never rewritten).
+    let stamp = |path: &std::path::Path| {
+        path.metadata()
+            .expect("artifact file should exist")
+            .modified()
+            .expect("mtime should be readable")
+    };
+    let kernel_stamp = stamp(&kernel.file.absolute_path);
+    let image_stamp = stamp(&image.file.absolute_path);
+
+    let kernel_repeat = sdk.download_kernel("linux-test-x86_64", |_| {}).await?;
+    let image_repeat = sdk
+        .download_distribution_image("alpine-test-1.0", "alpine-test-minimal", |_| {})
+        .await?;
+    assert_eq!(
+        kernel_repeat.file.disposition,
+        DownloadDisposition::SkippedExisting
+    );
+    assert_eq!(
+        image_repeat.file.disposition,
+        DownloadDisposition::SkippedExisting
+    );
+    assert_eq!(stamp(&kernel.file.absolute_path), kernel_stamp);
+    assert_eq!(stamp(&image.file.absolute_path), image_stamp);
+    assert_eq!(server.artifact_request_count(), requests_after_first);
+
+    // Corrupt the cached image: inventory row disagrees with the manifest, so the
+    // next download must replace it with a fresh verified transfer.
+    std::fs::write(&image.file.absolute_path, b"corrupted-payload")?;
+    let repaired = sdk
+        .download_distribution_image("alpine-test-1.0", "alpine-test-minimal", |_| {})
+        .await?;
+    assert_eq!(repaired.file.disposition, DownloadDisposition::Downloaded);
+    assert_eq!(
+        std::fs::read(&repaired.file.absolute_path)?,
+        include_bytes!("fixtures/rootfs-fixture")
+    );
+    let _ = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock should advance");
+
+    // Delete the cached kernel file: missing file with a Complete row must be
+    // re-downloaded, not reported as a phantom skip.
+    std::fs::remove_file(&kernel.file.absolute_path)?;
+    let redownloaded = sdk.download_kernel("linux-test-x86_64", |_| {}).await?;
+    assert_eq!(
+        redownloaded.file.disposition,
+        DownloadDisposition::Downloaded
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn present_images_list_reports_inventory_without_registry_or_hashing()
 -> Result<(), Box<dyn Error + Send + Sync>> {
     let server = FixtureServer::start().await?;

@@ -53,18 +53,28 @@ pub(crate) enum CacheDecision {
     Skip,
 }
 
+fn target_is_reusable_file(file_type: std::fs::FileType, is_file: bool) -> bool {
+    !file_type.is_symlink() && is_file
+}
+
 pub(crate) fn decide_cache(
     spec: &DownloadSpec,
     integrity: Option<&FileIntegrity>,
     inventory_state: InventoryState,
 ) -> CacheDecision {
+    // A `Complete` inventory row already pins size and digest from a previous
+    // verified transfer, so reuse trusts it without re-hashing the file. Hashing
+    // happens only for Adopt (unrecorded file) and Replace (fresh transfer).
+    if inventory_state == InventoryState::Complete {
+        return CacheDecision::Skip;
+    }
     let physical_file_is_correct = integrity.is_some_and(|value| {
         value.size_bytes == spec.expected_size && value.sha256 == spec.expected_sha256
     });
     match (physical_file_is_correct, inventory_state) {
-        (true, InventoryState::Complete) => CacheDecision::Skip,
         (true, InventoryState::Missing | InventoryState::Incomplete) => CacheDecision::Adopt,
         (false, _) => CacheDecision::Replace,
+        (true, InventoryState::Complete) => CacheDecision::Skip,
     }
 }
 
@@ -1981,14 +1991,25 @@ impl MicroVmSdk {
             on_progress(tracker.event(&member.spec, DownloadPhase::Cancelled, 0));
             return Err(SdkError::Cancelled);
         }
-        let physical_integrity = calculate_file_integrity(&member.spec.absolute_path).await?;
+        // Image and kernel reuse trusts a `Complete` inventory row without re-hashing
+        // the file. Hashing runs only when adoption is possible (a `Missing` or
+        // `Incomplete` row with a physical file to persist) or for binary members,
+        // which keep the previous hash-first behavior because creation re-resolves
+        // them on every run.
+        let hash_first = matches!(member.spec.artifact_kind, ArtifactKind::Binary);
         let repository_spec = member.spec.clone();
-        let repository_integrity = physical_integrity.clone();
         let inventory_state = self
-            .run_repository(move |repository| {
-                repository.inspect_member(&repository_spec, repository_integrity.as_ref())
-            })
+            .run_repository(move |repository| repository.inspect_member(&repository_spec, None))
             .await?;
+        let physical_integrity = if hash_first
+            || matches!(
+                inventory_state,
+                InventoryState::Missing | InventoryState::Incomplete
+            ) {
+            calculate_file_integrity(&member.spec.absolute_path).await?
+        } else {
+            None
+        };
 
         if cancellation.is_cancelled() {
             on_progress(tracker.event(&member.spec, DownloadPhase::Cancelled, 0));
@@ -1997,12 +2018,68 @@ impl MicroVmSdk {
 
         match decide_cache(&member.spec, physical_integrity.as_ref(), inventory_state) {
             CacheDecision::Skip => {
-                let integrity = physical_integrity.ok_or_else(|| {
-                    SdkError::Migration(format!(
-                        "complete inventory has no physical file for {}",
-                        member.spec.artifact_key
-                    ))
-                })?;
+                if hash_first {
+                    let integrity = physical_integrity.ok_or_else(|| {
+                        SdkError::Migration(format!(
+                            "complete inventory has no physical file for {}",
+                            member.spec.artifact_key
+                        ))
+                    })?;
+                    on_progress(tracker.event(&member.spec, DownloadPhase::SkippedExisting, 0));
+                    return Ok(downloaded_file(
+                        member,
+                        integrity,
+                        DownloadDisposition::SkippedExisting,
+                    ));
+                }
+                if let Some(integrity) = physical_integrity.as_ref() {
+                    // A computed hash disagrees with the Complete row: the file
+                    // changed after verification, so replace instead of Skip.
+                    // (Warm-cache repeats skip this entirely: no hash computed.)
+                    if integrity.size_bytes != member.spec.expected_size
+                        || integrity.sha256 != member.spec.expected_sha256
+                    {
+                        return self
+                            .replace_member(member, cancellation, tracker, on_progress)
+                            .await;
+                    }
+                }
+                let verified_size = member.spec.expected_size;
+                let verified_digest = member.spec.expected_sha256.clone();
+                let target = member.spec.absolute_path.clone();
+                let metadata = match async_fs::symlink_metadata(&target).await {
+                    Ok(metadata) => metadata,
+                    Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                        return self
+                            .replace_member(member, cancellation, tracker, on_progress)
+                            .await;
+                    }
+                    Err(source) => {
+                        return Err(SdkError::filesystem(
+                            "inspect artifact file",
+                            &target,
+                            source,
+                        ));
+                    }
+                };
+                if !target_is_reusable_file(metadata.file_type(), metadata.is_file()) {
+                    // Inventory claims a file that is gone or not regular: fall
+                    // through to Replace instead of reporting a phantom Skip.
+                    return self
+                        .replace_member(member, cancellation, tracker, on_progress)
+                        .await;
+                }
+                if metadata.len() != verified_size {
+                    // Cheap size signal (no read) already disproves the Complete
+                    // row: replace without paying for a doomed hash.
+                    return self
+                        .replace_member(member, cancellation, tracker, on_progress)
+                        .await;
+                }
+                let integrity = FileIntegrity {
+                    size_bytes: verified_size,
+                    sha256: verified_digest,
+                };
                 on_progress(tracker.event(&member.spec, DownloadPhase::SkippedExisting, 0));
                 Ok(downloaded_file(
                     member,
@@ -2011,12 +2088,36 @@ impl MicroVmSdk {
                 ))
             }
             CacheDecision::Adopt => {
-                let integrity = physical_integrity.ok_or_else(|| {
-                    SdkError::Migration(format!(
-                        "cache adoption has no physical file for {}",
-                        member.spec.artifact_key
-                    ))
-                })?;
+                let integrity = match physical_integrity {
+                    Some(integrity) => integrity,
+                    None => {
+                        // Unrecorded file with correct bytes: hash once to persist the
+                        // adoption. Complete rows never reach this arm (Skip above).
+                        let verified_size = member.spec.expected_size;
+                        let target = member.spec.absolute_path.clone();
+                        let metadata =
+                            async_fs::symlink_metadata(&target)
+                                .await
+                                .map_err(|source| {
+                                    SdkError::filesystem("inspect artifact file", &target, source)
+                                })?;
+                        if target_is_reusable_file(metadata.file_type(), metadata.is_file()) {
+                            calculate_file_integrity(&member.spec.absolute_path).await?
+                        } else {
+                            None
+                        }
+                        .filter(|integrity| {
+                            integrity.size_bytes == verified_size
+                                && integrity.sha256 == member.spec.expected_sha256
+                        })
+                        .ok_or_else(|| {
+                            SdkError::Migration(format!(
+                                "cache adoption has no physical file for {}",
+                                member.spec.artifact_key
+                            ))
+                        })?
+                    }
+                };
                 self.persist_member(member, &integrity).await?;
                 on_progress(tracker.event(&member.spec, DownloadPhase::AdoptedExisting, 0));
                 Ok(downloaded_file(
@@ -2026,31 +2127,41 @@ impl MicroVmSdk {
                 ))
             }
             CacheDecision::Replace => {
-                if cancellation.is_cancelled() {
-                    on_progress(tracker.event(&member.spec, DownloadPhase::Cancelled, 0));
-                    return Err(SdkError::Cancelled);
-                }
-                let removal_spec = member.spec.clone();
-                self.run_repository(move |repository| repository.remove_member(&removal_spec))
-                    .await?;
-                remove_invalid_target_if_exists(&member.spec.absolute_path).await?;
-                let integrity = self
-                    .stream_and_publish(member, cancellation, tracker, on_progress)
-                    .await?;
-                self.persist_member(member, &integrity).await?;
-                on_progress(tracker.event(
-                    &member.spec,
-                    DownloadPhase::Completed,
-                    integrity.size_bytes,
-                ));
-                tracker.commit_member(integrity.size_bytes);
-                Ok(downloaded_file(
-                    member,
-                    integrity,
-                    DownloadDisposition::Downloaded,
-                ))
+                self.replace_member(member, cancellation, tracker, on_progress)
+                    .await
             }
         }
+    }
+
+    async fn replace_member<F>(
+        &self,
+        member: &DownloadMember,
+        cancellation: &DownloadCancellation,
+        tracker: &mut ProgressTracker,
+        on_progress: &mut F,
+    ) -> Result<DownloadedFile, SdkError>
+    where
+        F: FnMut(DownloadProgress) + Send,
+    {
+        if cancellation.is_cancelled() {
+            on_progress(tracker.event(&member.spec, DownloadPhase::Cancelled, 0));
+            return Err(SdkError::Cancelled);
+        }
+        let removal_spec = member.spec.clone();
+        self.run_repository(move |repository| repository.remove_member(&removal_spec))
+            .await?;
+        remove_invalid_target_if_exists(&member.spec.absolute_path).await?;
+        let integrity = self
+            .stream_and_publish(member, cancellation, tracker, on_progress)
+            .await?;
+        self.persist_member(member, &integrity).await?;
+        on_progress(tracker.event(&member.spec, DownloadPhase::Completed, integrity.size_bytes));
+        tracker.commit_member(integrity.size_bytes);
+        Ok(downloaded_file(
+            member,
+            integrity,
+            DownloadDisposition::Downloaded,
+        ))
     }
 
     async fn persist_member(
@@ -3081,13 +3192,18 @@ mod tests {
     }
 
     #[test]
-    fn cache_decision_skips_only_complete_correct_entries() {
+    fn cache_decision_trusts_complete_inventory_without_hashing() {
         let spec = spec();
         let correct = FileIntegrity {
             size_bytes: 4,
             sha256: "a".repeat(64),
         };
 
+        // Complete inventory reuses without hashing: even no physical proof Skips.
+        assert_eq!(
+            decide_cache(&spec, None, InventoryState::Complete),
+            CacheDecision::Skip
+        );
         assert_eq!(
             decide_cache(&spec, Some(&correct), InventoryState::Complete),
             CacheDecision::Skip
@@ -3111,12 +3227,16 @@ mod tests {
         };
 
         assert_eq!(
-            decide_cache(&spec, None, InventoryState::Complete),
+            decide_cache(&spec, None, InventoryState::Missing),
             CacheDecision::Replace
         );
         assert_eq!(
             decide_cache(&spec, Some(&wrong), InventoryState::Incomplete),
             CacheDecision::Replace
+        );
+        assert_eq!(
+            decide_cache(&spec, Some(&wrong), InventoryState::Complete),
+            CacheDecision::Skip
         );
     }
 
