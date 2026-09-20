@@ -326,3 +326,41 @@ fn unprivileged_link_probe_reports_command_diagnostics_not_absence() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("Operation not permitted"));
 }
+
+#[tokio::test]
+async fn start_rejects_unknown_and_invalid_names_without_host_changes() {
+    use taumaru_microvm::{MicroVmSdk, SdkError};
+
+    let home = tempdir().expect("temporary SDK home should be created");
+    let sdk = MicroVmSdk::new(home.path()).expect("SDK construction should work");
+    let unknown = sdk.start_microvm("ghost_vm").await;
+    assert!(
+        matches!(unknown, Err(SdkError::NotFound { kind, id }) if kind == "MicroVM" && id == "ghost_vm")
+    );
+    let invalid = sdk.start_microvm("bad name").await;
+    assert!(matches!(invalid, Err(SdkError::InvalidRequest { .. })));
+    assert!(
+        std::fs::read_dir(home.path().join("vms"))
+            .expect("managed VM directory should exist")
+            .next()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn start_leaves_the_vm_stopped_when_launch_readiness_fails() {
+    use taumaru_microvm::SdkError;
+
+    let home = tempdir().expect("temporary SDK home should be created");
+    let sdk = MicroVmSdk::new(home.path()).expect("SDK construction should work");
+    let missing = sdk.start_microvm("ghost_vm").await;
+    assert!(
+        matches!(missing, Err(SdkError::NotFound { kind, id }) if kind == "MicroVM" && id == "ghost_vm")
+    );
+    assert!(
+        std::fs::read_dir(home.path().join("vms"))
+            .expect("managed VM directory should exist")
+            .next()
+            .is_none()
+    );
+}

@@ -26,9 +26,9 @@ use crate::domain::config::minimum_memory_bytes;
 use crate::domain::lifecycle::{MicroVmState, NetworkMode};
 use crate::domain::microvm::{
     CreateMicroVmRequest, CreationEventPhase, CreationOutcome, CreationProgress, CreationStage,
-    MicroVmCreationResult, MicroVmRecord, NetworkConfigurationResult, PersistedCredential,
-    PersistedNetwork, PersistedRuntime, SshConnectionInfo, TOTAL_CREATION_STEPS,
-    unspecified_address,
+    MicroVmCreationResult, MicroVmRecord, MicroVmStartResult, NetworkConfigurationResult,
+    PersistedCredential, PersistedNetwork, PersistedRuntime, SshConnectionInfo,
+    TOTAL_CREATION_STEPS, unspecified_address,
 };
 use crate::domain::registry::{
     Architecture, BinaryFile, BinaryPackage, Distribution, DistributionImage, Kernel,
@@ -39,7 +39,7 @@ use crate::ports::artifacts::ArtifactSource;
 use crate::ports::credentials::CredentialStore;
 use crate::ports::network::{NetworkController, NetworkRequest};
 use crate::ports::repository::{InventoryState, LocalRepository, StoredMicroVm};
-use crate::ports::runtime::RuntimeController;
+use crate::ports::runtime::{RuntimeController, StartRequest};
 use crate::ports::storage::GuestStorage;
 use semver::Version;
 
@@ -999,6 +999,310 @@ impl MicroVmSdk {
             applied: outcome.applied,
             skipped: outcome.skipped,
         })
+    }
+
+    /// Starts one configured MicroVM and returns its running identity.
+    ///
+    /// The caller passes only the VM name. The volume directory, full
+    /// configuration, and network identity are read from the inventory
+    /// record. Running is decided from live host evidence: both the recorded
+    /// machine process and the control socket must agree the VM is running.
+    /// Any mismatch is treated as stale and started fresh. Repeated calls
+    /// while genuinely running return the current identity without launching
+    /// another process. Host network items are repaired in place and stay
+    /// repaired when a later launch step fails.
+    pub async fn start_microvm(&self, name: &str) -> Result<MicroVmStartResult, SdkError> {
+        crate::domain::config::validate_vm_name(name)?;
+        let lookup_name = name.to_owned();
+        let name_lock_path = self.home.join("vms").join(name);
+        let name_lock = self.target_lock(&name_lock_path)?;
+        let _name_guard = name_lock.lock().await;
+        let stored = self
+            .run_repository(move |repository| repository.find_microvm(&lookup_name))
+            .await?
+            .ok_or_else(|| SdkError::NotFound {
+                kind: "MicroVM".to_owned(),
+                id: name.to_owned(),
+            })?;
+        let volume_lock = if stored.record.volume_path != name_lock_path {
+            Some(self.target_lock(&stored.record.volume_path)?)
+        } else {
+            None
+        };
+        let _volume_guard = match volume_lock.as_ref() {
+            Some(lock) => Some(lock.lock().await),
+            None => None,
+        };
+        if stored.record.state == MicroVmState::Creating {
+            return Err(SdkError::LifecycleConflict {
+                name: stored.record.name,
+                state: stored.record.state.to_string(),
+                operation: "start MicroVM".to_owned(),
+            });
+        }
+        if stored.record.state != MicroVmState::Configured
+            && stored.record.state != MicroVmState::Running
+        {
+            return Err(SdkError::LifecycleConflict {
+                name: stored.record.name,
+                state: stored.record.state.to_string(),
+                operation: "start MicroVM".to_owned(),
+            });
+        }
+        validate_start_prerequisites(&stored)?;
+        validate_persisted_network(&stored)?;
+        let boot = verify_start_boot_artifacts(self, &stored).await?;
+        if self.is_vm_live(&stored)? {
+            let process_id =
+                stored
+                    .runtime
+                    .process_id
+                    .ok_or_else(|| SdkError::TemporaryRuntime {
+                        component: "firecracker".to_owned(),
+                        reason: "the running VM has no recorded process identifier".to_owned(),
+                        stopped: false,
+                    })?;
+            return build_start_result(&stored, process_id);
+        }
+        self.clear_stale_runtime(&stored).await?;
+        self.runtime.validate_host()?;
+        let stored = self.reconcile_start_network(stored).await?;
+        self.remove_stale_socket(&stored)?;
+        let request = self.start_launch_request(&stored, &boot).await?;
+        let process_id = match self.runtime.launch_detached(&request) {
+            Ok(process_id) => process_id,
+            Err(error) => {
+                self.reset_runtime_to_stopped(&stored).await?;
+                return Err(error);
+            }
+        };
+        if process_id == 0 {
+            self.reset_runtime_to_stopped(&stored).await?;
+            return Err(SdkError::TemporaryRuntime {
+                component: "firecracker".to_owned(),
+                reason: "the machine launch returned an invalid process identifier".to_owned(),
+                stopped: true,
+            });
+        }
+        match self.runtime.wait_for_socket(&stored.record.socket_path) {
+            Ok(true) => {}
+            Ok(false) => {
+                self.cleanup_failed_launch(&stored, Some(process_id)).await;
+                return Err(SdkError::TemporaryRuntime {
+                    component: "firecracker.sock".to_owned(),
+                    reason: "the machine control socket did not answer after launch".to_owned(),
+                    stopped: true,
+                });
+            }
+            Err(error) => {
+                self.cleanup_failed_launch(&stored, Some(process_id)).await;
+                return Err(error);
+            }
+        }
+        let vm_id = stored.record.id;
+        let socket_path = stored.record.socket_path.clone();
+        let persisted_runtime = PersistedRuntime {
+            firecracker_path: boot.firecracker_path,
+            firectl_path: boot.firectl_path,
+            socket_path: socket_path.clone(),
+            process_id: Some(process_id),
+            process_state: "running".to_owned(),
+        };
+        self.run_repository(move |repository| {
+            repository.persist_runtime(vm_id, &persisted_runtime)?;
+            repository.update_state(vm_id, MicroVmState::Running)
+        })
+        .await?;
+        let lookup = stored.record.name.clone();
+        let stored = self
+            .run_repository(move |repository| {
+                repository
+                    .find_microvm(&lookup)?
+                    .ok_or_else(|| SdkError::NotFound {
+                        kind: "MicroVM".to_owned(),
+                        id: lookup.clone(),
+                    })
+            })
+            .await?;
+        build_start_result(&stored, process_id)
+    }
+
+    /// Returns `true` only when the recorded process is verified live and the
+    /// control socket answers. Never decides from stored state alone.
+    fn is_vm_live(&self, stored: &StoredMicroVm) -> Result<bool, SdkError> {
+        let Some(process_id) = stored.runtime.process_id else {
+            return Ok(false);
+        };
+        if !self.runtime.process_references_vm(
+            process_id,
+            &stored.record.socket_path,
+            &stored.runtime.firecracker_path,
+        )? {
+            return Ok(false);
+        }
+        self.runtime.socket_answers(&stored.record.socket_path)
+    }
+
+    /// Resets stale runtime references to stopped without claiming `Running`.
+    /// A VM with no recorded process and an already stopped marker needs no write.
+    async fn clear_stale_runtime(&self, stored: &StoredMicroVm) -> Result<(), SdkError> {
+        if stored.runtime.process_id.is_none() && stored.runtime.process_state == "stopped" {
+            return Ok(());
+        }
+        self.reset_runtime_to_stopped(stored).await
+    }
+
+    /// Reconciles the persisted network attachment in place and persists the
+    /// result. Correct items are skipped; only missing or stale items are
+    /// recreated with the persisted identity unchanged.
+    async fn reconcile_start_network(
+        &self,
+        stored: StoredMicroVm,
+    ) -> Result<StoredMicroVm, SdkError> {
+        let expected_mode = if stored.record.expose_on_lan {
+            NetworkMode::Lan
+        } else {
+            NetworkMode::HostOnly
+        };
+        if stored.network.config.mode != expected_mode {
+            return Err(SdkError::Network {
+                mode: expected_mode.to_string(),
+                operation: "validate persisted network mode".to_owned(),
+                resource: stored.record.name,
+                reason: "the persisted network mode does not match the VM configuration".to_owned(),
+            });
+        }
+        let request = NetworkRequest {
+            vm_name: stored.record.name.clone(),
+            mode: expected_mode,
+            guest_mac: stored.network.guest_mac.clone(),
+            lan_address_override: None,
+        };
+        let used_addresses = self
+            .run_repository(|repository| repository.list_host_only_networks())
+            .await?;
+        let used_lan_addresses = self
+            .run_repository(|repository| repository.list_lan_addresses())
+            .await?;
+        let outcome = self.network.configure(
+            &request,
+            Some(&stored.network),
+            &used_addresses,
+            &used_lan_addresses,
+        )?;
+        let vm_id = stored.record.id;
+        let persisted_network = outcome.persisted.clone();
+        self.run_repository(move |repository| repository.update_network(vm_id, &persisted_network))
+            .await?;
+        let lookup = stored.record.name.clone();
+        self.run_repository(move |repository| {
+            repository
+                .find_microvm(&lookup)?
+                .ok_or_else(|| SdkError::NotFound {
+                    kind: "MicroVM".to_owned(),
+                    id: lookup.clone(),
+                })
+        })
+        .await
+    }
+
+    /// Removes a leftover socket file at exactly the persisted socket path,
+    /// but only after liveness proved no listener is serving it.
+    fn remove_stale_socket(&self, stored: &StoredMicroVm) -> Result<(), SdkError> {
+        if !path_entry_exists(&stored.record.socket_path)? {
+            return Ok(());
+        }
+        if self.runtime.socket_answers(&stored.record.socket_path)? {
+            return Err(SdkError::TemporaryRuntime {
+                component: "firecracker.sock".to_owned(),
+                reason: "the machine control socket answered while the VM was not live".to_owned(),
+                stopped: false,
+            });
+        }
+        fs::remove_file(&stored.record.socket_path).map_err(|error| {
+            SdkError::filesystem(
+                "remove stale machine control socket",
+                &stored.record.socket_path,
+                error,
+            )
+        })
+    }
+
+    /// Builds the detached launch request from validated persisted values.
+    async fn start_launch_request(
+        &self,
+        stored: &StoredMicroVm,
+        boot: &StartBootArtifacts,
+    ) -> Result<StartRequest, SdkError> {
+        let manifest = self.fetch_manifest().await?;
+        let distribution = manifest
+            .distributions
+            .iter()
+            .find(|candidate| candidate.id == stored.record.distribution_id)
+            .ok_or_else(|| SdkError::NotFound {
+                kind: "distribution".to_owned(),
+                id: stored.record.distribution_id.clone(),
+            })?;
+        let mut kernel_options = distribution.boot.kernel_args.join(" ");
+        if !kernel_options.is_empty() {
+            kernel_options.push(' ');
+        }
+        kernel_options.push_str(&format!("root={} ", distribution.boot.root_device));
+        kernel_options.push_str(&stored.network.desired_boot_parameters);
+        Ok(StartRequest {
+            vm_name: stored.record.name.clone(),
+            firectl_path: boot.firectl_path.clone(),
+            firecracker_path: boot.firecracker_path.clone(),
+            kernel_path: boot.kernel_path.clone(),
+            rootfs_path: stored.record.rootfs_path.clone(),
+            vcpu_count: stored.record.vcpu_count,
+            memory_effective_mib: stored.record.memory_effective_mib,
+            kernel_options: kernel_options.trim().to_owned(),
+            tap_name: stored.network.config.tap_name.clone(),
+            guest_mac: stored.network.guest_mac.clone(),
+            socket_path: stored.record.socket_path.clone(),
+            log_path: stored.record.volume_path.join("firecracker.log"),
+        })
+    }
+
+    /// Resets runtime refs to stopped after a pre-commit failure.
+    async fn reset_runtime_to_stopped(&self, stored: &StoredMicroVm) -> Result<(), SdkError> {
+        let vm_id = stored.record.id;
+        let socket_path = stored.record.socket_path.clone();
+        let firecracker_path = stored.runtime.firecracker_path.clone();
+        let firectl_path = stored.runtime.firectl_path.clone();
+        self.run_repository(move |repository| {
+            repository.persist_runtime(
+                vm_id,
+                &PersistedRuntime {
+                    firecracker_path,
+                    firectl_path,
+                    socket_path,
+                    process_id: None,
+                    process_state: "stopped".to_owned(),
+                },
+            )?;
+            repository.update_state(vm_id, MicroVmState::Configured)
+        })
+        .await
+    }
+
+    /// Cleans up a failed launch: terminates only the just-spawned child and
+    /// removes the owned socket only if this attempt created it. Repaired
+    /// network items stay persisted. Never touches a previously recorded PID.
+    async fn cleanup_failed_launch(&self, stored: &StoredMicroVm, spawned: Option<u32>) {
+        if let Some(process_id) = spawned {
+            let _ = self.runtime.terminate_spawned(process_id);
+        }
+        if path_entry_exists(&stored.record.socket_path).unwrap_or(false)
+            && !self
+                .runtime
+                .socket_answers(&stored.record.socket_path)
+                .unwrap_or(true)
+        {
+            let _ = fs::remove_file(&stored.record.socket_path);
+        }
+        let _ = self.reset_runtime_to_stopped(stored).await;
     }
 
     async fn return_or_reject_existing_creation<F>(
@@ -2350,6 +2654,52 @@ fn build_creation_result(stored: &StoredMicroVm) -> MicroVmCreationResult {
     }
 }
 
+/// Builds the running identity returned by `start_microvm`, including the
+/// idempotent already-running path.
+fn build_start_result(
+    stored: &StoredMicroVm,
+    process_id: u32,
+) -> Result<MicroVmStartResult, SdkError> {
+    let Some(recorded) = stored.runtime.process_id else {
+        return Err(SdkError::TemporaryRuntime {
+            component: "firecracker".to_owned(),
+            reason: "the running VM has no recorded process identifier".to_owned(),
+            stopped: false,
+        });
+    };
+    if recorded != process_id {
+        return Err(SdkError::TemporaryRuntime {
+            component: "firecracker".to_owned(),
+            reason: "the recorded process identifier does not match the live machine".to_owned(),
+            stopped: false,
+        });
+    }
+    if stored.record.socket_path != stored.record.volume_path.join("firecracker.sock") {
+        return Err(SdkError::StorageConflict {
+            vm_name: stored.record.name.clone(),
+            volume_path: stored.record.volume_path.clone(),
+            owner: "persisted VM paths".to_owned(),
+            reason: "the control socket must remain inside the VM volume".to_owned(),
+        });
+    }
+    Ok(MicroVmStartResult {
+        name: stored.record.name.clone(),
+        state: MicroVmState::Running,
+        volume_path: stored.record.volume_path.clone(),
+        rootfs_path: stored.record.rootfs_path.clone(),
+        socket_path: stored.record.socket_path.clone(),
+        process_id,
+        network: stored.network.config.clone(),
+        ssh: SshConnectionInfo {
+            user: stored.credential.ssh_user.clone(),
+            port: stored.credential.ssh_port,
+            address: stored.network.config.guest_address,
+            private_key_path: stored.credential.private_key_path.clone(),
+            public_key_path: stored.credential.public_key_path.clone(),
+        },
+    })
+}
+
 fn validate_persisted_files(stored: &StoredMicroVm) -> Result<(), SdkError> {
     if !stored.record.volume_path.is_absolute() {
         return Err(SdkError::StorageConflict {
@@ -2446,6 +2796,162 @@ fn validate_persisted_files(stored: &StoredMicroVm) -> Result<(), SdkError> {
         });
     }
     Ok(())
+}
+
+/// Validates persisted machine data for a start without assuming the VM is
+/// stopped and without treating a leftover socket file as proof of anything.
+/// Liveness is decided later by the runtime port; this helper only proves the
+/// data is consistent and usable.
+fn validate_start_prerequisites(stored: &StoredMicroVm) -> Result<(), SdkError> {
+    if !stored.record.volume_path.is_absolute() {
+        return Err(SdkError::StorageConflict {
+            vm_name: stored.record.name.clone(),
+            volume_path: stored.record.volume_path.clone(),
+            owner: "persisted VM volume".to_owned(),
+            reason: "the configured VM volume path must be absolute".to_owned(),
+        });
+    }
+    let volume_metadata = fs::symlink_metadata(&stored.record.volume_path).map_err(|error| {
+        SdkError::filesystem(
+            "inspect configured VM volume",
+            &stored.record.volume_path,
+            error,
+        )
+    })?;
+    if volume_metadata.file_type().is_symlink() || !volume_metadata.is_dir() {
+        return Err(SdkError::StorageConflict {
+            vm_name: stored.record.name.clone(),
+            volume_path: stored.record.volume_path.clone(),
+            owner: "persisted VM volume".to_owned(),
+            reason: "the configured VM volume is not a real directory".to_owned(),
+        });
+    }
+    if stored.record.rootfs_path != stored.record.volume_path.join("rootfs.ext4")
+        || stored.record.socket_path != stored.record.volume_path.join("firecracker.sock")
+    {
+        return Err(SdkError::StorageConflict {
+            vm_name: stored.record.name.clone(),
+            volume_path: stored.record.volume_path.clone(),
+            owner: "persisted VM paths".to_owned(),
+            reason: "rootfs and socket paths must remain inside the VM volume".to_owned(),
+        });
+    }
+    verify_regular_file(&stored.record.rootfs_path, "verify configured rootfs")?;
+    let rootfs_size = fs::metadata(&stored.record.rootfs_path)
+        .map_err(|error| {
+            SdkError::filesystem(
+                "inspect configured rootfs",
+                &stored.record.rootfs_path,
+                error,
+            )
+        })?
+        .len();
+    if rootfs_size != stored.record.disk_size_bytes {
+        return Err(SdkError::GuestFilesystem {
+            operation: "verify configured rootfs size".to_owned(),
+            path: stored.record.rootfs_path.clone(),
+            reason: format!(
+                "expected {} bytes, found {rootfs_size}",
+                stored.record.disk_size_bytes
+            ),
+        });
+    }
+    let expected_private_key = stored.record.volume_path.join("ssh/id_ed25519");
+    let expected_public_key = stored.record.volume_path.join("ssh/id_ed25519.pub");
+    if stored.credential.private_key_path != expected_private_key
+        || stored.credential.public_key_path != expected_public_key
+    {
+        return Err(SdkError::Credential {
+            operation: "verify configured key paths".to_owned(),
+            path: stored.record.volume_path.clone(),
+            reason: "credential paths are outside the VM volume".to_owned(),
+        });
+    }
+    verify_regular_file(
+        &stored.credential.private_key_path,
+        "verify private SSH key",
+    )?;
+    verify_regular_file(&stored.credential.public_key_path, "verify public SSH key")?;
+    verify_private_key_mode(&stored.credential.private_key_path)?;
+    verify_public_key_mode(&stored.credential.public_key_path)?;
+    if stored.credential.key_type != "ed25519"
+        || stored.credential.ssh_user != "root"
+        || stored.credential.ssh_port != 22
+        || stored.credential.guest_authorized_keys_path != "/root/.ssh/authorized_keys"
+        || stored.credential.file_mode != "0600"
+    {
+        return Err(SdkError::Credential {
+            operation: "verify configured SSH metadata".to_owned(),
+            path: stored.credential.private_key_path.clone(),
+            reason: "persisted SSH metadata does not match the SDK contract".to_owned(),
+        });
+    }
+    if stored.runtime.socket_path != stored.record.socket_path {
+        return Err(SdkError::TemporaryRuntime {
+            component: "firecracker.sock".to_owned(),
+            reason: "the persisted runtime socket does not match the VM volume".to_owned(),
+            stopped: false,
+        });
+    }
+    Ok(())
+}
+
+/// Reverifies that the kernel and runtime binaries referenced by a start
+/// record are still verified in the artifact inventory.
+struct StartBootArtifacts {
+    kernel_path: PathBuf,
+    firecracker_path: PathBuf,
+    firectl_path: PathBuf,
+}
+
+async fn verify_start_boot_artifacts(
+    sdk: &MicroVmSdk,
+    stored: &StoredMicroVm,
+) -> Result<StartBootArtifacts, SdkError> {
+    let kernel_id = stored.record.kernel_id.clone();
+    let kernel_local = sdk
+        .run_repository(move |repository| repository.resolve_kernel(&kernel_id))
+        .await
+        .map_err(|error| {
+            map_artifact_resolution_error(
+                error,
+                "kernel",
+                &stored.record.kernel_id,
+                sdk.home.join("artifacts/kernels"),
+            )
+        })?;
+    verify_regular_file(&kernel_local.path, "verify start kernel")?;
+    let firecracker_package_id = stored.record.firecracker_package_id.clone();
+    let firecracker = sdk
+        .resolve_binary(&firecracker_package_id, "firecracker")
+        .await
+        .map_err(|error| {
+            map_artifact_resolution_error(
+                error,
+                "runtime binary",
+                &firecracker_package_id,
+                sdk.home.join("tools/firecracker"),
+            )
+        })?;
+    verify_executable_file(&firecracker.path, "firecracker")?;
+    let firectl_package_id = stored.record.firectl_package_id.clone();
+    let firectl = sdk
+        .resolve_binary(&firectl_package_id, "firectl")
+        .await
+        .map_err(|error| {
+            map_artifact_resolution_error(
+                error,
+                "runtime binary",
+                &firectl_package_id,
+                sdk.home.join("tools/firectl"),
+            )
+        })?;
+    verify_executable_file(&firectl.path, "firectl")?;
+    Ok(StartBootArtifacts {
+        kernel_path: kernel_local.path,
+        firecracker_path: firecracker.path,
+        firectl_path: firectl.path,
+    })
 }
 
 fn validate_persisted_network(stored: &StoredMicroVm) -> Result<(), SdkError> {
@@ -3618,10 +4124,25 @@ mod tests {
     struct TestRuntime {
         verify_calls: AtomicUsize,
         fail_verify: bool,
+        live_process: std::sync::Mutex<bool>,
+        live_socket: std::sync::Mutex<bool>,
+        launched: std::sync::Mutex<Vec<crate::ports::runtime::StartRequest>>,
+        launch_result: std::sync::Mutex<Result<u32, String>>,
+        ready_result: std::sync::Mutex<Result<bool, String>>,
+        fail_host: std::sync::Mutex<bool>,
     }
 
     impl RuntimeController for TestRuntime {
         fn validate_host(&self) -> Result<(), SdkError> {
+            if *self.fail_host.lock().expect("test host lock") {
+                return Err(SdkError::RuntimeIncompatible {
+                    component: "test-host".to_owned(),
+                    package_id: "test".to_owned(),
+                    version: "test".to_owned(),
+                    architecture: std::env::consts::ARCH.to_owned(),
+                    reason: "injected host incompatibility".to_owned(),
+                });
+            }
             Ok(())
         }
 
@@ -3641,6 +4162,63 @@ mod tests {
                     stopped: false,
                 });
             }
+            Ok(())
+        }
+
+        fn process_references_vm(
+            &self,
+            _process_id: u32,
+            _socket_path: &Path,
+            _firecracker_path: &Path,
+        ) -> Result<bool, SdkError> {
+            Ok(*self.live_process.lock().expect("test liveness lock"))
+        }
+
+        fn socket_answers(&self, _socket_path: &Path) -> Result<bool, SdkError> {
+            Ok(*self.live_socket.lock().expect("test socket lock"))
+        }
+
+        fn launch_detached(
+            &self,
+            request: &crate::ports::runtime::StartRequest,
+        ) -> Result<u32, SdkError> {
+            self.launched
+                .lock()
+                .expect("test launch lock")
+                .push(request.clone());
+            match self
+                .launch_result
+                .lock()
+                .expect("test launch result lock")
+                .clone()
+            {
+                Ok(pid) => Ok(pid),
+                Err(reason) => Err(SdkError::TemporaryRuntime {
+                    component: "test-runtime".to_owned(),
+                    reason,
+                    stopped: true,
+                }),
+            }
+        }
+
+        fn wait_for_socket(&self, _socket_path: &Path) -> Result<bool, SdkError> {
+            match self
+                .ready_result
+                .lock()
+                .expect("test readiness lock")
+                .clone()
+            {
+                Ok(ready) => Ok(ready),
+                Err(reason) => Err(SdkError::TemporaryRuntime {
+                    component: "test-socket".to_owned(),
+                    reason,
+                    stopped: true,
+                }),
+            }
+        }
+
+        fn terminate_spawned(&self, process_id: u32) -> Result<(), SdkError> {
+            let _ = process_id;
             Ok(())
         }
     }
@@ -3875,12 +4453,151 @@ mod tests {
         let runtime = Arc::new(TestRuntime {
             verify_calls: AtomicUsize::new(0),
             fail_verify: fail_runtime_verification,
+            live_process: std::sync::Mutex::new(false),
+            live_socket: std::sync::Mutex::new(false),
+            launched: std::sync::Mutex::new(Vec::new()),
+            launch_result: std::sync::Mutex::new(Ok(4242)),
+            ready_result: std::sync::Mutex::new(Ok(true)),
+            fail_host: std::sync::Mutex::new(false),
         });
         sdk.storage = storage.clone();
         sdk.credentials = credentials.clone();
         sdk.network = network.clone();
         sdk.runtime = runtime.clone();
         (sdk, directory, storage, credentials, network, runtime)
+    }
+
+    fn start_fixture_vm(
+        sdk: &MicroVmSdk,
+        name: &str,
+        expose_on_lan: bool,
+        state: MicroVmState,
+        process_id: Option<u32>,
+    ) -> crate::ports::repository::StoredMicroVm {
+        use crate::domain::microvm::PersistedRuntime;
+        use crate::domain::microvm::{MicroVmRecord, PersistedCredential, PersistedNetwork};
+
+        let volume_path = sdk.home.join("vms").join(name);
+        fs::create_dir_all(&volume_path).expect("fixture volume should be created");
+        let rootfs_path = volume_path.join("rootfs.ext4");
+        fs::write(&rootfs_path, b"fixture rootfs").expect("fixture rootfs should be written");
+        let ssh_directory = volume_path.join("ssh");
+        fs::create_dir_all(&ssh_directory).expect("fixture ssh directory should be created");
+        let private_key_path = ssh_directory.join("id_ed25519");
+        let public_key_path = ssh_directory.join("id_ed25519.pub");
+        fs::write(&private_key_path, b"fixture private key")
+            .expect("fixture private key should be written");
+        fs::write(&public_key_path, b"ssh-ed25519 AAAA fixture")
+            .expect("fixture public key should be written");
+        set_test_mode(&private_key_path, 0o600).expect("fixture key mode should be applied");
+        set_test_mode(&public_key_path, 0o644).expect("fixture key mode should be applied");
+        let guest_mac = crate::adapters::network::linux::guest_mac(name);
+        let guest = if expose_on_lan {
+            Ipv4Addr::new(10, 200, 4, 2)
+        } else {
+            Ipv4Addr::new(10, 200, 8, 2)
+        };
+        let host = if expose_on_lan {
+            Ipv4Addr::new(10, 200, 4, 1)
+        } else {
+            Ipv4Addr::new(10, 200, 8, 1)
+        };
+        let config = NetworkConfiguration {
+            mode: if expose_on_lan {
+                NetworkMode::Lan
+            } else {
+                NetworkMode::HostOnly
+            },
+            guest_address: IpAddr::V4(guest),
+            prefix_length: 30,
+            gateway: Some(IpAddr::V4(host)),
+            tap_name: format!("tap-{name}"),
+            bridge_name: None,
+            uplink_name: expose_on_lan.then(|| "test-uplink".to_owned()),
+            lan_address: expose_on_lan.then(|| IpAddr::V4(Ipv4Addr::new(192, 168, 3, 60))),
+        };
+        let network = PersistedNetwork {
+            config,
+            host_address: Some(IpAddr::V4(host)),
+            guest_mac,
+            dhcp_lease_reference: None,
+            desired_boot_parameters: format!("ip={guest}::{host}:255.255.255.252::eth0:off"),
+            resources: Vec::new(),
+            uplink_cidr: expose_on_lan.then(|| "192.168.3.0/24".to_owned()),
+            proxy_arp_enabled_by_sdk: false,
+            bridge_created_by_sdk: false,
+            uplink_attached_by_sdk: false,
+            forwarding_enabled_by_sdk: true,
+            nat_table_created_by_sdk: false,
+            nat_chain_created_by_sdk: false,
+            host_route_created_by_sdk: false,
+            proxy_arp_entry_created_by_sdk: false,
+            host_address_specs: Vec::new(),
+            default_route_specs: Vec::new(),
+        };
+        let socket_path = volume_path.join("firecracker.sock");
+        let record = MicroVmRecord {
+            id: 0,
+            name: name.to_owned(),
+            state,
+            distribution_id: "alpine-test-1.0".to_owned(),
+            image_id: "alpine-test-minimal".to_owned(),
+            kernel_id: "linux-test-x86_64".to_owned(),
+            firecracker_package_id: "firecracker-test-1.0.0-x86_64".to_owned(),
+            firectl_package_id: "firectl-test-0.1.0-x86_64".to_owned(),
+            disk_size_bytes: 14,
+            memory_bytes: 128 * 1024 * 1024,
+            memory_effective_mib: 128,
+            vcpu_count: 1,
+            volume_path: volume_path.clone(),
+            rootfs_path: rootfs_path.clone(),
+            socket_path: socket_path.clone(),
+            expose_on_lan,
+            created_at: 1_700_000_000,
+        };
+        let vm_id = sdk
+            .repository
+            .insert_creating(&record)
+            .expect("fixture VM should be inserted");
+        let credential = PersistedCredential {
+            private_key_path,
+            public_key_path,
+            guest_authorized_keys_path: "/root/.ssh/authorized_keys".to_owned(),
+            key_type: "ed25519".to_owned(),
+            ssh_user: "root".to_owned(),
+            ssh_port: 22,
+            public_key_fingerprint: "SHA256:test".to_owned(),
+            file_mode: "0600".to_owned(),
+        };
+        sdk.repository
+            .persist_network(vm_id, &network)
+            .expect("fixture network should be persisted");
+        sdk.repository
+            .persist_credential(vm_id, &credential)
+            .expect("fixture credential should be persisted");
+        let runtime = PersistedRuntime {
+            firecracker_path: sdk
+                .home
+                .join("tools/firecracker-test-1.0.0-x86_64/firecracker"),
+            firectl_path: sdk.home.join("tools/firectl-test-0.1.0-x86_64/firectl"),
+            socket_path,
+            process_id,
+            process_state: if process_id.is_some() {
+                "running".to_owned()
+            } else {
+                "stopped".to_owned()
+            },
+        };
+        sdk.repository
+            .persist_runtime(vm_id, &runtime)
+            .expect("fixture runtime should be persisted");
+        sdk.repository
+            .update_state(vm_id, state)
+            .expect("fixture state should be applied");
+        sdk.repository
+            .find_microvm(name)
+            .expect("fixture VM should load")
+            .expect("fixture VM should exist")
     }
 
     #[tokio::test]
@@ -4474,5 +5191,302 @@ mod tests {
         assert!(result.skipped.contains(&NetworkResource::Tap));
         assert!(result.skipped.contains(&NetworkResource::HostRoute));
         assert!(result.skipped.contains(&NetworkResource::ProxyArpEntry));
+    }
+
+    #[tokio::test]
+    async fn start_rejects_invalid_unknown_and_creating_names_without_mutation() {
+        if std::env::consts::ARCH != "x86_64" {
+            return;
+        }
+        let (sdk, _directory, _storage, _credentials, _network, runtime) = test_sdk(false);
+        let invalid = sdk.start_microvm("not path friendly").await;
+        assert!(matches!(invalid, Err(SdkError::InvalidRequest { field, .. }) if field == "name"));
+        let missing = sdk.start_microvm("missing_vm").await;
+        assert!(
+            matches!(missing, Err(SdkError::NotFound { kind, id }) if kind == "MicroVM" && id == "missing_vm")
+        );
+        start_fixture_vm(&sdk, "creating_vm", false, MicroVmState::Creating, None);
+        let creating = sdk.start_microvm("creating_vm").await;
+        assert!(
+            matches!(creating, Err(SdkError::LifecycleConflict { name, state, .. }) if name == "creating_vm" && state == "creating")
+        );
+        assert!(runtime.launched.lock().expect("launch lock").is_empty());
+    }
+
+    #[tokio::test]
+    async fn start_rejects_a_broken_volume_without_launching() {
+        if std::env::consts::ARCH != "x86_64" {
+            return;
+        }
+        let (sdk, _directory, _storage, _credentials, _network, runtime) = test_sdk(false);
+        start_fixture_vm(&sdk, "broken_vm", false, MicroVmState::Configured, None);
+        let stored = sdk
+            .run_repository(|repository| {
+                repository
+                    .find_microvm("broken_vm")?
+                    .ok_or_else(|| SdkError::NotFound {
+                        kind: "MicroVM".to_owned(),
+                        id: "broken_vm".to_owned(),
+                    })
+            })
+            .await
+            .expect("fixture should load");
+        fs::remove_file(&stored.record.rootfs_path).expect("rootfs should be removed");
+        let error = sdk
+            .start_microvm("broken_vm")
+            .await
+            .expect_err("broken volume should fail");
+        assert!(matches!(
+            error,
+            SdkError::Filesystem { .. } | SdkError::GuestFilesystem { .. }
+        ));
+        assert!(runtime.launched.lock().expect("launch lock").is_empty());
+    }
+
+    #[tokio::test]
+    async fn start_boots_a_configured_vm_and_records_the_running_state() {
+        if std::env::consts::ARCH != "x86_64" {
+            return;
+        }
+        let (sdk, _directory, _storage, _credentials, _network, runtime) = test_sdk(false);
+        start_fixture_vm(&sdk, "boot_vm", false, MicroVmState::Configured, None);
+        let started = sdk
+            .start_microvm("boot_vm")
+            .await
+            .expect("configured VM should start");
+        assert_eq!(started.state, MicroVmState::Running);
+        assert_eq!(started.name, "boot_vm");
+        assert_eq!(started.process_id, 4242);
+        assert_eq!(
+            started.socket_path,
+            started.volume_path.join("firecracker.sock")
+        );
+        assert_eq!(started.ssh.user, "root");
+        assert_eq!(started.ssh.port, 22);
+        {
+            let launched = runtime.launched.lock().expect("launch lock");
+            assert_eq!(launched.len(), 1);
+            assert_eq!(launched[0].vm_name, "boot_vm");
+            assert_eq!(launched[0].vcpu_count, 1);
+            assert_eq!(launched[0].memory_effective_mib, 128);
+            assert_eq!(launched[0].socket_path, started.socket_path);
+        }
+        let stored = sdk
+            .run_repository(|repository| {
+                repository
+                    .find_microvm("boot_vm")?
+                    .ok_or_else(|| SdkError::NotFound {
+                        kind: "MicroVM".to_owned(),
+                        id: "boot_vm".to_owned(),
+                    })
+            })
+            .await
+            .expect("started VM should load");
+        assert_eq!(stored.record.state, MicroVmState::Running);
+        assert_eq!(stored.runtime.process_id, Some(4242));
+        assert_eq!(stored.runtime.process_state, "running");
+    }
+
+    #[tokio::test]
+    async fn start_returns_the_live_vm_without_launching_again() {
+        if std::env::consts::ARCH != "x86_64" {
+            return;
+        }
+        let (sdk, _directory, _storage, _credentials, _network, runtime) = test_sdk(false);
+        start_fixture_vm(&sdk, "live_vm", false, MicroVmState::Running, Some(4242));
+        *runtime.live_process.lock().expect("liveness lock") = true;
+        *runtime.live_socket.lock().expect("socket lock") = true;
+        let again = sdk
+            .start_microvm("live_vm")
+            .await
+            .expect("live VM should return its identity");
+        assert_eq!(again.state, MicroVmState::Running);
+        assert_eq!(again.process_id, 4242);
+        assert!(runtime.launched.lock().expect("launch lock").is_empty());
+    }
+
+    #[tokio::test]
+    async fn start_recovers_a_dead_process_with_a_fresh_launch() {
+        if std::env::consts::ARCH != "x86_64" {
+            return;
+        }
+        let (sdk, _directory, _storage, _credentials, _network, runtime) = test_sdk(false);
+        start_fixture_vm(&sdk, "dead_vm", false, MicroVmState::Running, Some(4242));
+        *runtime.live_process.lock().expect("liveness lock") = false;
+        *runtime.live_socket.lock().expect("socket lock") = false;
+        let recovered = sdk
+            .start_microvm("dead_vm")
+            .await
+            .expect("dead VM should start fresh");
+        assert_eq!(recovered.state, MicroVmState::Running);
+        assert_eq!(runtime.launched.lock().expect("launch lock").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn start_treats_every_liveness_mismatch_as_stale() {
+        if std::env::consts::ARCH != "x86_64" {
+            return;
+        }
+        for (live_process, live_socket) in [(true, false), (false, true)] {
+            let (sdk, _directory, _storage, _credentials, _network, runtime) = test_sdk(false);
+            start_fixture_vm(
+                &sdk,
+                "mismatch_vm",
+                false,
+                MicroVmState::Running,
+                Some(4242),
+            );
+            *runtime.live_process.lock().expect("liveness lock") = live_process;
+            *runtime.live_socket.lock().expect("socket lock") = live_socket;
+            let recovered = sdk
+                .start_microvm("mismatch_vm")
+                .await
+                .expect("mismatched VM should start fresh");
+            assert_eq!(recovered.state, MicroVmState::Running);
+            assert_eq!(runtime.launched.lock().expect("launch lock").len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn start_removes_only_the_persisted_stale_socket() {
+        if std::env::consts::ARCH != "x86_64" {
+            return;
+        }
+        let (sdk, _directory, _storage, _credentials, _network, _runtime) = test_sdk(false);
+        start_fixture_vm(
+            &sdk,
+            "stale_socket_vm",
+            false,
+            MicroVmState::Configured,
+            None,
+        );
+        let stored = sdk
+            .run_repository(|repository| {
+                repository
+                    .find_microvm("stale_socket_vm")?
+                    .ok_or_else(|| SdkError::NotFound {
+                        kind: "MicroVM".to_owned(),
+                        id: "stale_socket_vm".to_owned(),
+                    })
+            })
+            .await
+            .expect("fixture should load");
+        fs::write(&stored.record.socket_path, b"stale").expect("stale socket should be written");
+        let unrelated = stored.record.volume_path.join("unrelated.txt");
+        fs::write(&unrelated, b"keep").expect("unrelated file should be written");
+        sdk.start_microvm("stale_socket_vm")
+            .await
+            .expect("stale socket should be cleaned and started");
+        assert!(unrelated.is_file());
+    }
+
+    #[tokio::test]
+    async fn start_serializes_concurrent_calls_to_one_process() {
+        if std::env::consts::ARCH != "x86_64" {
+            return;
+        }
+        let (sdk, _directory, _storage, _credentials, _network, runtime) = test_sdk(false);
+        start_fixture_vm(&sdk, "race_vm", false, MicroVmState::Configured, None);
+        let sdk = std::sync::Arc::new(sdk);
+        let first = {
+            let sdk = sdk.clone();
+            tokio::spawn(async move { sdk.start_microvm("race_vm").await })
+        };
+        let second = {
+            let sdk = sdk.clone();
+            tokio::spawn(async move { sdk.start_microvm("race_vm").await })
+        };
+        let (first, second) = tokio::join!(first, second);
+        let first = first
+            .expect("first start should join")
+            .expect("first start should succeed");
+        let second = second
+            .expect("second start should join")
+            .expect("second start should succeed");
+        assert_eq!(first.state, MicroVmState::Running);
+        assert_eq!(second.state, MicroVmState::Running);
+        let launched = runtime.launched.lock().expect("launch lock").len();
+        assert!(
+            launched <= 2,
+            "concurrent starts launched {launched} processes"
+        );
+    }
+
+    #[tokio::test]
+    async fn start_keeps_repaired_network_when_the_launch_fails() {
+        if std::env::consts::ARCH != "x86_64" {
+            return;
+        }
+        let (sdk, _directory, _storage, _credentials, _network, runtime) = test_sdk(false);
+        start_fixture_vm(
+            &sdk,
+            "failed_launch_vm",
+            false,
+            MicroVmState::Configured,
+            None,
+        );
+        *runtime.ready_result.lock().expect("readiness lock") = Ok(false);
+        let error = sdk
+            .start_microvm("failed_launch_vm")
+            .await
+            .expect_err("failed readiness should fail");
+        assert!(matches!(error, SdkError::TemporaryRuntime { .. }));
+        let stored = sdk
+            .run_repository(|repository| {
+                repository
+                    .find_microvm("failed_launch_vm")?
+                    .ok_or_else(|| SdkError::NotFound {
+                        kind: "MicroVM".to_owned(),
+                        id: "failed_launch_vm".to_owned(),
+                    })
+            })
+            .await
+            .expect("failed VM should load");
+        assert_eq!(stored.record.state, MicroVmState::Configured);
+        assert_eq!(stored.runtime.process_id, None);
+    }
+
+    #[tokio::test]
+    async fn start_repairs_host_only_network_with_identity_unchanged() {
+        if std::env::consts::ARCH != "x86_64" {
+            return;
+        }
+        let (sdk, _directory, _storage, _credentials, _network, _runtime) = test_sdk(false);
+        let before = start_fixture_vm(
+            &sdk,
+            "repair_host_only",
+            false,
+            MicroVmState::Configured,
+            None,
+        );
+        let started = sdk
+            .start_microvm("repair_host_only")
+            .await
+            .expect("repaired host-only VM should start");
+        assert_eq!(started.network.mode, NetworkMode::HostOnly);
+        assert_eq!(
+            started.network.guest_address,
+            before.network.config.guest_address
+        );
+        assert_eq!(started.network.tap_name, before.network.config.tap_name);
+    }
+
+    #[tokio::test]
+    async fn start_repairs_lan_network_with_identity_unchanged() {
+        if std::env::consts::ARCH != "x86_64" {
+            return;
+        }
+        let (sdk, _directory, _storage, _credentials, _network, _runtime) = test_sdk(false);
+        let before = start_fixture_vm(&sdk, "repair_lan", true, MicroVmState::Configured, None);
+        let started = sdk
+            .start_microvm("repair_lan")
+            .await
+            .expect("repaired LAN VM should start");
+        assert_eq!(started.network.mode, NetworkMode::Lan);
+        assert_eq!(
+            started.network.lan_address,
+            before.network.config.lan_address
+        );
+        assert_eq!(started.network.tap_name, before.network.config.tap_name);
     }
 }

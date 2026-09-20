@@ -676,18 +676,11 @@ fn reconcile_iptables_routed(
         }
     }
     let nat = routed_nat_spec(uplink, tap, private_network);
-    let arguments = nat.iter().map(String::as_str).collect::<Vec<_>>();
-    let with_table = if arguments.first() == Some(&"POSTROUTING") {
-        let mut full = vec!["-t", "nat", "-C"];
-        full.extend(arguments.iter().copied());
-        full
-    } else {
-        arguments
-    };
-    if iptables_rule_exists(&with_table)? {
+    let nat_rule: Vec<&str> = nat.iter().map(String::as_str).collect();
+    if iptables_nat_rule_exists(&nat_rule)? {
         skipped.push(NetworkResource::IptablesNat);
     } else {
-        run_iptables_spec(&nat)?;
+        iptables_nat_insert_rule(&nat_rule)?;
         applied.push(NetworkResource::IptablesNat);
         missing += 1;
     }
@@ -1405,6 +1398,48 @@ fn iptables_add_rule(spec: &[&str]) -> Result<(), SdkError> {
     Ok(())
 }
 
+fn iptables_nat_rule_exists(chain_and_rule: &[&str]) -> Result<bool, SdkError> {
+    let arguments = nat_check_arguments(chain_and_rule);
+    let output = command_output("iptables", &arguments)?;
+    if output.status.success() {
+        return Ok(true);
+    }
+    let stderr = command_stderr(&output);
+    if stderr.contains("No chain/target/match by that name")
+        || stderr.contains("Bad rule")
+        || stderr.contains("No such")
+    {
+        return Ok(false);
+    }
+    Err(host_command_error("iptables", &arguments, &output))
+}
+
+fn iptables_nat_insert_rule(chain_and_rule: &[&str]) -> Result<(), SdkError> {
+    if iptables_nat_rule_exists(chain_and_rule)? {
+        return Ok(());
+    }
+    // Insert at the top so SDK rules are evaluated before terminal UFW rules.
+    // Existence is still checked with `-C`, which is position-independent.
+    let mut arguments = vec!["-t", "nat", "-I", chain_and_rule[0], "1"];
+    arguments.extend(chain_and_rule.iter().skip(1).copied());
+    run_command("iptables", &arguments)?;
+    Ok(())
+}
+
+/// Builds `iptables -t nat -C <chain> <rule>` for a stored NAT spec.
+fn nat_check_arguments<'a>(chain_and_rule: &[&'a str]) -> Vec<&'a str> {
+    let mut arguments = vec!["-t", "nat", "-C"];
+    arguments.extend(chain_and_rule.iter().copied());
+    arguments
+}
+
+/// Builds `iptables -t nat -D <chain> <rule>` for a stored NAT spec.
+fn nat_delete_arguments<'a>(chain_and_rule: &[&'a str]) -> Vec<&'a str> {
+    let mut arguments = vec!["-t", "nat", "-D"];
+    arguments.extend(chain_and_rule.iter().copied());
+    arguments
+}
+
 fn iptables_delete_rule(spec: &[&str]) -> Result<(), SdkError> {
     if !iptables_rule_exists(spec)? {
         return Ok(());
@@ -1501,11 +1536,12 @@ fn run_iptables_spec(spec: &[String]) -> Result<(), SdkError> {
 }
 
 fn delete_iptables_spec(spec: &[String]) -> Result<(), SdkError> {
-    let arguments = spec.iter().map(String::as_str).collect::<Vec<_>>();
+    let arguments: Vec<&str> = spec.iter().map(String::as_str).collect();
     if arguments.first() == Some(&"POSTROUTING") {
-        let mut with_table = vec!["-t", "nat", "-D"];
-        with_table.extend(arguments.iter().copied());
-        run_command("iptables", &with_table)?;
+        if !iptables_nat_rule_exists(&arguments)? {
+            return Ok(());
+        }
+        run_command("iptables", &nat_delete_arguments(&arguments))?;
     } else {
         iptables_delete_rule(&arguments)?;
     }
@@ -1745,14 +1781,12 @@ fn reconcile_iptables_nat(
     skipped: &mut Vec<NetworkResource>,
 ) -> Result<(), SdkError> {
     let spec = host_only_nat_spec(tap, private_network);
-    let arguments = spec.iter().map(String::as_str).collect::<Vec<_>>();
-    let mut with_table = vec!["-t", "nat", "-C"];
-    with_table.extend(arguments.iter().copied());
-    if iptables_rule_exists(&with_table)? {
+    let nat_rule: Vec<&str> = spec.iter().map(String::as_str).collect();
+    if iptables_nat_rule_exists(&nat_rule)? {
         skipped.push(NetworkResource::IptablesNat);
         Ok(())
     } else {
-        run_iptables_spec(&spec)?;
+        iptables_nat_insert_rule(&nat_rule)?;
         applied.push(NetworkResource::IptablesNat);
         Ok(())
     }
@@ -2009,5 +2043,33 @@ mod tests {
     #[test]
     fn host_only_boot_device_is_the_guest_interface() {
         assert_eq!(GUEST_INTERFACE, "eth0");
+    }
+
+    #[test]
+    fn nat_specs_stay_paired_with_the_nat_table() {
+        let host_only =
+            super::host_only_nat_spec("tm-test", std::net::Ipv4Addr::new(172, 30, 0, 0));
+        let routed =
+            super::routed_nat_spec("enp3s0", "tm-test", std::net::Ipv4Addr::new(172, 30, 0, 0));
+        for spec in [&host_only, &routed] {
+            assert_eq!(spec.first().map(String::as_str), Some("POSTROUTING"));
+        }
+        // The NAT rules must be checked, inserted, and deleted against the
+        // nat table: a filter-table `-C POSTROUTING` probe fails with
+        // `Bad argument 'nat'` on real hosts (exit status 2).
+        let host_rule: Vec<&str> = host_only.iter().map(String::as_str).collect();
+        let routed_rule: Vec<&str> = routed.iter().map(String::as_str).collect();
+        let host_check = super::nat_check_arguments(&host_rule);
+        let routed_check = super::nat_check_arguments(&routed_rule);
+        assert_eq!(&host_check[..3], ["-t", "nat", "-C"]);
+        assert_eq!(&routed_check[..3], ["-t", "nat", "-C"]);
+        assert_eq!(
+            &super::nat_delete_arguments(&host_rule)[..3],
+            ["-t", "nat", "-D"]
+        );
+        assert_eq!(
+            &super::nat_delete_arguments(&routed_rule)[..3],
+            ["-t", "nat", "-D"]
+        );
     }
 }

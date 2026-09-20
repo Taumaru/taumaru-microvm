@@ -164,6 +164,34 @@ pub struct MicroVmCreationResult {
     pub ssh: SshConnectionInfo,
 }
 
+/// Result returned by [`crate::MicroVmSdk::start_microvm`].
+///
+/// The operation takes only the VM name: the volume directory is read from
+/// the inventory record, never from the caller. `socket_path` is always the
+/// volume-local control socket and is the preferred channel for later
+/// control; `process_id` is the background machine process and exists as the
+/// fallback for forced termination of an unresponsive machine.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MicroVmStartResult {
+    /// Stable VM identifier.
+    pub name: String,
+    /// Always [`MicroVmState::Running`] on success.
+    pub state: MicroVmState,
+    /// VM-exclusive volume directory read from the inventory record.
+    pub volume_path: PathBuf,
+    /// Writable VM-local root filesystem used for the launch.
+    pub rootfs_path: PathBuf,
+    /// Volume-local control socket. It answers on return and is the
+    /// preferred control channel for later operations.
+    pub socket_path: PathBuf,
+    /// Background machine process identifier for forced termination fallback.
+    pub process_id: u32,
+    /// Reconciled network metadata with the persisted identity unchanged.
+    pub network: NetworkConfiguration,
+    /// SSH connection metadata with path-only credential references.
+    pub ssh: SshConnectionInfo,
+}
+
 /// Total number of creation stages reported through the progress observer.
 ///
 /// Every observed `create_microvm` operation reports step counters out of this fixed

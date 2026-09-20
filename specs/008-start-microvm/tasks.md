@@ -31,19 +31,19 @@ other lifecycle operation are part of these tasks.
 
 **Purpose**: Establish the test doubles and scaffolding the start work builds on.
 
-- [ ] T001 Extend the manager unit-test fakes with a controllable runtime double (recorded-process liveness verdict, socket-probe verdict, spawned-PID script, readiness verdict) in `crates/sdk/src/manager.rs`.
-- [ ] T002 [P] Extend the manager unit-test fakes with a configurable network double (skipped/applied script per mode) in `crates/sdk/src/manager.rs`.
-- [ ] T003 [P] Add a `Configured` VM fixture builder (record, persisted network both modes, credential, runtime refs) reusable by all start tests in `crates/sdk/src/manager.rs`.
+- [X] T001 Extend the manager unit-test fakes with a controllable runtime double (recorded-process liveness verdict, socket-probe verdict, spawned-PID script, readiness verdict) in `crates/sdk/src/manager.rs`.
+- [X] T002 [P] Extend the manager unit-test fakes with a configurable network double (skipped/applied script per mode) in `crates/sdk/src/manager.rs`.
+- [X] T003 [P] Add a `Configured` VM fixture builder (record, persisted network both modes, credential, runtime refs) reusable by all start tests in `crates/sdk/src/manager.rs`.
 
 ---
 
 ## Phase 2: Foundational (Blocking Prerequisites)
 
-- [ ] T004 [P] Add the `MicroVmStartResult` type with the constraint "`state` is always `MicroVmState::Running` on success; `socket_path` is always inside `volume_path`; `ssh` carries the private-key path, never key contents" in `crates/sdk/src/domain/microvm.rs`, re-export it from `crates/sdk/src/domain/mod.rs`, and re-export it from `crates/sdk/src/lib.rs` with Rustdoc.
-- [ ] T005 [P] Extend the crate-internal `RuntimeController` in `crates/sdk/src/ports/runtime.rs` with process-liveness, control-socket probe, detached-launch, and bounded-readiness operations, keeping `validate_host` and `verify_stopped` unchanged.
-- [ ] T006 Update the existing test runtime doubles to implement the extended `RuntimeController` in `crates/sdk/src/manager.rs` test module.
-- [ ] T007 Add the start-specific persisted-data validation helper in `crates/sdk/src/manager.rs` enforcing "`volume_path` absolute real directory; `rootfs_path` equals `{volume_path}/rootfs.ext4`; `socket_path` equals `{volume_path}/firecracker.sock`; rootfs regular file of exactly `disk_size_bytes`; credential paths/modes/metadata match the contract", without reusing the creation assertion that the runtime is stopped and no socket file exists.
-- [ ] T008 Add boot-artifact reverification against the artifact inventory (kernel path from `kernel_id`, Firecracker/`firectl` paths from package IDs, executable and host-compatible) in `crates/sdk/src/manager.rs`, returning `ArtifactPrerequisite` naming kind, registry ID, local path, and reason.
+- [X] T004 [P] Add the `MicroVmStartResult` type with the constraint "`state` is always `MicroVmState::Running` on success; `socket_path` is always inside `volume_path`; `ssh` carries the private-key path, never key contents" in `crates/sdk/src/domain/microvm.rs`, re-export it from `crates/sdk/src/domain/mod.rs`, and re-export it from `crates/sdk/src/lib.rs` with Rustdoc.
+- [X] T005 [P] Extend the crate-internal `RuntimeController` in `crates/sdk/src/ports/runtime.rs` with process-liveness, control-socket probe, detached-launch, and bounded-readiness operations, keeping `validate_host` and `verify_stopped` unchanged.
+- [X] T006 Update the existing test runtime doubles to implement the extended `RuntimeController` in `crates/sdk/src/manager.rs` test module.
+- [X] T007 Add the start-specific persisted-data validation helper in `crates/sdk/src/manager.rs` enforcing "`volume_path` absolute real directory; `rootfs_path` equals `{volume_path}/rootfs.ext4`; `socket_path` equals `{volume_path}/firecracker.sock`; rootfs regular file of exactly `disk_size_bytes`; credential paths/modes/metadata match the contract", without reusing the creation assertion that the runtime is stopped and no socket file exists.
+- [X] T008 Add boot-artifact reverification against the artifact inventory (kernel path from `kernel_id`, Firecracker/`firectl` paths from package IDs, executable and host-compatible) in `crates/sdk/src/manager.rs`, returning `ArtifactPrerequisite` naming kind, registry ID, local path, and reason.
 
 **Checkpoint**: The SDK has the public result type, the extended runtime port, start validation,
 and controllable doubles. User-story work may begin.
@@ -63,18 +63,18 @@ regaining control immediately with no session held open.
 
 ### Tests for User Story 1
 
-- [ ] T009 [P] [US1] Add public-contract coverage for `MicroVmStartResult`, `MicroVmState::Running`, volume-local socket placement, and private-key-path-only SSH metadata in `crates/sdk/tests/public_api.rs`.
-- [ ] T010 [P] [US1] Add deterministic start lifecycle coverage for name validation, `NotFound` on unknown names, `Creating` rejection with `LifecycleConflict`, persisted-data validation errors, and no host mutation on preflight failure in `crates/sdk/src/manager.rs` unit tests.
+- [X] T009 [P] [US1] Add public-contract coverage for `MicroVmStartResult`, `MicroVmState::Running`, volume-local socket placement, and private-key-path-only SSH metadata in `crates/sdk/tests/public_api.rs`.
+- [X] T010 [P] [US1] Add deterministic start lifecycle coverage for name validation, `NotFound` on unknown names, `Creating` rejection with `LifecycleConflict`, persisted-data validation errors, and no host mutation on preflight failure in `crates/sdk/src/manager.rs` unit tests.
 
 ### Implementation for User Story 1
 
-- [ ] T011 [P] [US1] Implement the `FirecrackerRuntime` control-socket probe (`tokio::net::UnixStream` connect plus minimal `GET /machine-config` read; file existence alone never counts) in `crates/sdk/src/adapters/runtime/firecracker.rs`.
-- [ ] T012 [P] [US1] Implement the `FirecrackerRuntime` process-liveness check (read `/proc/<pid>`, verify the command line still references this VM's socket or runtime binary path; mismatched or unreadable command line is not-live; never signal the process) in `crates/sdk/src/adapters/runtime/firecracker.rs`.
-- [ ] T013 [US1] Implement the `firectl` argv builder from validated persisted values (Firecracker binary, kernel path, VM-local rootfs with `:rw`, vCPU count, checked effective memory MiB, persisted TAP/MAC, distribution `kernel_args` plus persisted `desired_boot_parameters`, volume-local socket) as typed argument vectors in `crates/sdk/src/adapters/runtime/firecracker.rs`.
-- [ ] T014 [US1] Implement detached spawn (stdin null, stdout/stderr appended to a VM-local log file in the volume, new process group, `kill_on_drop(false)`, forgotten handle after PID capture, passive reaper only) plus the bounded socket-readiness poll in `crates/sdk/src/adapters/runtime/firecracker.rs`.
-- [ ] T015 [US1] Implement the start coordinator in `crates/sdk/src/manager.rs`: `validate_vm_name`, per-name plus volume lock pair, `find_microvm`, `NotFound`, `Creating` gate with `LifecycleConflict` naming name/state/operation, start-specific validation, boot-artifact reverification, network reconciliation with `update_network`, launch, readiness, and the atomic `persist_runtime` plus `update_state(Running)` commit in one repository closure.
-- [ ] T016 [US1] Implement launch-failure cleanup in `crates/sdk/src/manager.rs` (terminate only the just-spawned child, remove the owned socket only if this attempt created it, reset runtime refs to stopped without claiming `Running`, keep repaired network items persisted, return the typed launch error with no orphan process).
-- [ ] T017 [US1] Add deterministic US1 lifecycle coverage for full-configuration launch, volume-local socket readiness, PID persistence, atomic `Running` commit, launch-failure cleanup with repaired network kept, and operation silence in `crates/sdk/src/manager.rs` unit tests and `crates/sdk/tests/lifecycle.rs`.
+- [X] T011 [P] [US1] Implement the `FirecrackerRuntime` control-socket probe (`tokio::net::UnixStream` connect plus minimal `GET /machine-config` read; file existence alone never counts) in `crates/sdk/src/adapters/runtime/firecracker.rs`.
+- [X] T012 [P] [US1] Implement the `FirecrackerRuntime` process-liveness check (read `/proc/<pid>`, verify the command line still references this VM's socket or runtime binary path; mismatched or unreadable command line is not-live; never signal the process) in `crates/sdk/src/adapters/runtime/firecracker.rs`.
+- [X] T013 [US1] Implement the `firectl` argv builder from validated persisted values (Firecracker binary, kernel path, VM-local rootfs with `:rw`, vCPU count, checked effective memory MiB, persisted TAP/MAC, distribution `kernel_args` plus persisted `desired_boot_parameters`, volume-local socket) as typed argument vectors in `crates/sdk/src/adapters/runtime/firecracker.rs`.
+- [X] T014 [US1] Implement detached spawn (stdin null, stdout/stderr appended to a VM-local log file in the volume, new process group, `kill_on_drop(false)`, forgotten handle after PID capture, passive reaper only) plus the bounded socket-readiness poll in `crates/sdk/src/adapters/runtime/firecracker.rs`.
+- [X] T015 [US1] Implement the start coordinator in `crates/sdk/src/manager.rs`: `validate_vm_name`, per-name plus volume lock pair, `find_microvm`, `NotFound`, `Creating` gate with `LifecycleConflict` naming name/state/operation, start-specific validation, boot-artifact reverification, network reconciliation with `update_network`, launch, readiness, and the atomic `persist_runtime` plus `update_state(Running)` commit in one repository closure.
+- [X] T016 [US1] Implement launch-failure cleanup in `crates/sdk/src/manager.rs` (terminate only the just-spawned child, remove the owned socket only if this attempt created it, reset runtime refs to stopped without claiming `Running`, keep repaired network items persisted, return the typed launch error with no orphan process).
+- [X] T017 [US1] Add deterministic US1 lifecycle coverage for full-configuration launch, volume-local socket readiness, PID persistence, atomic `Running` commit, launch-failure cleanup with repaired network kept, and operation silence in `crates/sdk/src/manager.rs` unit tests and `crates/sdk/tests/lifecycle.rs`.
 
 **Checkpoint**: At this point, User Story 1 should be fully functional and testable independently:
 a stopped VM starts, stays running after return, and failures leave it stopped with no orphan.
@@ -94,15 +94,15 @@ and PID reuse (each treated as stale, never duplicated), and run concurrent same
 
 ### Tests for User Story 2
 
-- [ ] T018 [P] [US2] Add idempotency coverage (live process plus answering socket returns current identity, launches nothing, changes no persisted configuration) in `crates/sdk/src/manager.rs` unit tests.
-- [ ] T019 [P] [US2] Add stale-recovery coverage for the liveness decision table (process-live/socket-silent, process-dead/socket-answering, PID reuse with foreign command line, orphaned socket file) in `crates/sdk/src/manager.rs` unit tests.
+- [X] T018 [P] [US2] Add idempotency coverage (live process plus answering socket returns current identity, launches nothing, changes no persisted configuration) in `crates/sdk/src/manager.rs` unit tests.
+- [X] T019 [P] [US2] Add stale-recovery coverage for the liveness decision table (process-live/socket-silent, process-dead/socket-answering, PID reuse with foreign command line, orphaned socket file) in `crates/sdk/src/manager.rs` unit tests.
 
 ### Implementation for User Story 2
 
-- [ ] T020 [US2] Wire live-check-first idempotency in `crates/sdk/src/manager.rs`: when both signals agree the VM is running, return the current running identity from persisted refs without launching, repairing, or mutating configuration.
-- [ ] T021 [US2] Wire stale-ref recovery in `crates/sdk/src/manager.rs`: on any signal mismatch, reset runtime refs to stopped via one repository closure, remove the stale socket file only at exactly the persisted socket path after proving no listener, and continue with a fresh launch.
-- [ ] T022 [US2] Add concurrency coverage proving concurrent same-name starts produce one process and one observed identity through the held lock pair in `crates/sdk/src/manager.rs` unit tests.
-- [ ] T023 [US2] Add failure-path coverage for stale handling (never signal a previously recorded PID, never delete outside the persisted socket path, never claim `Running` on mismatch) in `crates/sdk/tests/failure_paths.rs`.
+- [X] T020 [US2] Wire live-check-first idempotency in `crates/sdk/src/manager.rs`: when both signals agree the VM is running, return the current running identity from persisted refs without launching, repairing, or mutating configuration.
+- [X] T021 [US2] Wire stale-ref recovery in `crates/sdk/src/manager.rs`: on any signal mismatch, reset runtime refs to stopped via one repository closure, remove the stale socket file only at exactly the persisted socket path after proving no listener, and continue with a fresh launch.
+- [X] T022 [US2] Add concurrency coverage proving concurrent same-name starts produce one process and one observed identity through the held lock pair in `crates/sdk/src/manager.rs` unit tests.
+- [X] T023 [US2] Add failure-path coverage for stale handling (never signal a previously recorded PID, never delete outside the persisted socket path, never claim `Running` on mismatch) in `crates/sdk/tests/failure_paths.rs`.
 
 **Checkpoint**: At this point, User Stories 1 AND 2 should both work independently: start, repeat,
 external kill, mismatch, PID reuse, and concurrency all resolve to exactly one live machine or a
@@ -123,12 +123,12 @@ repeat for both host-only and LAN modes.
 
 ### Tests for User Story 3
 
-- [ ] T024 [P] [US3] Add per-mode repair coverage (wiped host-only items recreated with identity unchanged, wiped LAN items recreated with identity unchanged, correct items skipped) in `crates/sdk/src/manager.rs` unit tests.
+- [X] T024 [P] [US3] Add per-mode repair coverage (wiped host-only items recreated with identity unchanged, wiped LAN items recreated with identity unchanged, correct items skipped) in `crates/sdk/src/manager.rs` unit tests.
 
 ### Implementation for User Story 3
 
-- [ ] T025 [US3] Wire persisted-mode validation plus `NetworkController::configure` reuse in `crates/sdk/src/manager.rs` (mode derived from `expose_on_lan` must match the persisted mode; persisted network passed as `existing`; host-only and LAN used-address lists loaded; reconciled attachment persisted with `update_network`), returning the typed `Network` error with no process launched when repair is impossible.
-- [ ] T026 [US3] Add failure-path coverage for unrepairable network (VM stays `Configured`, no duplicate or half-started process, actionable typed error) in `crates/sdk/tests/failure_paths.rs`.
+- [X] T025 [US3] Wire persisted-mode validation plus `NetworkController::configure` reuse in `crates/sdk/src/manager.rs` (mode derived from `expose_on_lan` must match the persisted mode; persisted network passed as `existing`; host-only and LAN used-address lists loaded; reconciled attachment persisted with `update_network`), returning the typed `Network` error with no process launched when repair is impossible.
+- [X] T026 [US3] Add failure-path coverage for unrepairable network (VM stays `Configured`, no duplicate or half-started process, actionable typed error) in `crates/sdk/tests/failure_paths.rs`.
 
 **Checkpoint**: All user stories should now be independently functional: start, safe repeat, and
 repair-on-start all work per mode with identity preserved.
@@ -139,10 +139,10 @@ repair-on-start all work per mode with identity preserved.
 
 **Purpose**: Contract consistency, documentation, and quality gates across all stories.
 
-- [ ] T027 [P] Add Rustdoc for `start_microvm` and `MicroVmStartResult` covering the name-only input, volume-from-record rule, both-signals-agree liveness, socket-preferred control, PID fallback, and volume-local socket placement in `crates/sdk/src/manager.rs` and `crates/sdk/src/domain/microvm.rs`.
-- [ ] T028 [P] Verify no CLI source changes and no new public error variant were introduced, and that all repository text is English, by reviewing the final diff.
-- [ ] T029 Run `cargo fmt --all -- --check`, `cargo check --all-targets --all-features`, `cargo clippy --all-targets --all-features -- -D warnings`, and `cargo test --all-targets --all-features` and fix all findings.
-- [ ] T030 Run the `quickstart.md` validation scenarios (start by name, repeat while live, external-kill recovery, per-mode repair, failure handling) against the implemented SDK.
+- [X] T027 [P] Add Rustdoc for `start_microvm` and `MicroVmStartResult` covering the name-only input, volume-from-record rule, both-signals-agree liveness, socket-preferred control, PID fallback, and volume-local socket placement in `crates/sdk/src/manager.rs` and `crates/sdk/src/domain/microvm.rs`.
+- [X] T028 [P] Verify no CLI source changes and no new public error variant were introduced, and that all repository text is English, by reviewing the final diff.
+- [X] T029 Run `cargo fmt --all -- --check`, `cargo check --all-targets --all-features`, `cargo clippy --all-targets --all-features -- -D warnings`, and `cargo test --all-targets --all-features` and fix all findings.
+- [X] T030 Run the `quickstart.md` validation scenarios (start by name, repeat while live, external-kill recovery, per-mode repair, failure handling) against the implemented SDK.
 
 ---
 

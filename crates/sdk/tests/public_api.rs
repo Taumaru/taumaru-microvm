@@ -96,3 +96,27 @@ async fn creation_validates_input_before_registry_or_host_mutation() {
             .is_none()
     );
 }
+
+#[test]
+fn start_result_types_are_exported_with_running_state() {
+    use taumaru_microvm::{MicroVmStartResult, MicroVmState};
+    let _ = std::mem::size_of::<MicroVmStartResult>();
+    let _ = MicroVmState::Running;
+}
+
+#[tokio::test]
+async fn start_validates_names_and_reports_unknown_vms_as_typed_errors() {
+    use taumaru_microvm::{MicroVmSdk, SdkError};
+    use tempfile::tempdir;
+
+    let home = tempdir().expect("temporary SDK home should be created");
+    let sdk = MicroVmSdk::new(home.path()).expect("SDK construction should work");
+
+    let invalid = sdk.start_microvm("not path friendly").await;
+    assert!(matches!(invalid, Err(SdkError::InvalidRequest { field, .. }) if field == "name"));
+
+    let missing = sdk.start_microvm("missing_vm").await;
+    assert!(
+        matches!(missing, Err(SdkError::NotFound { kind, id }) if kind == "MicroVM" && id == "missing_vm")
+    );
+}
