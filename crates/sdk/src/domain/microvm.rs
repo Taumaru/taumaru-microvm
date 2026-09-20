@@ -205,6 +205,20 @@ pub struct MicroVmSummary {
     pub state: MicroVmState,
 }
 
+/// Read-only snapshot of one actually-running MicroVM.
+///
+/// Returned by [`crate::MicroVmSdk::list_running_microvms`] for the SSH selector and named
+/// SSH resolution. Liveness is verified at call time with the same probes the start operation
+/// uses; the last persisted lifecycle state alone never decides membership. The SSH material
+/// is the stored connection metadata verbatim: paths only, never key contents.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RunningMicroVm {
+    /// Stable VM identifier, ordered by name.
+    pub name: String,
+    /// Stored SSH connection metadata with path-only credential references.
+    pub ssh: SshConnectionInfo,
+}
+
 /// Total number of creation stages reported through the progress observer.
 ///
 /// Every observed `create_microvm` operation reports step counters out of this fixed

@@ -20,6 +20,8 @@ pub(crate) enum Command {
     New(NewArgs),
     /// Start a created MicroVM by name or interactive selection.
     Start(StartArgs),
+    /// Connect to a running MicroVM over SSH by name or interactive selection.
+    Ssh(SshArgs),
 }
 
 #[derive(Debug, Args, Clone)]
@@ -97,6 +99,30 @@ pub(crate) struct StartArgs {
     #[arg(long = "non-interactive")]
     pub(crate) non_interactive: bool,
 }
+
+#[derive(Debug, Args, Clone)]
+pub(crate) struct SshArgs {
+    /// Machine name; skips the machine selector when supplied.
+    /// With a trailing remote command present, all words after the name are remote.
+    /// To run a remote command on the interactively selected machine, omit the
+    /// name and put the command after `--`.
+    pub(crate) name: Option<String>,
+
+    /// Equivalent to the positional name; must agree when both are given.
+    #[arg(long = "name")]
+    pub(crate) explicit_name: Option<String>,
+
+    /// Disable prompts; the name is required and rights are required up front.
+    #[arg(long = "non-interactive")]
+    pub(crate) non_interactive: bool,
+
+    /// Remote command to run inside the guest instead of a shell.
+    /// Everything after `--` is always remote command; without `--`, words
+    /// after the machine name are remote command.
+    #[arg(last = true)]
+    pub(crate) command: Vec<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use clap::Parser;
@@ -203,5 +229,48 @@ mod tests {
         assert!(Cli::try_parse_from(["microvm", "start", "--image", "x"]).is_err());
         assert!(Cli::try_parse_from(["microvm", "start", "--disk-gb", "20"]).is_err());
         assert!(Cli::try_parse_from(["microvm", "start", "--expose-lan"]).is_err());
+    }
+
+    #[test]
+    fn ssh_parser_accepts_name_and_trailing_remote_command() {
+        let cli = Cli::try_parse_from([
+            "microvm",
+            "ssh",
+            "--non-interactive",
+            "web-01",
+            "--",
+            "uname",
+            "-a",
+        ])
+        .expect("valid explicit ssh arguments");
+
+        let Some(Command::Ssh(arguments)) = cli.command else {
+            panic!("ssh command should be parsed");
+        };
+        assert_eq!(arguments.name.as_deref(), Some("web-01"));
+        assert!(arguments.non_interactive);
+        assert_eq!(arguments.command, ["uname", "-a"]);
+    }
+
+    #[test]
+    fn ssh_parser_treats_everything_after_separator_as_remote_command() {
+        let cli = Cli::try_parse_from(["microvm", "ssh", "--", "web-01", "uname", "-a"])
+            .expect("remote command after separator");
+
+        let Some(Command::Ssh(arguments)) = cli.command else {
+            panic!("ssh command should be parsed");
+        };
+        assert!(arguments.name.is_none());
+        assert_eq!(arguments.command, ["web-01", "uname", "-a"]);
+    }
+
+    #[test]
+    fn ssh_parser_rejects_lifecycle_flags() {
+        assert!(
+            Cli::try_parse_from(["microvm", "ssh", "--", "--image", "x"]).is_err()
+                || Cli::try_parse_from(["microvm", "ssh", "--image", "x"]).is_err()
+        );
+        assert!(Cli::try_parse_from(["microvm", "ssh", "--disk-gb", "20"]).is_err());
+        assert!(Cli::try_parse_from(["microvm", "ssh", "--expose-lan"]).is_err());
     }
 }

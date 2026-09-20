@@ -120,6 +120,47 @@ impl CliError {
         ))
     }
 
+    pub(crate) fn ssh_not_found(name: &str) -> Self {
+        Self::Creation(format!(
+            "MicroVM {name:?} was not found\u{1f}no running machine named {name:?} exists in this home\u{1f}Run `microvm new` to create it, then start it before connecting"
+        ))
+    }
+
+    pub(crate) fn ssh_not_running(name: &str, state: impl Into<String>) -> Self {
+        let state = state.into();
+        Self::Creation(format!(
+            "MicroVM {name:?} is not running\u{1f}machine {name:?} is currently {state}\u{1f}Run `microvm start {name}` and try again"
+        ))
+    }
+
+    pub(crate) fn ssh_empty() -> Self {
+        Self::Creation(
+            "No running MicroVMs to connect to\u{1f}no machine is currently running in this home\u{1f}Run `microvm start` to start one, then try again"
+                .to_string(),
+        )
+    }
+
+    pub(crate) fn ssh_cancelled() -> Self {
+        Self::Creation(
+            "MicroVM connection cancelled\u{1f}no session was opened\u{1f}Run `microvm ssh` again when you are ready"
+                .to_string(),
+        )
+    }
+
+    pub(crate) fn ssh_key_unreadable(path: &std::path::Path) -> Self {
+        Self::Creation(format!(
+            "SSH key is missing or unreadable\u{1f}the private key at {} is not a readable file\u{1f}Repair the machine volume or recreate the machine, then try again",
+            path.display()
+        ))
+    }
+
+    pub(crate) fn ssh_client_missing() -> Self {
+        Self::Creation(
+            "SSH client is unavailable\u{1f}no `ssh` program was found on this host\u{1f}Install the OpenSSH client, then try again"
+                .to_string(),
+        )
+    }
+
     pub(crate) fn escalation_unavailable() -> Self {
         Self::Creation(
             "Elevated rights are required\u{1f}neither sudo nor pkexec is available on this host\u{1f}Install sudo or polkit, or run the command as root"
@@ -133,6 +174,7 @@ impl CliError {
             Self::Sdk(SdkError::Cancelled) => 130,
             Self::Cancelled => 130,
             Self::Creation(payload) if payload.starts_with("MicroVM start cancelled") => 130,
+            Self::Creation(payload) if payload.starts_with("MicroVM connection cancelled") => 130,
             _ => 1,
         }
     }

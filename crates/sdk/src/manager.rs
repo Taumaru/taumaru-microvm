@@ -28,7 +28,7 @@ use crate::domain::microvm::{
     CreateMicroVmRequest, CreationEventPhase, CreationOutcome, CreationProgress, CreationStage,
     MicroVmCreationResult, MicroVmRecord, MicroVmStartResult, MicroVmSummary,
     NetworkConfigurationResult, PersistedCredential, PersistedNetwork, PersistedRuntime,
-    SshConnectionInfo, TOTAL_CREATION_STEPS, unspecified_address,
+    RunningMicroVm, SshConnectionInfo, TOTAL_CREATION_STEPS, unspecified_address,
 };
 use crate::domain::registry::{
     Architecture, BinaryFile, BinaryPackage, Distribution, DistributionImage, Kernel,
@@ -594,6 +594,56 @@ impl MicroVmSdk {
                 Ok(MicroVmSummary { name, state })
             })
             .collect()
+    }
+
+    /// Lists every actually-running MicroVM for the SSH selector and named SSH resolution.
+    ///
+    /// Returns one [`RunningMicroVm`] per running machine ordered by name, each carrying
+    /// the stored SSH connection metadata verbatim (paths only, never key contents).
+    /// Liveness is verified at call time with the same probes the start operation uses:
+    /// the recorded process must still reference the VM and the volume-local control
+    /// socket must answer. Rows whose persisted state is not `Running` are skipped
+    /// before probing; the persisted state alone never decides membership. The query
+    /// performs no filesystem validation of key material, no mutation, repair, or
+    /// persistence write, and emits no output, logs, or global state.
+    pub async fn list_running_microvms(&self) -> Result<Vec<RunningMicroVm>, SdkError> {
+        let rows = self
+            .run_repository(|repository| repository.list_microvm_names())
+            .await?;
+        let mut running = Vec::new();
+        for (name, state) in rows {
+            let state = MicroVmState::parse(&state).ok_or_else(|| {
+                SdkError::Migration(format!(
+                    "invalid persisted lifecycle state for {name}: {state}"
+                ))
+            })?;
+            if state != MicroVmState::Running {
+                continue;
+            }
+            let lookup = name.clone();
+            let stored = self
+                .run_repository(move |repository| repository.find_microvm(&lookup))
+                .await?
+                .ok_or_else(|| {
+                    SdkError::Migration(format!(
+                        "inventory row for {name} disappeared during running listing"
+                    ))
+                })?;
+            if !self.is_vm_live(&stored)? {
+                continue;
+            }
+            running.push(RunningMicroVm {
+                name: stored.record.name.clone(),
+                ssh: SshConnectionInfo {
+                    user: stored.credential.ssh_user.clone(),
+                    port: stored.credential.ssh_port,
+                    address: stored.network.config.guest_address,
+                    private_key_path: stored.credential.private_key_path.clone(),
+                    public_key_path: stored.credential.public_key_path.clone(),
+                },
+            });
+        }
+        Ok(running)
     }
 
     /// Reports whether a distribution image is verified locally.
@@ -5511,5 +5561,84 @@ mod tests {
             before.network.config.lan_address
         );
         assert_eq!(started.network.tap_name, before.network.config.tap_name);
+    }
+
+    #[tokio::test]
+    async fn running_listing_is_empty_without_inventory_rows() {
+        if std::env::consts::ARCH != "x86_64" {
+            return;
+        }
+        let (sdk, _directory, _storage, _credentials, _network, _runtime) = test_sdk(false);
+        let running = sdk
+            .list_running_microvms()
+            .await
+            .expect("empty inventory should list no running VMs");
+        assert!(running.is_empty());
+    }
+
+    #[tokio::test]
+    async fn running_listing_returns_live_vms_ordered_with_ssh_material() {
+        if std::env::consts::ARCH != "x86_64" {
+            return;
+        }
+        let (sdk, _directory, _storage, _credentials, _network, runtime) = test_sdk(false);
+        start_fixture_vm(&sdk, "zeta", false, MicroVmState::Running, Some(4242));
+        start_fixture_vm(&sdk, "alpha", false, MicroVmState::Running, Some(4242));
+        start_fixture_vm(&sdk, "stopped", false, MicroVmState::Configured, None);
+        start_fixture_vm(&sdk, "creating", false, MicroVmState::Creating, None);
+        *runtime.live_process.lock().expect("liveness lock") = true;
+        *runtime.live_socket.lock().expect("socket lock") = true;
+        let running = sdk
+            .list_running_microvms()
+            .await
+            .expect("live VMs should be listed");
+        let names: Vec<&str> = running.iter().map(|entry| entry.name.as_str()).collect();
+        assert_eq!(names, ["alpha", "zeta"]);
+        for entry in &running {
+            assert_eq!(entry.ssh.user, "root");
+            assert_eq!(entry.ssh.port, 22);
+            assert!(entry.ssh.private_key_path.ends_with("id_ed25519"));
+            assert!(entry.ssh.private_key_path.is_absolute());
+        }
+    }
+
+    #[tokio::test]
+    async fn running_listing_omits_machines_without_liveness() {
+        if std::env::consts::ARCH != "x86_64" {
+            return;
+        }
+        let (sdk, _directory, _storage, _credentials, _network, runtime) = test_sdk(false);
+        start_fixture_vm(&sdk, "dead_vm", false, MicroVmState::Running, Some(4242));
+        *runtime.live_process.lock().expect("liveness lock") = false;
+        *runtime.live_socket.lock().expect("socket lock") = false;
+        let running = sdk
+            .list_running_microvms()
+            .await
+            .expect("dead process should be omitted");
+        assert!(running.is_empty());
+    }
+
+    #[tokio::test]
+    async fn running_listing_treats_every_liveness_mismatch_as_not_running() {
+        if std::env::consts::ARCH != "x86_64" {
+            return;
+        }
+        for (live_process, live_socket) in [(true, false), (false, true)] {
+            let (sdk, _directory, _storage, _credentials, _network, runtime) = test_sdk(false);
+            start_fixture_vm(
+                &sdk,
+                "mismatch_vm",
+                false,
+                MicroVmState::Running,
+                Some(4242),
+            );
+            *runtime.live_process.lock().expect("liveness lock") = live_process;
+            *runtime.live_socket.lock().expect("socket lock") = live_socket;
+            let running = sdk
+                .list_running_microvms()
+                .await
+                .expect("mismatched VM should be omitted");
+            assert!(running.is_empty());
+        }
     }
 }
