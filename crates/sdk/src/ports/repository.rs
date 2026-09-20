@@ -89,6 +89,8 @@ pub(crate) struct StoredMicroVm {
 pub(crate) trait MicroVmRepository: Send + Sync {
     fn find_microvm(&self, name: &str) -> Result<Option<StoredMicroVm>, SdkError>;
 
+    fn list_microvm_names(&self) -> Result<Vec<(String, String)>, SdkError>;
+
     fn find_volume_owner(&self, volume_path: &Path) -> Result<Option<String>, SdkError>;
 
     fn list_host_only_networks(&self) -> Result<Vec<(String, IpAddr, String)>, SdkError>;

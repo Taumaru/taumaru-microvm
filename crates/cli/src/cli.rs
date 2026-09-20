@@ -18,6 +18,8 @@ pub(crate) enum Command {
     Artifacts(ArtifactsArgs),
     /// Create a new MicroVM through guided prompts or explicit flags.
     New(NewArgs),
+    /// Start a created MicroVM by name or interactive selection.
+    Start(StartArgs),
 }
 
 #[derive(Debug, Args, Clone)]
@@ -80,6 +82,20 @@ pub(crate) struct NewArgs {
     /// Internal only: set by privilege escalation for the elevated child.
     #[arg(long = "trusted-values", hide = true)]
     pub(crate) trusted_values: bool,
+}
+
+#[derive(Debug, Args, Clone)]
+pub(crate) struct StartArgs {
+    /// Machine name; skips the machine selector when supplied.
+    pub(crate) name: Option<String>,
+
+    /// Equivalent to the positional name; must agree when both are given.
+    #[arg(long = "name")]
+    pub(crate) explicit_name: Option<String>,
+
+    /// Disable prompts; the name is required and root is required up front.
+    #[arg(long = "non-interactive")]
+    pub(crate) non_interactive: bool,
 }
 #[cfg(test)]
 mod tests {
@@ -168,5 +184,24 @@ mod tests {
         assert!(Cli::try_parse_from(["microvm", "new", "--kernel", "x"]).is_err());
         assert!(Cli::try_parse_from(["microvm", "new", "--volume-path", "/tmp/x"]).is_err());
         assert!(Cli::try_parse_from(["microvm", "new", "--lan-address", "1.2.3.4"]).is_err());
+    }
+
+    #[test]
+    fn start_parser_accepts_positional_name_and_flag() {
+        let cli = Cli::try_parse_from(["microvm", "start", "web-01", "--non-interactive"])
+            .expect("valid explicit start arguments");
+
+        let Some(Command::Start(arguments)) = cli.command else {
+            panic!("start command should be parsed");
+        };
+        assert_eq!(arguments.name.as_deref(), Some("web-01"));
+        assert!(arguments.non_interactive);
+    }
+
+    #[test]
+    fn start_parser_rejects_lifecycle_flags() {
+        assert!(Cli::try_parse_from(["microvm", "start", "--image", "x"]).is_err());
+        assert!(Cli::try_parse_from(["microvm", "start", "--disk-gb", "20"]).is_err());
+        assert!(Cli::try_parse_from(["microvm", "start", "--expose-lan"]).is_err());
     }
 }

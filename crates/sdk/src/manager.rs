@@ -26,9 +26,9 @@ use crate::domain::config::minimum_memory_bytes;
 use crate::domain::lifecycle::{MicroVmState, NetworkMode};
 use crate::domain::microvm::{
     CreateMicroVmRequest, CreationEventPhase, CreationOutcome, CreationProgress, CreationStage,
-    MicroVmCreationResult, MicroVmRecord, MicroVmStartResult, NetworkConfigurationResult,
-    PersistedCredential, PersistedNetwork, PersistedRuntime, SshConnectionInfo,
-    TOTAL_CREATION_STEPS, unspecified_address,
+    MicroVmCreationResult, MicroVmRecord, MicroVmStartResult, MicroVmSummary,
+    NetworkConfigurationResult, PersistedCredential, PersistedNetwork, PersistedRuntime,
+    SshConnectionInfo, TOTAL_CREATION_STEPS, unspecified_address,
 };
 use crate::domain::registry::{
     Architecture, BinaryFile, BinaryPackage, Distribution, DistributionImage, Kernel,
@@ -571,6 +571,29 @@ impl MicroVmSdk {
     ) -> Result<Vec<(String, String)>, SdkError> {
         self.run_repository(|repository| repository.list_ready_distribution_images())
             .await
+    }
+
+    /// Lists every persisted MicroVM for selectors and future listing surfaces.
+    ///
+    /// Returns one [`MicroVmSummary`] per inventory row ordered by name. The state is
+    /// the last persisted lifecycle state and is never live-verified; running truth
+    /// requires a start or status check, never this snapshot alone. The query performs
+    /// no mutation, repair, or persistence write, and emits no output, logs, or global
+    /// state.
+    pub async fn list_microvms(&self) -> Result<Vec<MicroVmSummary>, SdkError> {
+        let rows = self
+            .run_repository(|repository| repository.list_microvm_names())
+            .await?;
+        rows.into_iter()
+            .map(|(name, state)| {
+                let state = MicroVmState::parse(&state).ok_or_else(|| {
+                    SdkError::Migration(format!(
+                        "invalid persisted lifecycle state for {name}: {state}"
+                    ))
+                })?;
+                Ok(MicroVmSummary { name, state })
+            })
+            .collect()
     }
 
     /// Reports whether a distribution image is verified locally.

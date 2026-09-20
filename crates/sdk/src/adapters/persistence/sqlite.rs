@@ -787,6 +787,15 @@ impl MicroVmRepository for SqliteRepository {
         }))
     }
 
+    fn list_microvm_names(&self) -> Result<Vec<(String, String)>, SdkError> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare("SELECT name, state FROM microvms ORDER BY name")?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(SdkError::from)
+    }
+
     fn find_volume_owner(&self, volume_path: &Path) -> Result<Option<String>, SdkError> {
         let connection = self.connection()?;
         connection

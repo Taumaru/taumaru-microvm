@@ -192,6 +192,19 @@ pub struct MicroVmStartResult {
     pub ssh: SshConnectionInfo,
 }
 
+/// Read-only inventory snapshot of one persisted MicroVM.
+///
+/// Returned by [`crate::MicroVmSdk::list_microvms`] for selectors and future listing
+/// surfaces. The state is the last persisted lifecycle state and is never live-verified;
+/// running truth requires a start or status check, never this snapshot alone.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MicroVmSummary {
+    /// Stable VM identifier, ordered by name.
+    pub name: String,
+    /// Last persisted lifecycle state (`Configured`, `Running`, `Creating`).
+    pub state: MicroVmState,
+}
+
 /// Total number of creation stages reported through the progress observer.
 ///
 /// Every observed `create_microvm` operation reports step counters out of this fixed

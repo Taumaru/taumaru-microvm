@@ -93,6 +93,33 @@ impl CliError {
         ))
     }
 
+    pub(crate) fn start_not_found(name: &str) -> Self {
+        Self::Creation(format!(
+            "MicroVM {name:?} was not found\u{1f}no created machine named {name:?} exists in this home\u{1f}Run `microvm new` to create it, then try again"
+        ))
+    }
+
+    pub(crate) fn start_empty_inventory() -> Self {
+        Self::Creation(
+            "No MicroVMs to start\u{1f}no created machines exist in this home\u{1f}Run `microvm new` to create one, then try again"
+                .to_string(),
+        )
+    }
+
+    pub(crate) fn start_cancelled() -> Self {
+        Self::Creation(
+            "MicroVM start cancelled\u{1f}no machine was started\u{1f}Run `microvm start` again when you are ready"
+                .to_string(),
+        )
+    }
+
+    pub(crate) fn start_failed(what: impl Into<String>, error: &SdkError) -> Self {
+        Self::Creation(format!(
+            "{}\u{1f}{error}\u{1f}Check the reported cause, then retry the start",
+            what.into()
+        ))
+    }
+
     pub(crate) fn escalation_unavailable() -> Self {
         Self::Creation(
             "Elevated rights are required\u{1f}neither sudo nor pkexec is available on this host\u{1f}Install sudo or polkit, or run the command as root"
@@ -105,6 +132,7 @@ impl CliError {
             Self::Prompt(message) if message == "cancelled" => 130,
             Self::Sdk(SdkError::Cancelled) => 130,
             Self::Cancelled => 130,
+            Self::Creation(payload) if payload.starts_with("MicroVM start cancelled") => 130,
             _ => 1,
         }
     }

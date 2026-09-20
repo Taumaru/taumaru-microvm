@@ -61,6 +61,48 @@ impl CatalogSpinner {
     }
 }
 
+pub(crate) struct StartSpinner {
+    bar: ProgressBar,
+    interactive: bool,
+}
+
+impl StartSpinner {
+    pub(crate) fn new(name: &str, capabilities: TerminalCapabilities) -> Self {
+        let bar = if capabilities.interactive {
+            let bar = ProgressBar::new_spinner();
+            let template = if capabilities.color {
+                "{spinner:.dim} {msg}"
+            } else {
+                "{spinner} {msg}"
+            };
+            let style = match ProgressStyle::with_template(template) {
+                Ok(style) => {
+                    style.tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"])
+                }
+                Err(_) => ProgressStyle::default_spinner(),
+            };
+            bar.set_style(style);
+            bar.set_message(format!("Starting MicroVM {name}"));
+            bar.enable_steady_tick(Duration::from_millis(90));
+            bar
+        } else {
+            eprintln!("·  Starting MicroVM {name}");
+            ProgressBar::hidden()
+        };
+
+        Self {
+            bar,
+            interactive: capabilities.interactive,
+        }
+    }
+
+    pub(crate) fn finish(self) {
+        if self.interactive {
+            self.bar.finish_and_clear();
+        }
+    }
+}
+
 pub(crate) fn write_catalog_ready(
     capabilities: TerminalCapabilities,
     distribution_count: usize,
@@ -778,6 +820,11 @@ pub(crate) fn format_new_result(
         result.volume_path.display()
     ));
     output.push_str(&format!("  {ssh_label} {ssh}\n"));
+    output.push_str(&format!(
+        "  {} microvm start {}\n",
+        paint("Start:", ANSI_DIM, capabilities.color),
+        result.name
+    ));
     if interrupted {
         output.push_str(&format!(
             "\n  {}\n",
@@ -802,6 +849,71 @@ pub(crate) fn write_new_result(
         stdout,
         "{}",
         format_new_result(result, request, interrupted, capabilities)
+    )
+}
+
+pub(crate) fn format_start_result(
+    result: &taumaru_microvm::MicroVmStartResult,
+    ssh_prefix: &str,
+    capabilities: TerminalCapabilities,
+) -> String {
+    let title = paint(
+        format!("MicroVM {} running", result.name),
+        ANSI_BOLD,
+        capabilities.color,
+    );
+    let check = paint("✓", ANSI_GREEN, capabilities.color);
+    let rule = divider(capabilities);
+    let connect_label = paint("Connect:", ANSI_DIM, capabilities.color);
+    let direct_label = paint("Direct:", ANSI_DIM, capabilities.color);
+    let lan_label = paint("LAN:", ANSI_DIM, capabilities.color);
+    let stop_label = paint("Stop:", ANSI_DIM, capabilities.color);
+    let direct = format!(
+        "{ssh_prefix}ssh -i {} -p {} {}@{}",
+        result.ssh.private_key_path.display(),
+        result.ssh.port,
+        result.ssh.user,
+        result.ssh.address
+    );
+    let mut output = String::from("\n");
+    output.push_str(&format!("{check} {title}\n{rule}\n\n"));
+    output.push_str(&format!("  {connect_label} microvm ssh {}\n", result.name));
+    output.push_str(&format!("  {direct_label}  {direct}\n"));
+    if result.network.mode == taumaru_microvm::NetworkMode::Lan {
+        match result.network.lan_address {
+            Some(address) => {
+                output.push_str(&format!(
+                    "  {lan_label}     copy {} to the other machine, then\n           ssh -i {} -p {} {}@{address}\n",
+                    result.ssh.private_key_path.display(),
+                    result
+                        .ssh
+                        .private_key_path
+                        .file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| String::from("id_ed25519")),
+                    result.ssh.port,
+                    result.ssh.user,
+                ));
+            }
+            None => {
+                output.push_str(&format!("  {lan_label}     LAN exposed\n"));
+            }
+        }
+    }
+    output.push_str(&format!("  {stop_label}    microvm stop {}\n", result.name));
+    output
+}
+
+pub(crate) fn write_start_result(
+    result: &taumaru_microvm::MicroVmStartResult,
+    ssh_prefix: &str,
+    capabilities: TerminalCapabilities,
+) -> Result<(), io::Error> {
+    let mut stdout = io::stdout().lock();
+    write!(
+        stdout,
+        "{}",
+        format_start_result(result, ssh_prefix, capabilities)
     )
 }
 
@@ -1033,6 +1145,142 @@ mod new_tests {
         assert!(line.contains("creation/volume_preparation"));
         assert!(line.contains("2/6"));
         assert!(line.contains("4 B / 8 B"));
+    }
+}
+
+#[cfg(test)]
+mod start_tests {
+    use super::{format_new_result, format_start_result};
+    use crate::commands::new::NewVmRequest;
+    use crate::context::TerminalCapabilities;
+    use std::net::IpAddr;
+    use std::path::PathBuf;
+    use taumaru_microvm::{
+        MicroVmCreationResult, MicroVmStartResult, MicroVmState, NetworkConfiguration, NetworkMode,
+        SshConnectionInfo,
+    };
+
+    fn capabilities() -> TerminalCapabilities {
+        TerminalCapabilities {
+            interactive: false,
+            color: false,
+            width: Some(120),
+        }
+    }
+
+    fn ssh() -> SshConnectionInfo {
+        SshConnectionInfo {
+            user: String::from("root"),
+            port: 22,
+            address: "192.168.127.2"
+                .parse::<IpAddr>()
+                .expect("test address parses"),
+            private_key_path: PathBuf::from(
+                "/home/user/.taumaru-microvm/vms/web-01/ssh/id_ed25519",
+            ),
+            public_key_path: PathBuf::from(
+                "/home/user/.taumaru-microvm/vms/web-01/ssh/id_ed25519.pub",
+            ),
+        }
+    }
+
+    fn network(mode: NetworkMode, lan_address: Option<IpAddr>) -> NetworkConfiguration {
+        NetworkConfiguration {
+            mode,
+            guest_address: "192.168.127.2"
+                .parse::<IpAddr>()
+                .expect("test address parses"),
+            prefix_length: 30,
+            gateway: None,
+            tap_name: String::from("tap-web-01"),
+            bridge_name: None,
+            uplink_name: None,
+            lan_address,
+        }
+    }
+
+    fn start_result(mode: NetworkMode, lan_address: Option<IpAddr>) -> MicroVmStartResult {
+        MicroVmStartResult {
+            name: String::from("web-01"),
+            state: MicroVmState::Running,
+            volume_path: PathBuf::from("/home/user/.taumaru-microvm/vms/web-01"),
+            rootfs_path: PathBuf::from("/home/user/.taumaru-microvm/vms/web-01/rootfs.ext4"),
+            socket_path: PathBuf::from("/home/user/.taumaru-microvm/vms/web-01/firecracker.sock"),
+            process_id: 4242,
+            network: network(mode, lan_address),
+            ssh: ssh(),
+        }
+    }
+
+    fn creation_result() -> MicroVmCreationResult {
+        MicroVmCreationResult {
+            name: String::from("web-01"),
+            state: MicroVmState::Configured,
+            distribution_id: String::from("distro-a"),
+            image_id: String::from("image-a"),
+            volume_path: PathBuf::from("/home/user/.taumaru-microvm/vms/web-01"),
+            rootfs_path: PathBuf::from("/home/user/.taumaru-microvm/vms/web-01/rootfs.ext4"),
+            socket_path: PathBuf::from("/home/user/.taumaru-microvm/vms/web-01/firecracker.sock"),
+            vcpu_count: 2,
+            memory_bytes: 2 * 1024 * 1024 * 1024,
+            disk_size_bytes: 20 * 1024 * 1024 * 1024,
+            network: network(NetworkMode::HostOnly, None),
+            ssh: ssh(),
+        }
+    }
+
+    #[test]
+    fn host_only_report_orders_hints_without_lan_paragraph() {
+        let report = format_start_result(
+            &start_result(NetworkMode::HostOnly, None),
+            "",
+            capabilities(),
+        );
+        let connect = report
+            .find("microvm ssh web-01")
+            .expect("connect hint renders");
+        let direct = report.find("ssh -i").expect("direct hint renders");
+        let stop = report
+            .find("microvm stop web-01")
+            .expect("stop hint renders");
+        assert!(connect < direct);
+        assert!(direct < stop);
+        assert!(!report.contains("copy "));
+        assert!(!report.contains("LAN:"));
+        assert!(report.contains("MicroVM web-01 running"));
+    }
+
+    #[test]
+    fn lan_report_uses_lan_address_with_elevation_prefix() {
+        let lan: IpAddr = "192.168.10.30"
+            .parse::<IpAddr>()
+            .expect("test address parses");
+        let report = format_start_result(
+            &start_result(NetworkMode::Lan, Some(lan)),
+            "sudo ",
+            capabilities(),
+        );
+        assert!(report.contains("sudo ssh -i"));
+        assert!(report.contains("copy /home/user/.taumaru-microvm/vms/web-01/ssh/id_ed25519"));
+        assert!(report.contains("root@192.168.10.30"));
+        assert!(!report.contains("id_ed25519\n"));
+    }
+
+    #[test]
+    fn new_report_appends_start_command_with_existing_rows() {
+        let request = NewVmRequest {
+            name: String::from("web-01"),
+            distribution_id: String::from("distro-a"),
+            image_id: String::from("image-a"),
+            disk_size_bytes: 20 * 1024 * 1024 * 1024,
+            memory_bytes: 2 * 1024 * 1024 * 1024,
+            vcpu_count: 2,
+            expose_on_lan: false,
+        };
+        let report = format_new_result(&creation_result(), &request, false, capabilities());
+        assert!(report.contains("MicroVM web-01 created"));
+        assert!(report.contains("host-only"));
+        assert!(report.contains("Start: microvm start web-01"));
     }
 }
 

@@ -18,7 +18,7 @@ pub use domain::{
 };
 pub use domain::{
     CreateMicroVmRequest, CreationEventPhase, CreationOutcome, CreationProgress, CreationStage,
-    MicroVmCreationResult, MicroVmStartResult, MicroVmState, NetworkConfiguration,
+    MicroVmCreationResult, MicroVmStartResult, MicroVmState, MicroVmSummary, NetworkConfiguration,
     NetworkConfigurationResult, NetworkMode, NetworkResource, SshConnectionInfo,
     TOTAL_CREATION_STEPS,
 };
