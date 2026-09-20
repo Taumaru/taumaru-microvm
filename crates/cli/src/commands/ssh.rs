@@ -13,12 +13,13 @@ use crate::error::CliError;
 
 #[derive(Clone, Debug)]
 struct MachineOption {
-    name: String,
+    id: String,
+    label: String,
 }
 
 impl std::fmt::Display for MachineOption {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(&self.name)
+        formatter.write_str(&self.label)
     }
 }
 
@@ -50,12 +51,15 @@ fn ssh_prompt_error(error: inquire::InquireError) -> CliError {
 }
 
 async fn prompt_machine(
-    names: &[String],
+    machines: &[(String, taumaru_microvm::MicroVmState)],
     terminal: TerminalCapabilities,
 ) -> Result<String, CliError> {
-    let options: Vec<MachineOption> = names
+    let options: Vec<MachineOption> = machines
         .iter()
-        .map(|name| MachineOption { name: name.clone() })
+        .map(|(name, state)| MachineOption {
+            id: name.clone(),
+            label: format!("{name} [{state}]"),
+        })
         .collect();
     let selected = Select::new("Choose a MicroVM to connect to", options)
         .with_help_message("↑↓ move  ·  enter confirm")
@@ -63,7 +67,7 @@ async fn prompt_machine(
         .with_render_config(prompt_render_config(terminal.color))
         .prompt()
         .map_err(ssh_prompt_error)?;
-    validate_name(&selected.name)
+    validate_name(&selected.id)
 }
 
 async fn resolve_running_entry(
@@ -181,15 +185,15 @@ pub(crate) async fn run(context: &CliContext, arguments: SshArgs) -> Result<u8, 
             ));
         }
         let inventory = context.sdk.list_microvms().await?;
-        let names: Vec<String> = inventory
+        let machines: Vec<(String, taumaru_microvm::MicroVmState)> = inventory
             .into_iter()
             .filter(|machine| machine.state == taumaru_microvm::MicroVmState::Running)
-            .map(|machine| machine.name)
+            .map(|machine| (machine.name, machine.state))
             .collect();
-        if names.is_empty() {
+        if machines.is_empty() {
             return Err(CliError::ssh_empty());
         }
-        let name = prompt_machine(&names, context.terminal).await?;
+        let name = prompt_machine(&machines, context.terminal).await?;
         let home = crate::context::resolve_home().ok();
         let command = escalated_child_command(&name, &remote);
         if let Some(exit) = crate::privilege::require_privileged(
