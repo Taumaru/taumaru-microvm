@@ -103,6 +103,48 @@ impl StartSpinner {
     }
 }
 
+pub(crate) struct StopSpinner {
+    bar: ProgressBar,
+    interactive: bool,
+}
+
+impl StopSpinner {
+    pub(crate) fn new(name: &str, capabilities: TerminalCapabilities) -> Self {
+        let bar = if capabilities.interactive {
+            let bar = ProgressBar::new_spinner();
+            let template = if capabilities.color {
+                "{spinner:.dim} {msg}"
+            } else {
+                "{spinner} {msg}"
+            };
+            let style = match ProgressStyle::with_template(template) {
+                Ok(style) => {
+                    style.tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"])
+                }
+                Err(_) => ProgressStyle::default_spinner(),
+            };
+            bar.set_style(style);
+            bar.set_message(format!("Stopping MicroVM {name}"));
+            bar.enable_steady_tick(Duration::from_millis(90));
+            bar
+        } else {
+            eprintln!("·  Stopping MicroVM {name}");
+            ProgressBar::hidden()
+        };
+
+        Self {
+            bar,
+            interactive: capabilities.interactive,
+        }
+    }
+
+    pub(crate) fn finish(self) {
+        if self.interactive {
+            self.bar.finish_and_clear();
+        }
+    }
+}
+
 pub(crate) fn write_catalog_ready(
     capabilities: TerminalCapabilities,
     distribution_count: usize,
@@ -915,6 +957,85 @@ pub(crate) fn write_start_result(
         "{}",
         format_start_result(result, ssh_prefix, capabilities)
     )
+}
+pub(crate) fn format_stop_result(
+    result: &taumaru_microvm::MicroVmStopResult,
+    capabilities: TerminalCapabilities,
+) -> String {
+    let title = paint(
+        format!("MicroVM {} stopped", result.name),
+        ANSI_BOLD,
+        capabilities.color,
+    );
+    let check = paint("✓", ANSI_GREEN, capabilities.color);
+    let rule = divider(capabilities);
+    let shutdown_label = paint("Shutdown:", ANSI_DIM, capabilities.color);
+    let start_label = paint("Start:", ANSI_DIM, capabilities.color);
+    let shutdown = if result.forced {
+        "forced — the guest did not exit and was force-terminated"
+    } else {
+        "graceful — the guest exited on its own"
+    };
+    let mut output = String::from("\n");
+    output.push_str(&format!("{check} {title}\n{rule}\n\n"));
+    output.push_str(&format!("  {shutdown_label} {shutdown}\n"));
+    output.push_str(&format!(
+        "  {start_label}    microvm start {}\n",
+        result.name
+    ));
+    output
+}
+
+pub(crate) fn write_stop_result(
+    result: &taumaru_microvm::MicroVmStopResult,
+    capabilities: TerminalCapabilities,
+) -> Result<(), io::Error> {
+    let mut stdout = io::stdout().lock();
+    write!(stdout, "{}", format_stop_result(result, capabilities))
+}
+
+#[cfg(test)]
+mod stop_tests {
+    use super::format_stop_result;
+    use crate::context::TerminalCapabilities;
+    use std::path::PathBuf;
+    use taumaru_microvm::{MicroVmState, MicroVmStopResult};
+
+    fn capabilities() -> TerminalCapabilities {
+        TerminalCapabilities {
+            interactive: false,
+            color: false,
+            width: Some(120),
+        }
+    }
+
+    fn stop_result(forced: bool) -> MicroVmStopResult {
+        MicroVmStopResult {
+            name: String::from("web-01"),
+            state: MicroVmState::Stopped,
+            socket_path: PathBuf::from("/home/user/.taumaru-microvm/vms/web-01/firecracker.sock"),
+            forced,
+        }
+    }
+
+    #[test]
+    fn graceful_report_names_machine_with_restart_hint() {
+        let report = format_stop_result(&stop_result(false), capabilities());
+        assert!(report.contains("MicroVM web-01 stopped"));
+        assert!(report.contains("graceful"));
+        assert!(!report.contains("forced"));
+        assert!(report.contains("microvm start web-01"));
+    }
+
+    #[test]
+    fn forced_report_is_text_distinguishable_from_graceful() {
+        let forced = format_stop_result(&stop_result(true), capabilities());
+        let graceful = format_stop_result(&stop_result(false), capabilities());
+        assert!(forced.contains("forced"));
+        assert!(!forced.contains("graceful — the guest exited on its own"));
+        assert!(graceful.contains("graceful — the guest exited on its own"));
+        assert_ne!(forced, graceful);
+    }
 }
 
 fn availability_label(availability: &Availability) -> &'static str {

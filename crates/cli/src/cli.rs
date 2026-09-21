@@ -20,6 +20,8 @@ pub(crate) enum Command {
     New(NewArgs),
     /// Start a created MicroVM by name or interactive selection.
     Start(StartArgs),
+    /// Stop a running MicroVM by name or interactive selection.
+    Stop(StopArgs),
     /// Connect to a running MicroVM over SSH by name or interactive selection.
     Ssh(SshArgs),
 }
@@ -88,6 +90,19 @@ pub(crate) struct NewArgs {
 
 #[derive(Debug, Args, Clone)]
 pub(crate) struct StartArgs {
+    /// Machine name; skips the machine selector when supplied.
+    pub(crate) name: Option<String>,
+
+    /// Equivalent to the positional name; must agree when both are given.
+    #[arg(long = "name")]
+    pub(crate) explicit_name: Option<String>,
+
+    /// Disable prompts; the name is required and root is required up front.
+    #[arg(long = "non-interactive")]
+    pub(crate) non_interactive: bool,
+}
+#[derive(Debug, Args, Clone)]
+pub(crate) struct StopArgs {
     /// Machine name; skips the machine selector when supplied.
     pub(crate) name: Option<String>,
 
@@ -222,6 +237,25 @@ mod tests {
         };
         assert_eq!(arguments.name.as_deref(), Some("web-01"));
         assert!(arguments.non_interactive);
+    }
+
+    #[test]
+    fn stop_parser_accepts_positional_name_and_flag() {
+        let cli = Cli::try_parse_from(["microvm", "stop", "web-01", "--non-interactive"])
+            .expect("valid explicit stop arguments");
+
+        let Some(Command::Stop(arguments)) = cli.command else {
+            panic!("stop command should be parsed");
+        };
+        assert_eq!(arguments.name.as_deref(), Some("web-01"));
+        assert!(arguments.non_interactive);
+    }
+
+    #[test]
+    fn stop_parser_rejects_lifecycle_flags() {
+        assert!(Cli::try_parse_from(["microvm", "stop", "--image", "x"]).is_err());
+        assert!(Cli::try_parse_from(["microvm", "stop", "--disk-gb", "20"]).is_err());
+        assert!(Cli::try_parse_from(["microvm", "stop", "--expose-lan"]).is_err());
     }
 
     #[test]

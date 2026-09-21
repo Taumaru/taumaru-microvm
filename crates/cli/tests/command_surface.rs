@@ -292,3 +292,53 @@ fn non_interactive_ssh_without_root_reports_privilege_error() {
     assert!(!output.status.success());
     assert!(stderr.to_ascii_lowercase().contains("elevated rights"));
 }
+
+#[test]
+fn stop_help_exposes_name_selection_without_lifecycle_flags() {
+    let output = run_microvm(&["stop", "--help"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(output.status.success());
+    assert!(stdout.contains("Usage: microvm stop"));
+    assert!(stdout.contains("[NAME]"));
+    assert!(stdout.contains("--name"));
+    assert!(stdout.contains("--non-interactive"));
+    assert!(!stdout.contains("--image"));
+    assert!(!stdout.contains("--disk-gb"));
+    assert!(!stdout.contains("--memory"));
+    assert!(!stdout.contains("--vcpus"));
+    assert!(!stdout.contains("--expose-lan"));
+}
+
+#[test]
+fn non_interactive_stop_rejects_missing_name_without_prompting() {
+    let home = tempfile::tempdir().expect("temporary home should be created");
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_microvm"))
+        .args(["stop", "--non-interactive"])
+        .env("TAUMARU_HOME", home.path())
+        .output()
+        .expect("failed to execute microvm");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(!output.status.success());
+    assert!(stderr.contains("Missing machine name"));
+    assert!(!stderr.contains("panicked"));
+}
+
+#[test]
+fn non_interactive_stop_without_root_reports_privilege_error() {
+    let home = tempfile::tempdir().expect("temporary home should be created");
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_microvm"))
+        .args(["stop", "web-01", "--non-interactive"])
+        .env("TAUMARU_HOME", home.path())
+        .env_remove("TAUMARU_ESCALATED")
+        .output()
+        .expect("failed to execute microvm");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    if unsafe { libc_geteuid() } == 0 {
+        return;
+    }
+    assert!(!output.status.success());
+    assert!(stderr.to_ascii_lowercase().contains("elevated rights"));
+}

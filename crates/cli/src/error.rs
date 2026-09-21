@@ -139,7 +139,6 @@ impl CliError {
                 .to_string(),
         )
     }
-
     pub(crate) fn ssh_cancelled() -> Self {
         Self::Creation(
             "MicroVM connection cancelled\u{1f}no session was opened\u{1f}Run `microvm ssh` again when you are ready"
@@ -147,18 +146,45 @@ impl CliError {
         )
     }
 
-    pub(crate) fn ssh_key_unreadable(path: &std::path::Path) -> Self {
-        Self::Creation(format!(
-            "SSH key is missing or unreadable\u{1f}the private key at {} is not a readable file\u{1f}Repair the machine volume or recreate the machine, then try again",
-            path.display()
-        ))
-    }
-
     pub(crate) fn ssh_client_missing() -> Self {
         Self::Creation(
             "SSH client is unavailable\u{1f}no `ssh` program was found on this host\u{1f}Install the OpenSSH client, then try again"
                 .to_string(),
         )
+    }
+
+    pub(crate) fn stop_not_found(name: &str) -> Self {
+        Self::Creation(format!(
+            "MicroVM {name:?} was not found\u{1f}no created machine named {name:?} exists in this home\u{1f}Run `microvm new` to create it, then try again"
+        ))
+    }
+
+    pub(crate) fn stop_empty() -> Self {
+        Self::Creation(
+            "No running MicroVMs to stop\u{1f}no machine is currently running in this home\u{1f}Run `microvm start` to start one, then try again"
+                .to_string(),
+        )
+    }
+
+    pub(crate) fn stop_cancelled() -> Self {
+        Self::Creation(
+            "MicroVM stop cancelled\u{1f}no machine was stopped\u{1f}Run `microvm stop` again when you are ready"
+                .to_string(),
+        )
+    }
+
+    pub(crate) fn stop_failed(what: impl Into<String>, error: &SdkError) -> Self {
+        Self::Creation(format!(
+            "{}\u{1f}{error}\u{1f}Check the reported cause, then retry the stop",
+            what.into()
+        ))
+    }
+
+    pub(crate) fn ssh_key_unreadable(path: &std::path::Path) -> Self {
+        Self::Creation(format!(
+            "SSH key is missing or unreadable\u{1f}the private key at {} is not a readable file\u{1f}Repair the machine volume or recreate the machine, then try again",
+            path.display()
+        ))
     }
 
     pub(crate) fn escalation_unavailable() -> Self {
@@ -175,6 +201,7 @@ impl CliError {
             Self::Cancelled => 130,
             Self::Creation(payload) if payload.starts_with("MicroVM start cancelled") => 130,
             Self::Creation(payload) if payload.starts_with("MicroVM connection cancelled") => 130,
+            Self::Creation(payload) if payload.starts_with("MicroVM stop cancelled") => 130,
             _ => 1,
         }
     }
