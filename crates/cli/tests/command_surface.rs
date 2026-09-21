@@ -342,3 +342,58 @@ fn non_interactive_stop_without_root_reports_privilege_error() {
     assert!(!output.status.success());
     assert!(stderr.to_ascii_lowercase().contains("elevated rights"));
 }
+
+#[test]
+fn ls_help_exposes_flag_only_surface() {
+    for spelling in ["ls", "list"] {
+        let output = run_microvm(&[spelling, "--help"]);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        assert!(output.status.success(), "{spelling} help should succeed");
+        assert!(stdout.contains("--non-interactive"));
+        assert!(!stdout.contains("--image"));
+        assert!(!stdout.contains("--disk-gb"));
+        assert!(!stdout.contains("--memory"));
+        assert!(!stdout.contains("--vcpus"));
+        assert!(!stdout.contains("--expose-lan"));
+    }
+}
+
+#[test]
+fn list_alias_matches_ls_help() {
+    let ls = run_microvm(&["ls", "--help"]);
+    let list = run_microvm(&["list", "--help"]);
+    let ls_stdout = String::from_utf8_lossy(&ls.stdout);
+    let list_stdout = String::from_utf8_lossy(&list.stdout);
+
+    assert!(ls.status.success());
+    assert!(list.status.success());
+    for stdout in [&ls_stdout, &list_stdout] {
+        assert!(stdout.contains("List all MicroVMs with state and configured capacities"));
+        assert!(stdout.contains("--non-interactive"));
+    }
+}
+
+#[test]
+fn ls_rejects_positional_name() {
+    let output = run_microvm(&["ls", "web-01"]);
+    assert!(!output.status.success());
+}
+
+#[test]
+fn non_interactive_ls_without_root_reports_privilege_error() {
+    let home = tempfile::tempdir().expect("temporary home should be created");
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_microvm"))
+        .args(["ls", "--non-interactive"])
+        .env("TAUMARU_HOME", home.path())
+        .env_remove("TAUMARU_ESCALATED")
+        .output()
+        .expect("failed to execute microvm");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    if unsafe { libc_geteuid() } == 0 {
+        return;
+    }
+    assert!(!output.status.success());
+    assert!(stderr.to_ascii_lowercase().contains("elevated rights"));
+}

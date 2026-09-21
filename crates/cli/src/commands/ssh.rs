@@ -554,10 +554,26 @@ mod tests {
             MicroVmSummary {
                 name: "web-01".to_owned(),
                 state: MicroVmState::Running,
+                vcpu_count: 2,
+                memory_bytes: 2 * 1024 * 1024 * 1024,
+                disk_size_bytes: 20 * 1024 * 1024 * 1024,
+                distribution_id: "ubuntu-24.04".to_owned(),
+                image_id: "base".to_owned(),
+                network_mode: None,
+                guest_address: None,
+                lan_address: None,
             },
             MicroVmSummary {
                 name: "db-01".to_owned(),
                 state: MicroVmState::Stopped,
+                vcpu_count: 2,
+                memory_bytes: 2 * 1024 * 1024 * 1024,
+                disk_size_bytes: 20 * 1024 * 1024 * 1024,
+                distribution_id: "ubuntu-24.04".to_owned(),
+                image_id: "base".to_owned(),
+                network_mode: None,
+                guest_address: None,
+                lan_address: None,
             },
         ];
         let machines: Vec<(String, taumaru_microvm::MicroVmState)> = inventory

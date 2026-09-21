@@ -138,6 +138,47 @@ async fn seeded_vms_report_verified_states_ordered_by_name() {
     assert_eq!(listed[0].state, MicroVmState::Stopped);
     assert_eq!(listed[1].state, MicroVmState::Running);
     assert_eq!(listed[2].state, MicroVmState::Stopped);
+    for item in &listed {
+        assert_eq!(item.vcpu_count, 1);
+        assert_eq!(item.memory_bytes, 1);
+        assert_eq!(item.disk_size_bytes, 1);
+        assert_eq!(item.distribution_id, "distro");
+        assert_eq!(item.image_id, "image");
+        assert_eq!(
+            item.network_mode,
+            Some(taumaru_microvm::NetworkMode::HostOnly)
+        );
+        assert_eq!(
+            item.guest_address,
+            Some("10.200.8.2".parse().expect("seed guest IP should parse"))
+        );
+        assert_eq!(item.lan_address, None);
+    }
+
+    let incomplete_home = tempdir().expect("temporary SDK home should be created");
+    let incomplete_sdk =
+        MicroVmSdk::new(incomplete_home.path()).expect("SDK construction should work");
+    let incomplete_socket = seed_vm(&incomplete_home, "half-01");
+    let connection = open_inventory(incomplete_home.path()).expect("inventory should open");
+    connection
+        .execute(
+            "DELETE FROM vm_networks WHERE microvm_id = (SELECT id FROM microvms WHERE name = 'half-01')",
+            [],
+        )
+        .expect("seed network row should delete");
+    drop(connection);
+    let _ = &incomplete_socket;
+    let incomplete = incomplete_sdk
+        .list_microvms()
+        .await
+        .expect("listing an incomplete VM should work");
+    assert_eq!(incomplete.len(), 1);
+    assert_eq!(incomplete[0].name, "half-01");
+    assert_eq!(incomplete[0].vcpu_count, 1);
+    assert_eq!(incomplete[0].distribution_id, "distro");
+    assert_eq!(incomplete[0].network_mode, None);
+    assert_eq!(incomplete[0].guest_address, None);
+    assert_eq!(incomplete[0].lan_address, None);
 
     let running = sdk
         .list_running_microvms()

@@ -180,6 +180,13 @@ impl CliError {
         ))
     }
 
+    pub(crate) fn ls_failed(what: impl Into<String>, error: &SdkError) -> Self {
+        Self::Creation(format!(
+            "{}\u{1f}{error}\u{1f}Check the reported cause, then retry the listing",
+            what.into()
+        ))
+    }
+
     pub(crate) fn ssh_key_unreadable(path: &std::path::Path) -> Self {
         Self::Creation(format!(
             "SSH key is missing or unreadable\u{1f}the private key at {} is not a readable file\u{1f}Repair the machine volume or recreate the machine, then try again",

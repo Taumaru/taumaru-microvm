@@ -994,6 +994,203 @@ pub(crate) fn write_stop_result(
     write!(stdout, "{}", format_stop_result(result, capabilities))
 }
 
+fn ls_network_cell(summary: &taumaru_microvm::MicroVmSummary) -> String {
+    let (Some(mode), Some(guest)) = (summary.network_mode, summary.guest_address) else {
+        return String::from("-");
+    };
+    match (mode, summary.lan_address) {
+        (taumaru_microvm::NetworkMode::HostOnly, _) => format!("host-only {guest}"),
+        (taumaru_microvm::NetworkMode::Lan, Some(lan)) => {
+            format!("lan {lan} (guest {guest})")
+        }
+        (taumaru_microvm::NetworkMode::Lan, None) => format!("lan (guest {guest})"),
+    }
+}
+
+fn ls_state_text(summary: &taumaru_microvm::MicroVmSummary) -> &'static str {
+    match summary.state {
+        taumaru_microvm::MicroVmState::Running => "running",
+        taumaru_microvm::MicroVmState::Stopped => "stopped",
+    }
+}
+
+pub(crate) fn format_ls_table(
+    summaries: &[taumaru_microvm::MicroVmSummary],
+    capabilities: TerminalCapabilities,
+) -> String {
+    let headers = [
+        "NAME", "STATE", "VCPUS", "MEMORY", "DISK", "IMAGE", "NETWORK",
+    ];
+    let rows: Vec<[String; 7]> = summaries
+        .iter()
+        .map(|summary| {
+            [
+                summary.name.clone(),
+                ls_state_text(summary).to_owned(),
+                summary.vcpu_count.to_string(),
+                format_mb_gb(summary.memory_bytes),
+                format_gb(summary.disk_size_bytes),
+                format!("{}={}", summary.distribution_id, summary.image_id),
+                ls_network_cell(summary),
+            ]
+        })
+        .collect();
+    let mut widths = [0usize; 7];
+    for (index, header) in headers.iter().enumerate() {
+        widths[index] = widths[index].max(header.len());
+    }
+    for row in &rows {
+        for (index, cell) in row.iter().enumerate() {
+            widths[index] = widths[index].max(cell.len());
+        }
+    }
+    let mut output = String::from("\n");
+    let header_cells: Vec<String> = headers
+        .iter()
+        .enumerate()
+        .map(|(index, header)| format!("{:<width$}", header, width = widths[index]))
+        .collect();
+    output.push_str(&format!(
+        "{}\n",
+        paint(header_cells.join("  "), ANSI_DIM, capabilities.color)
+    ));
+    for (row_index, row) in rows.iter().enumerate() {
+        let mut cells: Vec<String> = row
+            .iter()
+            .enumerate()
+            .map(|(index, cell)| format!("{:<width$}", cell, width = widths[index]))
+            .collect();
+        cells[1] = match summaries[row_index].state {
+            taumaru_microvm::MicroVmState::Running => {
+                paint(&cells[1], ANSI_GREEN, capabilities.color)
+            }
+            taumaru_microvm::MicroVmState::Stopped => {
+                paint(&cells[1], ANSI_DIM, capabilities.color)
+            }
+        };
+        output.push_str(&format!("{}\n", cells.join("  ")));
+    }
+    output
+}
+
+pub(crate) fn write_ls_table(
+    summaries: &[taumaru_microvm::MicroVmSummary],
+    capabilities: TerminalCapabilities,
+) -> Result<(), io::Error> {
+    let mut stdout = io::stdout().lock();
+    write!(stdout, "{}", format_ls_table(summaries, capabilities))
+}
+
+pub(crate) fn format_ls_empty(capabilities: TerminalCapabilities) -> String {
+    let mut output = String::from("\n");
+    output.push_str(&format!(
+        "{} {}\n",
+        paint("○", ANSI_DIM, capabilities.color),
+        paint("No MicroVMs yet", ANSI_BOLD, capabilities.color)
+    ));
+    output.push_str(&format!(
+        "  {} Run `microvm new` to create your first machine.\n",
+        paint("Next:", ANSI_BOLD, capabilities.color)
+    ));
+    output
+}
+
+pub(crate) fn write_ls_empty(capabilities: TerminalCapabilities) -> Result<(), io::Error> {
+    let mut stdout = io::stdout().lock();
+    write!(stdout, "{}", format_ls_empty(capabilities))
+}
+
+#[cfg(test)]
+mod ls_tests {
+    use super::{format_ls_empty, format_ls_table};
+    use crate::context::TerminalCapabilities;
+    use std::net::IpAddr;
+    use taumaru_microvm::{MicroVmState, MicroVmSummary, NetworkMode};
+
+    fn capabilities() -> TerminalCapabilities {
+        TerminalCapabilities {
+            interactive: false,
+            color: false,
+            width: Some(120),
+        }
+    }
+
+    fn summary(
+        name: &str,
+        state: MicroVmState,
+        mode: Option<NetworkMode>,
+        guest: Option<&str>,
+        lan: Option<&str>,
+    ) -> MicroVmSummary {
+        MicroVmSummary {
+            name: name.to_owned(),
+            state,
+            vcpu_count: 2,
+            memory_bytes: 2 * 1024 * 1024 * 1024,
+            disk_size_bytes: 20 * 1024 * 1024 * 1024,
+            distribution_id: "ubuntu-24.04".to_owned(),
+            image_id: "base".to_owned(),
+            network_mode: mode,
+            guest_address: guest
+                .map(|value| value.parse::<IpAddr>().expect("guest IP should parse")),
+            lan_address: lan.map(|value| value.parse::<IpAddr>().expect("LAN IP should parse")),
+        }
+    }
+
+    #[test]
+    fn table_lists_every_machine_with_details_in_name_order() {
+        let rows = vec![
+            summary(
+                "db-01",
+                MicroVmState::Stopped,
+                Some(NetworkMode::HostOnly),
+                Some("10.200.8.2"),
+                None,
+            ),
+            summary(
+                "web-01",
+                MicroVmState::Running,
+                Some(NetworkMode::Lan),
+                Some("10.200.8.3"),
+                Some("192.168.1.50"),
+            ),
+        ];
+        let table = format_ls_table(&rows, capabilities());
+        assert!(table.contains("NAME"));
+        assert!(table.contains("NETWORK"));
+        assert!(table.contains("web-01"));
+        assert!(table.contains("running"));
+        assert!(table.contains("stopped"));
+        assert!(table.contains("2 GB"));
+        assert!(table.contains("20 GB"));
+        assert!(table.contains("ubuntu-24.04=base"));
+        assert!(table.contains("lan 192.168.1.50 (guest 10.200.8.3)"));
+        assert!(table.contains("host-only 10.200.8.2"));
+        assert!(
+            table.find("db-01").expect("db-01 should render")
+                < table.find("web-01").expect("web-01 should render")
+        );
+        assert!(!table.contains("id_ed25519"));
+    }
+
+    #[test]
+    fn degraded_row_keeps_place_with_dashes() {
+        let rows = vec![summary("half-01", MicroVmState::Stopped, None, None, None)];
+        let table = format_ls_table(&rows, capabilities());
+        assert!(table.contains("half-01"));
+        assert!(table.contains("stopped"));
+        assert!(table.contains('-'));
+    }
+
+    #[test]
+    fn empty_report_points_at_creation_without_table() {
+        let report = format_ls_empty(capabilities());
+        assert!(report.contains("No MicroVMs yet"));
+        assert!(report.contains("microvm new"));
+        assert!(!report.contains("NAME"));
+    }
+}
+
 #[cfg(test)]
 mod stop_tests {
     use super::format_stop_result;

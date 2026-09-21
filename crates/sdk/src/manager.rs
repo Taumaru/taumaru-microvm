@@ -594,9 +594,20 @@ impl MicroVmSdk {
         Ok(stored
             .iter()
             .zip(states)
-            .map(|(vm, state)| MicroVmSummary {
-                name: vm.record.name.clone(),
-                state,
+            .map(|(vm, state)| {
+                let network = vm.network.as_ref();
+                MicroVmSummary {
+                    name: vm.record.name.clone(),
+                    state,
+                    vcpu_count: vm.record.vcpu_count,
+                    memory_bytes: vm.record.memory_bytes,
+                    disk_size_bytes: vm.record.disk_size_bytes,
+                    distribution_id: vm.record.distribution_id.clone(),
+                    image_id: vm.record.image_id.clone(),
+                    network_mode: network.map(|network| network.config.mode),
+                    guest_address: network.map(|network| network.config.guest_address),
+                    lan_address: network.and_then(|network| network.config.lan_address),
+                }
             })
             .collect())
     }

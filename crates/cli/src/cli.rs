@@ -22,6 +22,9 @@ pub(crate) enum Command {
     Start(StartArgs),
     /// Stop a running MicroVM by name or interactive selection.
     Stop(StopArgs),
+    /// List all MicroVMs with state and configured capacities.
+    #[command(visible_alias = "list")]
+    Ls(LsArgs),
     /// Connect to a running MicroVM over SSH by name or interactive selection.
     Ssh(SshArgs),
 }
@@ -111,6 +114,12 @@ pub(crate) struct StopArgs {
     pub(crate) explicit_name: Option<String>,
 
     /// Disable prompts; the name is required and root is required up front.
+    #[arg(long = "non-interactive")]
+    pub(crate) non_interactive: bool,
+}
+#[derive(Debug, Args, Clone)]
+pub(crate) struct LsArgs {
+    /// Disable prompts; root is required up front.
     #[arg(long = "non-interactive")]
     pub(crate) non_interactive: bool,
 }
@@ -259,10 +268,28 @@ mod tests {
     }
 
     #[test]
-    fn start_parser_rejects_lifecycle_flags() {
-        assert!(Cli::try_parse_from(["microvm", "start", "--image", "x"]).is_err());
-        assert!(Cli::try_parse_from(["microvm", "start", "--disk-gb", "20"]).is_err());
-        assert!(Cli::try_parse_from(["microvm", "start", "--expose-lan"]).is_err());
+    fn ls_parser_accepts_flag_only_form_and_alias() {
+        let cli = Cli::try_parse_from(["microvm", "ls", "--non-interactive"])
+            .expect("valid explicit ls arguments");
+        let Some(Command::Ls(arguments)) = cli.command else {
+            panic!("ls command should be parsed");
+        };
+        assert!(arguments.non_interactive);
+
+        let cli = Cli::try_parse_from(["microvm", "list"])
+            .expect("list alias should parse to the same variant");
+        let Some(Command::Ls(arguments)) = cli.command else {
+            panic!("list alias should parse to Ls");
+        };
+        assert!(!arguments.non_interactive);
+    }
+
+    #[test]
+    fn ls_parser_rejects_name_and_lifecycle_flags() {
+        assert!(Cli::try_parse_from(["microvm", "ls", "web-01"]).is_err());
+        assert!(Cli::try_parse_from(["microvm", "ls", "--name", "web-01"]).is_err());
+        assert!(Cli::try_parse_from(["microvm", "ls", "--image", "x"]).is_err());
+        assert!(Cli::try_parse_from(["microvm", "ls", "--disk-gb", "20"]).is_err());
     }
 
     #[test]

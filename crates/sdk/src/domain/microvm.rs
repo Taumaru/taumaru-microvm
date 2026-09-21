@@ -214,15 +214,35 @@ pub struct MicroVmStopResult {
 
 /// Read-only inventory snapshot of one persisted MicroVM.
 ///
-/// Returned by [`crate::MicroVmSdk::list_microvms`] for selectors and future listing
-/// surfaces. The state is the last persisted lifecycle state and is never live-verified;
-/// running truth requires a start or status check, never this snapshot alone.
+/// Returned by [`crate::MicroVmSdk::list_microvms`] for selectors and listing
+/// surfaces. The state is verified at call time: `Running` if and only if the
+/// VM's volume-local control socket answers, `Stopped` otherwise. The
+/// remaining fields are the values persisted at creation and never
+/// live-measured.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MicroVmSummary {
     /// Stable VM identifier, ordered by name.
     pub name: String,
     /// Call-time verified state (`Running` iff the socket answers, else `Stopped`).
     pub state: MicroVmState,
+    /// Configured virtual CPU count, already persisted at creation.
+    pub vcpu_count: u32,
+    /// Configured memory size in bytes, already persisted at creation. This is
+    /// the configured value chosen at creation, never live-measured usage.
+    pub memory_bytes: u64,
+    /// Configured root-disk size in bytes, already persisted at creation. This is
+    /// the configured value chosen at creation, never live-measured usage.
+    pub disk_size_bytes: u64,
+    /// Registry ID of the distribution metadata, already persisted at creation.
+    pub distribution_id: String,
+    /// Exact registry ID of the image, already persisted at creation.
+    pub image_id: String,
+    /// Stored network mode, already persisted at creation. `None` for incomplete records.
+    pub network_mode: Option<NetworkMode>,
+    /// Stored guest address used for SSH. `None` for incomplete records.
+    pub guest_address: Option<IpAddr>,
+    /// Stored LAN address for routed LAN mode. `None` for host-only machines and incomplete records.
+    pub lan_address: Option<IpAddr>,
 }
 
 /// Read-only snapshot of one actually-running MicroVM.
