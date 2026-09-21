@@ -104,6 +104,30 @@ fn start_result_types_are_exported_with_running_state() {
     let _ = MicroVmState::Running;
     let _ = MicroVmState::Stopped;
 }
+#[test]
+fn stop_result_types_are_exported_with_stopped_state() {
+    use taumaru_microvm::{MicroVmState, MicroVmStopResult};
+    let _ = std::mem::size_of::<MicroVmStopResult>();
+    let _ = MicroVmState::Running;
+    let _ = MicroVmState::Stopped;
+}
+
+#[tokio::test]
+async fn stop_validates_names_and_reports_unknown_vms_as_typed_errors() {
+    use taumaru_microvm::{MicroVmSdk, SdkError};
+    use tempfile::tempdir;
+
+    let home = tempdir().expect("temporary SDK home should be created");
+    let sdk = MicroVmSdk::new(home.path()).expect("SDK construction should work");
+
+    let invalid = sdk.stop_microvm("not path friendly").await;
+    assert!(matches!(invalid, Err(SdkError::InvalidRequest { field, .. }) if field == "name"));
+
+    let missing = sdk.stop_microvm("missing_vm").await;
+    assert!(
+        matches!(missing, Err(SdkError::NotFound { kind, id }) if kind == "MicroVM" && id == "missing_vm")
+    );
+}
 
 #[tokio::test]
 async fn start_validates_names_and_reports_unknown_vms_as_typed_errors() {

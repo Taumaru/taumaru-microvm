@@ -13,6 +13,10 @@ use crate::ports::runtime::{RuntimeController, StartRequest};
 const READINESS_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
 /// Interval between socket readiness probes.
 const READINESS_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
+/// Timeouts for one graceful shutdown request over the control socket.
+const SHUTDOWN_SOCKET_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// Interval between exit probes after a graceful shutdown request.
+const STOP_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
 
 /// Internal firectl/Firecracker process adapter.
 #[derive(Clone, Copy, Debug, Default)]
@@ -82,6 +86,20 @@ impl RuntimeController for FirecrackerRuntime {
 
     fn wait_for_socket(&self, socket_path: &Path) -> Result<bool, SdkError> {
         wait_for_socket(socket_path, READINESS_DEADLINE)
+    }
+
+    fn request_shutdown(&self, socket_path: &Path) -> Result<bool, SdkError> {
+        request_shutdown(socket_path)
+    }
+
+    fn wait_for_stop(
+        &self,
+        socket_path: &Path,
+        process_id: Option<u32>,
+        firecracker_path: &Path,
+        deadline: std::time::Duration,
+    ) -> Result<bool, SdkError> {
+        wait_for_stop(socket_path, process_id, firecracker_path, deadline)
     }
 
     fn terminate_spawned(&self, process_id: u32) -> Result<(), SdkError> {
@@ -244,6 +262,117 @@ fn launch_detached(request: &StartRequest) -> Result<u32, SdkError> {
     let process_id = child.id();
     std::mem::forget(child);
     Ok(process_id)
+}
+
+/// Sends one graceful shutdown request through the volume-local control
+/// socket. `Ok(true)` means the request was delivered (HTTP 204),
+/// `Ok(false)` means the socket was already silent, and `Err` means any
+/// other delivery failure with no forced-termination attempt.
+fn request_shutdown(socket_path: &Path) -> Result<bool, SdkError> {
+    use std::os::unix::net::UnixStream;
+
+    let mut stream = match UnixStream::connect(socket_path) {
+        Ok(stream) => stream,
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound
+                    | std::io::ErrorKind::ConnectionRefused
+                    | std::io::ErrorKind::ConnectionReset
+            ) =>
+        {
+            return Ok(false);
+        }
+        Err(error) => {
+            return Err(SdkError::filesystem(
+                "connect to machine control socket",
+                socket_path,
+                error,
+            ));
+        }
+    };
+    stream
+        .set_read_timeout(Some(SHUTDOWN_SOCKET_TIMEOUT))
+        .map_err(|error| {
+            SdkError::filesystem("configure machine control socket", socket_path, error)
+        })?;
+    stream
+        .set_write_timeout(Some(SHUTDOWN_SOCKET_TIMEOUT))
+        .map_err(|error| {
+            SdkError::filesystem("configure machine control socket", socket_path, error)
+        })?;
+    let body = r#"{"action_type":"SendCtrlAltDel"}"#;
+    let request = format!(
+        "PUT /actions HTTP/1.0\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    stream.write_all(request.as_bytes()).map_err(|error| {
+        SdkError::filesystem("send machine shutdown request", socket_path, error)
+    })?;
+    let mut response = Vec::new();
+    let mut buffer = [0_u8; 1024];
+    loop {
+        match stream.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => {
+                response.extend_from_slice(&buffer[..read]);
+                if response.len() >= 8192 {
+                    break;
+                }
+                if response.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            Err(error) => {
+                return Err(SdkError::filesystem(
+                    "read machine shutdown response",
+                    socket_path,
+                    error,
+                ));
+            }
+        }
+    }
+    let status_line = response
+        .split(|byte| *byte == b'\n')
+        .next()
+        .map(|line| String::from_utf8_lossy(line).into_owned())
+        .unwrap_or_default();
+    if status_line.contains("204") {
+        return Ok(true);
+    }
+    Err(SdkError::TemporaryRuntime {
+        component: "firecracker.sock".to_owned(),
+        reason: format!("the machine shutdown request was not accepted: {status_line}"),
+        stopped: false,
+    })
+}
+
+/// Polls until the machine has exited or the deadline expires. Exited means
+/// the control socket is silent and the recorded process, when present, no
+/// longer references the VM.
+fn wait_for_stop(
+    socket_path: &Path,
+    process_id: Option<u32>,
+    firecracker_path: &Path,
+    deadline: std::time::Duration,
+) -> Result<bool, SdkError> {
+    let started = std::time::Instant::now();
+    loop {
+        if !socket_answers(socket_path)? {
+            let process_gone = match process_id {
+                Some(pid) => !process_references_vm(pid, socket_path, firecracker_path)?,
+                None => true,
+            };
+            if process_gone {
+                return Ok(true);
+            }
+        }
+        if started.elapsed() >= deadline {
+            return Ok(false);
+        }
+        std::thread::sleep(STOP_POLL_INTERVAL);
+    }
 }
 
 fn wait_for_socket(socket_path: &Path, deadline: std::time::Duration) -> Result<bool, SdkError> {

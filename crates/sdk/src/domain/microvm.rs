@@ -191,6 +191,26 @@ pub struct MicroVmStartResult {
     /// SSH connection metadata with path-only credential references.
     pub ssh: SshConnectionInfo,
 }
+/// Result returned by [`crate::MicroVmSdk::stop_microvm`].
+///
+/// The operation takes only the VM name: the volume directory and every
+/// runtime reference are read from the inventory record, never from the
+/// caller. `socket_path` is always the volume-local control socket and is
+/// silent at return. `forced` is `true` only when SIGKILL was delivered to
+/// the recorded process; it is `false` for graceful exit, already-stopped,
+/// and natural-exit-during-wait.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MicroVmStopResult {
+    /// Stable VM identifier.
+    pub name: String,
+    /// Always [`MicroVmState::Stopped`] on success. The socket is silent at return.
+    pub state: MicroVmState,
+    /// Volume-local control socket. It is silent at return.
+    pub socket_path: PathBuf,
+    /// Whether forced termination was used. `true` only when SIGKILL was
+    /// delivered to the recorded process.
+    pub forced: bool,
+}
 
 /// Read-only inventory snapshot of one persisted MicroVM.
 ///

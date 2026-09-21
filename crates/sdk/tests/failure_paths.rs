@@ -364,3 +364,61 @@ async fn start_leaves_the_vm_stopped_when_launch_readiness_fails() {
             .is_none()
     );
 }
+#[tokio::test]
+async fn stop_rejects_unknown_invalid_and_incomplete_names_without_host_changes() {
+    use taumaru_microvm::{MicroVmSdk, SdkError};
+
+    let home = tempdir().expect("temporary SDK home should be created");
+    let sdk = MicroVmSdk::new(home.path()).expect("SDK construction should work");
+    let unknown = sdk.stop_microvm("ghost_vm").await;
+    assert!(
+        matches!(unknown, Err(SdkError::NotFound { kind, id }) if kind == "MicroVM" && id == "ghost_vm")
+    );
+    let invalid = sdk.stop_microvm("bad name").await;
+    assert!(matches!(invalid, Err(SdkError::InvalidRequest { .. })));
+    assert!(
+        std::fs::read_dir(home.path().join("vms"))
+            .expect("managed VM directory should exist")
+            .next()
+            .is_none()
+    );
+
+    let volume = home.path().join("vms").join("half_vm");
+    std::fs::create_dir_all(&volume).expect("seed volume should be created");
+    let socket = volume.join("firecracker.sock");
+    let connection =
+        Connection::open(home.path().join("state/inventory.db")).expect("inventory should open");
+    connection
+        .execute(
+            "INSERT INTO microvms (
+                name, distribution_id, image_id, kernel_id,
+                firecracker_package_id, firectl_package_id, disk_size_bytes,
+                memory_requested_bytes, memory_effective_mib, vcpu_count,
+                volume_path, rootfs_path, socket_path, expose_on_lan, created_at, updated_at
+            ) VALUES ('half_vm', 'distro', 'image', 'kernel', 'fc', 'firectl',
+                      1, 1, 1, 1, ?1, ?2, ?3, 0, 1, 1)",
+            rusqlite::params![
+                volume.to_string_lossy().into_owned(),
+                volume.join("rootfs.ext4").to_string_lossy().into_owned(),
+                socket.to_string_lossy().into_owned(),
+            ],
+        )
+        .expect("seed VM row should insert");
+    let incomplete = sdk.stop_microvm("half_vm").await;
+    assert!(
+        matches!(incomplete, Err(SdkError::LifecycleConflict { name, .. }) if name == "half_vm")
+    );
+}
+
+#[tokio::test]
+async fn stop_leaves_preflight_failures_silent_without_new_files() {
+    use taumaru_microvm::{MicroVmSdk, SdkError};
+
+    let home = tempdir().expect("temporary SDK home should be created");
+    let sdk = MicroVmSdk::new(home.path()).expect("SDK construction should work");
+    let error = sdk
+        .stop_microvm("ghost_vm")
+        .await
+        .expect_err("unknown VM should fail");
+    assert!(matches!(error, SdkError::NotFound { .. }));
+}

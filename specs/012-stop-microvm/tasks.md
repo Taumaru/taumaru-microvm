@@ -31,8 +31,8 @@ other lifecycle operation are part of these tasks.
 
 **Purpose**: Establish the test doubles and scaffolding the stop work builds on.
 
-- [ ] T001 Extend the manager unit-test fakes with a controllable stop double (shutdown-delivery verdict per socket, wait-for-stop verdict sequence, process-reference verdict, terminate-record list) in `crates/sdk/src/manager.rs`.
-- [ ] T002 [P] Add a running/stopped VM fixture builder (record with volume/socket paths, persisted runtime with `process_id`/`process_state`, complete network plus credential rows) reusable by all stop tests in `crates/sdk/src/manager.rs`.
+- [X] T001 Extend the manager unit-test fakes with a controllable stop double (shutdown-delivery verdict per socket, wait-for-stop verdict sequence, process-reference verdict, terminate-record list) in `crates/sdk/src/manager.rs`.
+- [X] T002 [P] Add a running/stopped VM fixture builder (record with volume/socket paths, persisted runtime with `process_id`/`process_state`, complete network plus credential rows) reusable by all stop tests in `crates/sdk/src/manager.rs`.
 
 ---
 
@@ -42,9 +42,9 @@ other lifecycle operation are part of these tasks.
 
 **⚠️ CRITICAL**: No user story work can begin until this phase is complete
 
-- [ ] T003 [P] Add the `MicroVmStopResult` type with the constraint "`state` is always `MicroVmState::Stopped` on success; `socket_path` is always inside the volume and silent at return; `forced` is `true` only when SIGKILL was delivered" in `crates/sdk/src/domain/microvm.rs`, re-export it from `crates/sdk/src/domain/mod.rs`, and re-export it from `crates/sdk/src/lib.rs` with Rustdoc.
-- [ ] T004 [P] Extend the crate-internal `RuntimeController` in `crates/sdk/src/ports/runtime.rs` with `request_shutdown` (HTTP 204 delivered / already-silent / delivery-error) and `wait_for_stop` (200 ms poll until socket silence plus recorded-process exit, `None` PID waits on socket alone) operations, keeping `validate_host`, `verify_stopped`, `process_references_vm`, `socket_answers`, `launch_detached`, and `wait_for_socket` unchanged, and updating the `terminate_spawned` docs to cover the stop SIGKILL escalation path.
-- [ ] T005 Update the existing test runtime doubles to implement the extended `RuntimeController` in `crates/sdk/src/manager.rs` test module.
+- [X] T003 [P] Add the `MicroVmStopResult` type with the constraint "`state` is always `MicroVmState::Stopped` on success; `socket_path` is always inside the volume and silent at return; `forced` is `true` only when SIGKILL was delivered" in `crates/sdk/src/domain/microvm.rs`, re-export it from `crates/sdk/src/domain/mod.rs`, and re-export it from `crates/sdk/src/lib.rs` with Rustdoc.
+- [X] T004 [P] Extend the crate-internal `RuntimeController` in `crates/sdk/src/ports/runtime.rs` with `request_shutdown` (HTTP 204 delivered / already-silent / delivery-error) and `wait_for_stop` (200 ms poll until socket silence plus recorded-process exit, `None` PID waits on socket alone) operations, keeping `validate_host`, `verify_stopped`, `process_references_vm`, `socket_answers`, `launch_detached`, and `wait_for_socket` unchanged, and updating the `terminate_spawned` docs to cover the stop SIGKILL escalation path.
+- [X] T005 Update the existing test runtime doubles to implement the extended `RuntimeController` in `crates/sdk/src/manager.rs` test module.
 
 **Checkpoint**: The SDK has the public result type, the extended runtime port, and controllable doubles. User-story work may begin.
 
@@ -58,15 +58,12 @@ other lifecycle operation are part of these tasks.
 
 ### Tests for User Story 1
 
-- [ ] T006 [P] [US1] Add public-contract coverage for `MicroVmStopResult`, `MicroVmState::Stopped`, volume-local silent socket placement, and `forced: false` on the graceful path in `crates/sdk/tests/public_api.rs`.
-- [ ] T007 [P] [US1] Add deterministic preflight coverage for name validation with the constraint "1–64 ASCII characters; first character alphanumeric; remaining alphanumeric, `-`, or `_`", `NotFound` on unknown names, `LifecycleConflict` on incomplete creation, and no host mutation on preflight failure in `crates/sdk/src/manager.rs` unit tests.
-
-### Implementation for User Story 1
-
-- [ ] T008 [P] [US1] Implement the `FirecrackerRuntime` graceful shutdown delivery (`PUT /actions` with `{ "action_type": "SendCtrlAltDel" }` over UDS, bounded read/write timeouts, HTTP 204 delivered / already-silent / delivery-error) in `crates/sdk/src/adapters/runtime/firecracker.rs`.
-- [ ] T009 [P] [US1] Implement the `FirecrackerRuntime` exit wait poll (200 ms interval, exit means socket silence AND recorded process no longer referencing the VM, `None` PID waits on socket silence alone) in `crates/sdk/src/adapters/runtime/firecracker.rs`.
-- [ ] T010 [US1] Implement the stop coordinator graceful path in `crates/sdk/src/manager.rs`: `validate_vm_name`, per-name plus volume lock pair, `find_microvm`, `NotFound`, `require_complete`, socket-decided liveness, one `request_shutdown` call, 60-second `wait_for_stop`, owned stale-socket removal only at exactly the persisted socket path after proving no listener, stopped commit via `reset_runtime_to_stopped`, return `Stopped` with `forced: false` (depends on T008, T009).
-- [ ] T011 [US1] Add deterministic US1 lifecycle coverage for graceful delivery, exit within the bound, silent socket and settled refs afterwards, and operation silence in `crates/sdk/src/manager.rs` unit tests and `crates/sdk/tests/lifecycle.rs`.
+- [X] T006 [P] [US1] Add public-contract coverage for `MicroVmStopResult`, `MicroVmState::Stopped`, volume-local silent socket placement, and `forced: false` on the graceful path in `crates/sdk/tests/public_api.rs`.
+- [X] T007 [P] [US1] Add deterministic preflight coverage for name validation with the constraint "1–64 ASCII characters; first character alphanumeric; remaining alphanumeric, `-`, or `_`", `NotFound` on unknown names, `LifecycleConflict` on incomplete creation, and no host mutation on preflight failure in `crates/sdk/src/manager.rs` unit tests.
+- [X] T008 [P] [US1] Implement the `FirecrackerRuntime` graceful shutdown delivery (`PUT /actions` with `{ "action_type": "SendCtrlAltDel" }` over UDS, bounded read/write timeouts, HTTP 204 delivered / already-silent / delivery-error) in `crates/sdk/src/adapters/runtime/firecracker.rs`.
+- [X] T009 [P] [US1] Implement the `FirecrackerRuntime` exit wait poll (200 ms interval, exit means socket silence AND recorded process no longer referencing the VM, `None` PID waits on socket silence alone) in `crates/sdk/src/adapters/runtime/firecracker.rs`.
+- [X] T010 [US1] Implement the stop coordinator graceful path in `crates/sdk/src/manager.rs`: `validate_vm_name`, per-name plus volume lock pair, `find_microvm`, `NotFound`, `require_complete`, socket-decided liveness, one `request_shutdown` call, 60-second `wait_for_stop`, owned stale-socket removal only at exactly the persisted socket path after proving no listener, stopped commit via `reset_runtime_to_stopped`, return `Stopped` with `forced: false` (depends on T008, T009).
+- [X] T011 [US1] Add deterministic US1 lifecycle coverage for graceful delivery, exit within the bound, silent socket and settled refs afterwards, and operation silence in `crates/sdk/src/manager.rs` unit tests and `crates/sdk/tests/lifecycle.rs`.
 
 **Checkpoint**: At this point, User Story 1 should be fully functional and testable independently: a cooperative running VM stops gracefully and reports `forced: false`.
 
@@ -80,14 +77,11 @@ other lifecycle operation are part of these tasks.
 
 ### Tests for User Story 2
 
-- [ ] T012 [P] [US2] Add idempotency coverage across stopped, never-started, and externally-killed rows (success `Stopped` with `forced: false`, at most a ref-settling write, no shutdown request, no process signal) in `crates/sdk/src/manager.rs` unit tests.
-- [ ] T013 [P] [US2] Add delivery-race coverage (socket silent at delivery time re-verifies to success with `forced: false`) in `crates/sdk/src/manager.rs` unit tests.
-
-### Implementation for User Story 2
-
-- [ ] T014 [US2] Wire the already-stopped early return in `crates/sdk/src/manager.rs`: silent socket settles refs via `clear_stale_runtime` when needed, removes the owned stale socket only at exactly the persisted socket path after proving no listener, and returns `Stopped` with `forced: false` with no shutdown and no signal.
-- [ ] T015 [US2] Add concurrency coverage proving concurrent same-name stops run one shutdown sequence with one consistent stopped result through the held lock pair in `crates/sdk/src/manager.rs` unit tests.
-- [ ] T016 [US2] Add failure-path coverage for preflight errors (unknown, malformed, and incomplete-record names return typed errors with no host mutation and operation silence) in `crates/sdk/tests/failure_paths.rs`.
+- [X] T012 [P] [US2] Add idempotency coverage across stopped, never-started, and externally-killed rows (success `Stopped` with `forced: false`, at most a ref-settling write, no shutdown request, no process signal) in `crates/sdk/src/manager.rs` unit tests.
+- [X] T013 [P] [US2] Add delivery-race coverage (socket silent at delivery time re-verifies to success with `forced: false`) in `crates/sdk/src/manager.rs` unit tests.
+- [X] T014 [US2] Wire the already-stopped early return in `crates/sdk/src/manager.rs`: silent socket settles refs via `clear_stale_runtime` when needed, removes the owned stale socket only at exactly the persisted socket path after proving no listener, and returns `Stopped` with `forced: false` with no shutdown and no signal.
+- [X] T015 [US2] Add concurrency coverage proving concurrent same-name stops run one shutdown sequence with one consistent stopped result through the held lock pair in `crates/sdk/src/manager.rs` unit tests.
+- [X] T016 [US2] Add failure-path coverage for preflight errors (unknown, malformed, and incomplete-record names return typed errors with no host mutation and operation silence) in `crates/sdk/tests/failure_paths.rs`.
 
 **Checkpoint**: At this point, User Stories 1 AND 2 should both work independently: graceful stop and idempotent already-stopped both return the correct `forced` flag with no stray host effects.
 
@@ -101,13 +95,10 @@ other lifecycle operation are part of these tasks.
 
 ### Tests for User Story 3
 
-- [ ] T017 [P] [US3] Add escalation coverage (60-second expiry, SIGKILL to the re-verified PID, success with `forced: true`, natural-exit race between expiry and SIGKILL returns `forced: false`) in `crates/sdk/src/manager.rs` unit tests.
-- [ ] T018 [P] [US3] Add failure-path coverage for undeliverable graceful request while answering (typed error, no signal, no state write), unforceable still-running machine with no usable PID (typed error, never success), PID-reuse safety (unrelated process never signaled), and still-running after SIGKILL re-verify (typed error, never claims stopped) in `crates/sdk/tests/failure_paths.rs`.
-
-### Implementation for User Story 3
-
-- [ ] T019 [US3] Wire forced escalation in `crates/sdk/src/manager.rs`: on 60-second expiry with the machine still running require a usable recorded PID, re-verify it with `process_references_vm`, deliver SIGKILL via `terminate_spawned`, re-verify with `wait_for_stop` up to 10 seconds, commit the stopped row on success and return `Stopped` with `forced: true`, otherwise return the typed error without claiming stopped.
-- [ ] T020 [US3] Add deterministic US3 lifecycle coverage for forced stop end-to-end (silent socket, settled refs, `forced: true` observable from the result alone) in `crates/sdk/src/manager.rs` unit tests and `crates/sdk/tests/lifecycle.rs`.
+- [X] T017 [P] [US3] Add escalation coverage (60-second expiry, SIGKILL to the re-verified PID, success with `forced: true`, natural-exit race between expiry and SIGKILL returns `forced: false`) in `crates/sdk/src/manager.rs` unit tests.
+- [X] T018 [P] [US3] Add failure-path coverage for undeliverable graceful request while answering (typed error, no signal, no state write), unforceable still-running machine with no usable PID (typed error, never success), PID-reuse safety (unrelated process never signaled), and still-running after SIGKILL re-verify (typed error, never claims stopped) in `crates/sdk/tests/failure_paths.rs`.
+- [X] T019 [US3] Wire forced escalation in `crates/sdk/src/manager.rs`: on 60-second expiry with the machine still running require a usable recorded PID, re-verify it with `process_references_vm`, deliver SIGKILL via `terminate_spawned`, re-verify with `wait_for_stop` up to 10 seconds, commit the stopped row on success and return `Stopped` with `forced: true`, otherwise return the typed error without claiming stopped.
+- [X] T020 [US3] Add deterministic US3 lifecycle coverage for forced stop end-to-end (silent socket, settled refs, `forced: true` observable from the result alone) in `crates/sdk/src/manager.rs` unit tests and `crates/sdk/tests/lifecycle.rs`.
 
 **Checkpoint**: All user stories should now be independently functional: graceful, idempotent, and forced stops each behave per the liveness decision table with PID-reuse protection intact.
 
@@ -117,10 +108,10 @@ other lifecycle operation are part of these tasks.
 
 **Purpose**: Contract consistency, documentation, and quality gates across all stories.
 
-- [ ] T021 [P] Add Rustdoc for `stop_microvm` and `MicroVmStopResult` covering the name-only input, socket-decided liveness, `SendCtrlAltDel` graceful path, 60-second wait, SIGKILL-only escalation, the `forced` flag meaning, and volume-local silent socket placement in `crates/sdk/src/manager.rs` and `crates/sdk/src/domain/microvm.rs`.
-- [ ] T022 [P] Verify no CLI source changes and no new public error variant were introduced, and that all repository text is English, by reviewing the final diff.
-- [ ] T023 Run `cargo fmt --all -- --check`, `cargo check --all-targets --all-features`, `cargo clippy --all-targets --all-features -- -D warnings`, and `cargo test --all-targets --all-features` and fix all findings.
-- [ ] T024 Run the `quickstart.md` validation scenarios (graceful stop by name, already-stopped repeat, forced escalation, failure handling) against the implemented SDK.
+- [X] T021 [P] Add Rustdoc for `stop_microvm` and `MicroVmStopResult` covering the name-only input, socket-decided liveness, `SendCtrlAltDel` graceful path, 60-second wait, SIGKILL-only escalation, the `forced` flag meaning, and volume-local silent socket placement in `crates/sdk/src/manager.rs` and `crates/sdk/src/domain/microvm.rs`.
+- [X] T022 [P] Verify no CLI source changes and no new public error variant were introduced, and that all repository text is English, by reviewing the final diff.
+- [X] T023 Run `cargo fmt --all -- --check`, `cargo check --all-targets --all-features`, `cargo clippy --all-targets --all-features -- -D warnings`, and `cargo test --all-targets --all-features` and fix all findings.
+- [X] T024 Run the `quickstart.md` validation scenarios (graceful stop by name, already-stopped repeat, forced escalation, failure handling) against the implemented SDK.
 
 ---
 

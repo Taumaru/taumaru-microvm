@@ -18,9 +18,9 @@ pub use domain::{
 };
 pub use domain::{
     CreateMicroVmRequest, CreationEventPhase, CreationOutcome, CreationProgress, CreationStage,
-    MicroVmCreationResult, MicroVmStartResult, MicroVmState, MicroVmSummary, NetworkConfiguration,
-    NetworkConfigurationResult, NetworkMode, NetworkResource, RunningMicroVm, SshConnectionInfo,
-    TOTAL_CREATION_STEPS,
+    MicroVmCreationResult, MicroVmStartResult, MicroVmState, MicroVmStopResult, MicroVmSummary,
+    NetworkConfiguration, NetworkConfigurationResult, NetworkMode, NetworkResource, RunningMicroVm,
+    SshConnectionInfo, TOTAL_CREATION_STEPS,
 };
 pub use error::SdkError;
 pub use manager::MicroVmSdk;

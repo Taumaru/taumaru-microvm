@@ -47,8 +47,38 @@ pub(crate) trait RuntimeController: Send + Sync {
         Ok(false)
     }
 
-    /// Terminates a process spawned by the current call. Must only be used
-    /// with a PID returned by [`RuntimeController::launch_detached`].
+    /// Sends one graceful shutdown request through the volume-local control
+    /// socket. Returns `Ok(true)` when the request is delivered, `Ok(false)`
+    /// when the socket is already silent, and `Err` for any other delivery
+    /// failure. Never attempts forced termination.
+    fn request_shutdown(&self, socket_path: &Path) -> Result<bool, SdkError> {
+        let _ = socket_path;
+        Err(SdkError::TemporaryRuntime {
+            component: "firecracker.sock".to_owned(),
+            reason: "graceful shutdown is not implemented by this runtime".to_owned(),
+            stopped: false,
+        })
+    }
+
+    /// Waits until the machine has exited or the bound expires. The machine
+    /// counts as exited when the control socket is silent and the recorded
+    /// process, when present, no longer references the VM. A `None` process
+    /// identity waits on socket silence alone. Returns `Ok(true)` on exit,
+    /// `Ok(false)` on expiry.
+    fn wait_for_stop(
+        &self,
+        socket_path: &Path,
+        process_id: Option<u32>,
+        firecracker_path: &Path,
+        deadline: std::time::Duration,
+    ) -> Result<bool, SdkError> {
+        let _ = (socket_path, process_id, firecracker_path, deadline);
+        Ok(false)
+    }
+
+    /// Terminates a process spawned by the current call, or the re-verified
+    /// recorded process on the stop escalation path. Must never be used with
+    /// a process identity that was not verified to reference this VM.
     fn terminate_spawned(&self, process_id: u32) -> Result<(), SdkError> {
         let _ = process_id;
         Ok(())
