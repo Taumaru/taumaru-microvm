@@ -62,7 +62,7 @@ async fn prompt_machine(
         })
         .collect();
     let selected = Select::new("Choose a MicroVM to connect to", options)
-        .with_help_message("↑↓ move  ·  enter confirm")
+        .with_help_message("↑↓ move  ·  enter confirm  ·  Only running MicroVMs appear in this list; if your MicroVM is not here, run: `microvm start`")
         .with_page_size(10)
         .with_render_config(prompt_render_config(terminal.color))
         .prompt()
