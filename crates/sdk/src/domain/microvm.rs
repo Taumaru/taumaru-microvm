@@ -140,7 +140,7 @@ impl NetworkResource {
 pub struct MicroVmCreationResult {
     /// Stable VM identifier.
     pub name: String,
-    /// Always [`MicroVmState::Configured`] on success.
+    /// Always [`MicroVmState::Stopped`] on success. The socket is verified inactive at return.
     pub state: MicroVmState,
     /// Selected distribution ID.
     pub distribution_id: String,
@@ -175,7 +175,7 @@ pub struct MicroVmCreationResult {
 pub struct MicroVmStartResult {
     /// Stable VM identifier.
     pub name: String,
-    /// Always [`MicroVmState::Running`] on success.
+    /// Always [`MicroVmState::Running`] on success. The socket answered at return.
     pub state: MicroVmState,
     /// VM-exclusive volume directory read from the inventory record.
     pub volume_path: PathBuf,
@@ -201,7 +201,7 @@ pub struct MicroVmStartResult {
 pub struct MicroVmSummary {
     /// Stable VM identifier, ordered by name.
     pub name: String,
-    /// Last persisted lifecycle state (`Configured`, `Running`, `Creating`).
+    /// Call-time verified state (`Running` iff the socket answers, else `Stopped`).
     pub state: MicroVmState,
 }
 
@@ -344,8 +344,6 @@ pub enum CreationEventPhase {
 pub struct NetworkConfigurationResult {
     /// Stable VM identifier.
     pub name: String,
-    /// Always [`MicroVmState::Configured`] on success.
-    pub state: MicroVmState,
     /// Desired network configuration after reconciliation.
     pub configuration: NetworkConfiguration,
     /// Resources created or repaired by the operation.
@@ -359,7 +357,6 @@ pub struct NetworkConfigurationResult {
 pub(crate) struct MicroVmRecord {
     pub id: i64,
     pub name: String,
-    pub state: MicroVmState,
     pub distribution_id: String,
     pub image_id: String,
     pub kernel_id: String,

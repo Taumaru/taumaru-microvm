@@ -80,16 +80,49 @@ pub(crate) struct LocalArtifact {
 #[derive(Clone, Debug)]
 pub(crate) struct StoredMicroVm {
     pub record: MicroVmRecord,
-    pub network: PersistedNetwork,
-    pub credential: PersistedCredential,
-    pub runtime: PersistedRuntime,
+    pub network: Option<PersistedNetwork>,
+    pub credential: Option<PersistedCredential>,
+    pub runtime: Option<PersistedRuntime>,
+}
+
+impl StoredMicroVm {
+    pub(crate) fn is_complete(&self) -> bool {
+        self.network.is_some() && self.credential.is_some() && self.runtime.is_some()
+    }
+
+    pub(crate) fn require_complete(&self, operation: &str) -> Result<(), SdkError> {
+        if self.is_complete() {
+            Ok(())
+        } else {
+            Err(SdkError::LifecycleConflict {
+                name: self.record.name.clone(),
+                state: "creation incomplete".to_owned(),
+                operation: operation.to_owned(),
+            })
+        }
+    }
+
+    pub(crate) fn require_full(
+        &self,
+        operation: &str,
+    ) -> Result<(&PersistedNetwork, &PersistedCredential, &PersistedRuntime), SdkError> {
+        self.require_complete(operation)?;
+        match (&self.network, &self.credential, &self.runtime) {
+            (Some(network), Some(credential), Some(runtime)) => Ok((network, credential, runtime)),
+            _ => Err(SdkError::LifecycleConflict {
+                name: self.record.name.clone(),
+                state: "creation incomplete".to_owned(),
+                operation: operation.to_owned(),
+            }),
+        }
+    }
 }
 
 /// Local inventory and lifecycle persistence for MicroVM records.
 pub(crate) trait MicroVmRepository: Send + Sync {
     fn find_microvm(&self, name: &str) -> Result<Option<StoredMicroVm>, SdkError>;
 
-    fn list_microvm_names(&self) -> Result<Vec<(String, String)>, SdkError>;
+    fn list_stored_microvms(&self) -> Result<Vec<StoredMicroVm>, SdkError>;
 
     fn find_volume_owner(&self, volume_path: &Path) -> Result<Option<String>, SdkError>;
 
@@ -97,7 +130,7 @@ pub(crate) trait MicroVmRepository: Send + Sync {
 
     fn list_lan_addresses(&self) -> Result<Vec<(String, IpAddr, String)>, SdkError>;
 
-    fn insert_creating(&self, record: &MicroVmRecord) -> Result<i64, SdkError>;
+    fn insert_microvm(&self, record: &MicroVmRecord) -> Result<i64, SdkError>;
 
     fn persist_network(&self, vm_id: i64, network: &PersistedNetwork) -> Result<(), SdkError>;
 
@@ -108,12 +141,6 @@ pub(crate) trait MicroVmRepository: Send + Sync {
     ) -> Result<(), SdkError>;
 
     fn persist_runtime(&self, vm_id: i64, runtime: &PersistedRuntime) -> Result<(), SdkError>;
-
-    fn update_state(
-        &self,
-        vm_id: i64,
-        state: crate::domain::lifecycle::MicroVmState,
-    ) -> Result<(), SdkError>;
 
     fn delete_microvm(&self, vm_id: i64) -> Result<(), SdkError>;
 

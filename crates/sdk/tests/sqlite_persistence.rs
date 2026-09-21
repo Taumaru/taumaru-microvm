@@ -59,7 +59,7 @@ fn constructor_creates_idempotent_inventory_schema() {
             row.get(0)
         })
         .expect("migration ledger should be readable");
-    assert_eq!(migration_count, 3);
+    assert_eq!(migration_count, 4);
     let preserved_count: i64 = connection
         .query_row(
             "SELECT COUNT(*) FROM downloads WHERE artifact_key = 'kernel:preserved'",
@@ -296,4 +296,91 @@ async fn invalid_kernel_cleanup_removes_its_physical_and_relation_rows()
     assert_eq!(kernel_count, 0);
     assert_eq!(relation_count, 0);
     Ok(())
+}
+
+#[test]
+fn migration_v4_removes_the_persisted_state_column_and_keeps_vm_data() {
+    use sha2::{Digest, Sha256};
+    let directory = tempdir().expect("temporary directory should be created");
+    std::fs::create_dir_all(directory.path().join("state"))
+        .expect("state directory should be created");
+    let database = directory.path().join("state").join("inventory.db");
+    let names = [
+        "0001_artifact_inventory.sql",
+        "0002_microvm_creation.sql",
+        "0003_routed_lan.sql",
+    ];
+    let crate_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let connection = Connection::open(&database).expect("inventory should open");
+    connection
+        .execute_batch(
+            "CREATE TABLE IF NOT EXISTS schema_migrations (
+                version INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                checksum TEXT NOT NULL,
+                applied_at INTEGER NOT NULL
+            )",
+        )
+        .expect("ledger should exist");
+    for (index, name) in names.iter().enumerate() {
+        let version = index as i64 + 1;
+        let sql = std::fs::read_to_string(crate_dir.join("migrations").join(name))
+            .unwrap_or_else(|_| panic!("{name} should be readable"));
+        connection
+            .execute_batch(&sql)
+            .expect("seed migration should apply");
+        let mut digest = Sha256::new();
+        digest.update(sql.as_bytes());
+        let checksum: String = digest
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        connection
+            .execute(
+                "INSERT INTO schema_migrations (version, name, checksum, applied_at)
+                 VALUES (?1, ?2, ?3, 1)",
+                rusqlite::params![version, name, checksum],
+            )
+            .expect("ledger row should insert");
+    }
+    connection
+        .execute(
+            "INSERT INTO microvms (
+                name, state, distribution_id, image_id, kernel_id,
+                firecracker_package_id, firectl_package_id, disk_size_bytes,
+                memory_requested_bytes, memory_effective_mib, vcpu_count,
+                volume_path, rootfs_path, socket_path, expose_on_lan, created_at, updated_at
+            ) VALUES ('legacy-vm', 'running', 'd', 'i', 'k', 'fc', 'fr',
+                      8, 134217728, 128, 1, '/tmp/legacy', '/tmp/legacy/rootfs.ext4',
+                      '/tmp/legacy/firecracker.sock', 0, 1, 1)",
+            [],
+        )
+        .expect("legacy VM row should insert");
+    drop(connection);
+    let sdk = MicroVmSdk::new(directory.path()).expect("v4 migration should apply");
+    drop(sdk);
+    let connection = open_inventory(directory.path()).expect("inventory should open");
+    let state_columns: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('microvms') WHERE name = 'state'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("microvms columns should be readable");
+    assert_eq!(state_columns, 0);
+    let migration_count: i64 = connection
+        .query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| {
+            row.get(0)
+        })
+        .expect("migration ledger should be readable");
+    assert_eq!(migration_count, 4);
+    let vm_name: String = connection
+        .query_row(
+            "SELECT name FROM microvms WHERE volume_path = '/tmp/legacy'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("legacy VM data should survive");
+    assert_eq!(vm_name, "legacy-vm");
 }

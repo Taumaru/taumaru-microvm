@@ -1,31 +1,23 @@
 use std::fmt;
 
-/// Durable lifecycle states used while preparing a MicroVM.
+/// Call-time verified state of a MicroVM.
+///
+/// There is no persisted lifecycle state. A machine reports [`MicroVmState::Running`]
+/// if and only if its volume-local control socket answers at call time; anything
+/// else reports [`MicroVmState::Stopped`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MicroVmState {
-    /// The SDK has claimed the VM and is applying its configuration.
-    Creating,
-    /// A temporary runtime is active for an operation such as DHCP discovery.
+    /// The volume-local control socket answered at call time.
     Running,
-    /// The VM is fully configured and stopped.
-    Configured,
+    /// The socket did not answer, the probe failed, or no runtime record exists.
+    Stopped,
 }
 
 impl MicroVmState {
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
-            Self::Creating => "creating",
             Self::Running => "running",
-            Self::Configured => "configured",
-        }
-    }
-
-    pub(crate) fn parse(value: &str) -> Option<Self> {
-        match value {
-            "creating" => Some(Self::Creating),
-            "running" => Some(Self::Running),
-            "configured" => Some(Self::Configured),
-            _ => None,
+            Self::Stopped => "stopped",
         }
     }
 }

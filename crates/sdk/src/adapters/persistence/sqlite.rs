@@ -6,7 +6,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 use crate::domain::artifact::{ArtifactKind, DownloadSpec, FileIntegrity, InstalledBinary};
-use crate::domain::lifecycle::{MicroVmState, NetworkMode};
+use crate::domain::lifecycle::NetworkMode;
 use crate::domain::microvm::{
     MicroVmRecord, NetworkConfiguration, NetworkResource, PersistedCredential, PersistedNetwork,
     PersistedNetworkResource, PersistedRuntime,
@@ -741,7 +741,7 @@ impl MicroVmRepository for SqliteRepository {
         let connection = self.connection()?;
         let row = connection
             .query_row(
-                "SELECT id, name, state, distribution_id, image_id, kernel_id,
+                "SELECT id, name, distribution_id, image_id, kernel_id,
                         firecracker_package_id, firectl_package_id, disk_size_bytes,
                         memory_requested_bytes, memory_effective_mib, vcpu_count,
                         volume_path, rootfs_path, socket_path, expose_on_lan,
@@ -757,17 +757,16 @@ impl MicroVmRepository for SqliteRepository {
                         row.get::<_, String>(4)?,
                         row.get::<_, String>(5)?,
                         row.get::<_, String>(6)?,
-                        row.get::<_, String>(7)?,
+                        row.get::<_, i64>(7)?,
                         row.get::<_, i64>(8)?,
                         row.get::<_, i64>(9)?,
                         row.get::<_, i64>(10)?,
-                        row.get::<_, i64>(11)?,
+                        PathBuf::from(row.get::<_, String>(11)?),
                         PathBuf::from(row.get::<_, String>(12)?),
                         PathBuf::from(row.get::<_, String>(13)?),
-                        PathBuf::from(row.get::<_, String>(14)?),
+                        row.get::<_, i64>(14)?,
                         row.get::<_, i64>(15)?,
                         row.get::<_, i64>(16)?,
-                        row.get::<_, i64>(17)?,
                     ))
                 },
             )
@@ -787,13 +786,64 @@ impl MicroVmRepository for SqliteRepository {
         }))
     }
 
-    fn list_microvm_names(&self) -> Result<Vec<(String, String)>, SdkError> {
+    fn list_stored_microvms(&self) -> Result<Vec<StoredMicroVm>, SdkError> {
         let connection = self.connection()?;
-        let mut statement = connection.prepare("SELECT name, state FROM microvms ORDER BY name")?;
-        let rows = statement.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(SdkError::from)
+        let mut statement = connection.prepare("SELECT name FROM microvms ORDER BY name")?;
+        let names = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(SdkError::from)?;
+        let mut stored = Vec::with_capacity(names.len());
+        for name in names {
+            let row = connection
+                .query_row(
+                    "SELECT id, name, distribution_id, image_id, kernel_id,
+                            firecracker_package_id, firectl_package_id, disk_size_bytes,
+                            memory_requested_bytes, memory_effective_mib, vcpu_count,
+                            volume_path, rootfs_path, socket_path, expose_on_lan,
+                            created_at, updated_at
+                     FROM microvms WHERE name = ?1",
+                    params![name],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, String>(4)?,
+                            row.get::<_, String>(5)?,
+                            row.get::<_, String>(6)?,
+                            row.get::<_, i64>(7)?,
+                            row.get::<_, i64>(8)?,
+                            row.get::<_, i64>(9)?,
+                            row.get::<_, i64>(10)?,
+                            PathBuf::from(row.get::<_, String>(11)?),
+                            PathBuf::from(row.get::<_, String>(12)?),
+                            PathBuf::from(row.get::<_, String>(13)?),
+                            row.get::<_, i64>(14)?,
+                            row.get::<_, i64>(15)?,
+                            row.get::<_, i64>(16)?,
+                        ))
+                    },
+                )
+                .optional()?
+                .ok_or_else(|| {
+                    SdkError::Migration(format!(
+                        "inventory row for {name} disappeared during bulk listing"
+                    ))
+                })?;
+            let record = record_from_row(row)?;
+            let network = load_network_record(&connection, record.id)?;
+            let credential = load_credential_record(&connection, record.id)?;
+            let runtime = load_runtime_record(&connection, record.id)?;
+            stored.push(StoredMicroVm {
+                record,
+                network,
+                credential,
+                runtime,
+            });
+        }
+        Ok(stored)
     }
 
     fn find_volume_owner(&self, volume_path: &Path) -> Result<Option<String>, SdkError> {
@@ -826,18 +876,17 @@ impl MicroVmRepository for SqliteRepository {
         )
     }
 
-    fn insert_creating(&self, record: &MicroVmRecord) -> Result<i64, SdkError> {
+    fn insert_microvm(&self, record: &MicroVmRecord) -> Result<i64, SdkError> {
         let connection = self.connection()?;
         connection.execute(
             "INSERT INTO microvms (
-                name, state, distribution_id, image_id, kernel_id,
+                name, distribution_id, image_id, kernel_id,
                 firecracker_package_id, firectl_package_id, disk_size_bytes,
                 memory_requested_bytes, memory_effective_mib, vcpu_count,
                 volume_path, rootfs_path, socket_path, expose_on_lan, created_at, updated_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?16)",
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?15)",
             params![
                 record.name,
-                record.state.as_str(),
                 record.distribution_id,
                 record.image_id,
                 record.kernel_id,
@@ -927,15 +976,6 @@ impl MicroVmRepository for SqliteRepository {
         Ok(())
     }
 
-    fn update_state(&self, vm_id: i64, state: MicroVmState) -> Result<(), SdkError> {
-        let connection = self.connection()?;
-        connection.execute(
-            "UPDATE microvms SET state = ?1, updated_at = ?2 WHERE id = ?3",
-            params![state.as_str(), unix_timestamp()?, vm_id],
-        )?;
-        Ok(())
-    }
-
     fn delete_microvm(&self, vm_id: i64) -> Result<(), SdkError> {
         let mut connection = self.connection()?;
         let transaction = connection.transaction()?;
@@ -1000,13 +1040,14 @@ impl MicroVmRepository for SqliteRepository {
 
     fn load_network(&self, vm_id: i64) -> Result<NetworkConfiguration, SdkError> {
         let connection = self.connection()?;
-        Ok(load_network_record(&connection, vm_id)?.config)
+        load_network_record(&connection, vm_id)?
+            .map(|network| network.config)
+            .ok_or_else(|| SdkError::Migration(format!("network record is missing for VM {vm_id}")))
     }
 }
 
 type MicroVmRow = (
     i64,
-    String,
     String,
     String,
     String,
@@ -1029,7 +1070,6 @@ fn record_from_row(row: MicroVmRow) -> Result<MicroVmRecord, SdkError> {
     let (
         id,
         name,
-        state,
         distribution_id,
         image_id,
         kernel_id,
@@ -1046,8 +1086,6 @@ fn record_from_row(row: MicroVmRow) -> Result<MicroVmRecord, SdkError> {
         created_at,
         _updated_at,
     ) = row;
-    let state = MicroVmState::parse(&state)
-        .ok_or_else(|| SdkError::Migration(format!("unknown persisted VM state {state}")))?;
     let disk_size_bytes = from_sqlite_integer(disk_size_bytes, "VM disk size")?;
     let memory_bytes = from_sqlite_integer(memory_bytes, "VM memory")?;
     let memory_effective_mib = from_sqlite_integer(memory_effective_mib, "VM effective memory")?;
@@ -1056,7 +1094,6 @@ fn record_from_row(row: MicroVmRow) -> Result<MicroVmRecord, SdkError> {
     Ok(MicroVmRecord {
         id,
         name,
-        state,
         distribution_id,
         image_id,
         kernel_id,
@@ -1074,7 +1111,10 @@ fn record_from_row(row: MicroVmRow) -> Result<MicroVmRecord, SdkError> {
     })
 }
 
-fn load_network_record(connection: &Connection, vm_id: i64) -> Result<PersistedNetwork, SdkError> {
+fn load_network_record(
+    connection: &Connection,
+    vm_id: i64,
+) -> Result<Option<PersistedNetwork>, SdkError> {
     let row = connection
         .query_row(
             "SELECT n.mode, n.guest_ip, n.prefix_length, n.gateway_ip, n.host_ip,
@@ -1122,8 +1162,10 @@ fn load_network_record(connection: &Connection, vm_id: i64) -> Result<PersistedN
                 ))
             },
         )
-        .optional()?
-        .ok_or_else(|| SdkError::Migration(format!("network record is missing for VM {vm_id}")))?;
+        .optional()?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
     let (
         mode,
         guest_ip,
@@ -1200,7 +1242,7 @@ fn load_network_record(connection: &Connection, vm_id: i64) -> Result<PersistedN
             })
         })
         .collect::<Result<Vec<_>, SdkError>>()?;
-    Ok(PersistedNetwork {
+    Ok(Some(PersistedNetwork {
         config,
         host_address: parse_optional_ip(host_ip.as_deref(), "host IP")?,
         guest_mac,
@@ -1222,13 +1264,13 @@ fn load_network_record(connection: &Connection, vm_id: i64) -> Result<PersistedN
             SdkError::Migration(format!("invalid persisted default route state: {error}"))
         })?,
         resources,
-    })
+    }))
 }
 
 fn load_credential_record(
     connection: &Connection,
     vm_id: i64,
-) -> Result<PersistedCredential, SdkError> {
+) -> Result<Option<PersistedCredential>, SdkError> {
     let row = connection
         .query_row(
             "SELECT private_key_path, public_key_path, guest_authorized_keys_path,
@@ -1248,13 +1290,13 @@ fn load_credential_record(
                 ))
             },
         )
-        .optional()?
-        .ok_or_else(|| {
-            SdkError::Migration(format!("credential record is missing for VM {vm_id}"))
-        })?;
+        .optional()?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
     let (private_key_path, public_key_path, guest_path, key_type, user, port, fingerprint, mode) =
         row;
-    Ok(PersistedCredential {
+    Ok(Some(PersistedCredential {
         private_key_path,
         public_key_path,
         guest_authorized_keys_path: guest_path,
@@ -1264,10 +1306,13 @@ fn load_credential_record(
             .map_err(|_| SdkError::Migration("persisted SSH port is invalid".to_owned()))?,
         public_key_fingerprint: fingerprint,
         file_mode: mode,
-    })
+    }))
 }
 
-fn load_runtime_record(connection: &Connection, vm_id: i64) -> Result<PersistedRuntime, SdkError> {
+fn load_runtime_record(
+    connection: &Connection,
+    vm_id: i64,
+) -> Result<Option<PersistedRuntime>, SdkError> {
     let row = connection
         .query_row(
             "SELECT firecracker_path, firectl_path, socket_path, process_id, process_state
@@ -1283,10 +1328,12 @@ fn load_runtime_record(connection: &Connection, vm_id: i64) -> Result<PersistedR
                 ))
             },
         )
-        .optional()?
-        .ok_or_else(|| SdkError::Migration(format!("runtime record is missing for VM {vm_id}")))?;
+        .optional()?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
     let (firecracker_path, firectl_path, socket_path, process_id, process_state) = row;
-    Ok(PersistedRuntime {
+    Ok(Some(PersistedRuntime {
         firecracker_path,
         firectl_path,
         socket_path,
@@ -1297,7 +1344,7 @@ fn load_runtime_record(connection: &Connection, vm_id: i64) -> Result<PersistedR
             })
             .transpose()?,
         process_state,
-    })
+    }))
 }
 
 fn persist_network_transaction(

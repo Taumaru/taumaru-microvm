@@ -177,6 +177,23 @@ pub(crate) async fn run(context: &CliContext, arguments: SshArgs) -> Result<u8, 
     }
 
     if named.is_none() {
+        let home = crate::context::resolve_home().ok();
+        let command = vec![OsString::from("ssh")];
+        if let Some(exit) = crate::privilege::require_privileged(
+            &crate::privilege::SystemPrivilege,
+            context.terminal,
+            false,
+            home,
+            &[],
+            command,
+            "Run the same command with sudo or as root",
+        )
+        .await?
+        {
+            return Ok(exit);
+        }
+    }
+    if named.is_none() {
         if !context.terminal.interactive {
             return Err(CliError::creation(
                 "An interactive terminal is required",
@@ -528,5 +545,35 @@ mod tests {
                 "-a"
             ]
         );
+    }
+
+    #[test]
+    fn running_prefilter_keeps_only_verified_running_machines() {
+        use taumaru_microvm::{MicroVmState, MicroVmSummary};
+        let inventory = vec![
+            MicroVmSummary {
+                name: "web-01".to_owned(),
+                state: MicroVmState::Running,
+            },
+            MicroVmSummary {
+                name: "db-01".to_owned(),
+                state: MicroVmState::Stopped,
+            },
+        ];
+        let machines: Vec<(String, taumaru_microvm::MicroVmState)> = inventory
+            .into_iter()
+            .filter(|machine| machine.state == taumaru_microvm::MicroVmState::Running)
+            .map(|machine| (machine.name, machine.state))
+            .collect();
+        assert_eq!(
+            machines,
+            [("web-01".to_owned(), taumaru_microvm::MicroVmState::Running)]
+        );
+    }
+
+    #[test]
+    fn stopped_machines_render_stopped_error_labels() {
+        let state = taumaru_microvm::MicroVmState::Stopped;
+        assert_eq!(state.to_string(), "stopped");
     }
 }

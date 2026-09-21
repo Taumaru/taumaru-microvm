@@ -1215,7 +1215,7 @@ mod start_tests {
     fn creation_result() -> MicroVmCreationResult {
         MicroVmCreationResult {
             name: String::from("web-01"),
-            state: MicroVmState::Configured,
+            state: MicroVmState::Stopped,
             distribution_id: String::from("distro-a"),
             image_id: String::from("image-a"),
             volume_path: PathBuf::from("/home/user/.taumaru-microvm/vms/web-01"),

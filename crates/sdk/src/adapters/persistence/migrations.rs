@@ -28,6 +28,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "0003_routed_lan.sql",
         sql: include_str!("../../../migrations/0003_routed_lan.sql"),
     },
+    Migration {
+        version: 4,
+        name: "0004_drop_microvm_state.sql",
+        sql: include_str!("../../../migrations/0004_drop_microvm_state.sql"),
+    },
 ];
 
 pub(crate) fn apply_pending(connection: &mut Connection) -> Result<(), SdkError> {
@@ -189,7 +194,6 @@ fn verify_required_schema(connection: &Connection) -> Result<(), SdkError> {
             &[
                 "id",
                 "name",
-                "state",
                 "distribution_id",
                 "image_id",
                 "kernel_id",

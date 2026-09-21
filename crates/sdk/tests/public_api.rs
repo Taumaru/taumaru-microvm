@@ -102,6 +102,7 @@ fn start_result_types_are_exported_with_running_state() {
     use taumaru_microvm::{MicroVmStartResult, MicroVmState};
     let _ = std::mem::size_of::<MicroVmStartResult>();
     let _ = MicroVmState::Running;
+    let _ = MicroVmState::Stopped;
 }
 
 #[tokio::test]

@@ -148,6 +148,23 @@ pub(crate) async fn run(context: &CliContext, arguments: StartArgs) -> Result<u8
         return execute_start(context, &name, "").await;
     }
 
+    if arguments.name.is_none() && arguments.explicit_name.is_none() {
+        let home = crate::context::resolve_home().ok();
+        let command = vec![std::ffi::OsString::from("start")];
+        if let Some(exit) = crate::privilege::require_privileged(
+            &crate::privilege::SystemPrivilege,
+            context.terminal,
+            false,
+            home,
+            &[],
+            command,
+            "Run the same command with sudo or as root",
+        )
+        .await?
+        {
+            return Ok(exit);
+        }
+    }
     let name = resolve_interactive_name(context, &arguments).await?;
     let home = crate::context::resolve_home().ok();
     let command = escalated_child_command(&name);
@@ -172,7 +189,7 @@ pub(crate) async fn run(context: &CliContext, arguments: StartArgs) -> Result<u8
 #[cfg(test)]
 mod tests {
     use super::escalated_child_command;
-    use super::resolve_name;
+    use super::{map_start_error, resolve_name};
 
     #[test]
     fn positional_and_flag_names_agree_or_abort() {
@@ -201,5 +218,39 @@ mod tests {
             .map(|part| part.to_string_lossy().into_owned())
             .collect();
         assert_eq!(rendered, ["start", "web-01", "--non-interactive"]);
+    }
+
+    #[test]
+    fn machine_labels_render_verified_states() {
+        use taumaru_microvm::{MicroVmState, MicroVmSummary};
+        let machines = [
+            MicroVmSummary {
+                name: "web-01".to_owned(),
+                state: MicroVmState::Running,
+            },
+            MicroVmSummary {
+                name: "db-01".to_owned(),
+                state: MicroVmState::Stopped,
+            },
+        ];
+        let labels: Vec<String> = machines
+            .iter()
+            .map(|machine| format!("{} [{}]", machine.name, machine.state))
+            .collect();
+        assert_eq!(labels, ["web-01 [running]", "db-01 [stopped]"]);
+    }
+
+    #[test]
+    fn refused_foreign_machine_maps_to_calm_start_failure() {
+        use taumaru_microvm::SdkError;
+        let error = map_start_error(
+            "web-01",
+            SdkError::TemporaryRuntime {
+                component: "firecracker".to_owned(),
+                reason: "the machine is already running outside SDK management".to_owned(),
+                stopped: false,
+            },
+        );
+        assert!(error.user_message(false).contains("MicroVM start failed"));
     }
 }

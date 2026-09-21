@@ -3,7 +3,7 @@ use std::fmt;
 use inquire::{Confirm, Select, Text};
 use taumaru_microvm::{
     CreateMicroVmRequest, CreationProgress, Distribution, DistributionImage, DownloadCancellation,
-    Kernel, MicroVmSdk, MicroVmState, SdkError,
+    Kernel, MicroVmSdk, SdkError,
 };
 
 use super::download::{
@@ -1039,11 +1039,6 @@ async fn run_creation(context: &CliContext, request: &NewVmRequest) -> Result<u8
                 context.terminal,
             )
             .map_err(CliError::from)?;
-            if !matches!(result.state, MicroVmState::Configured) {
-                return Err(CliError::Sdk(SdkError::Migration(
-                    "creation returned without reaching the configured state".to_owned(),
-                )));
-            }
             Ok(0)
         }
         Err(error) => {
