@@ -109,6 +109,59 @@ impl NetworkController for LinuxNetworkController {
             })
         }
     }
+
+    fn cleanup_for_delete(&self, network: &PersistedNetwork) -> Result<(), SdkError> {
+        let mut failures = Vec::new();
+        if network.config.mode == NetworkMode::HostOnly {
+            if let Err(error) = delete_link_if_present(&network.config.tap_name) {
+                failures.push(error.to_string());
+            }
+            if network.forwarding_enabled_by_sdk
+                && let Err(error) = run_command("sysctl", &["-w", "net.ipv4.ip_forward=0"])
+            {
+                failures.push(error.to_string());
+            }
+        } else {
+            let Some(IpAddr::V4(lan)) = network.config.lan_address else {
+                failures.push("routed LAN network has no committed LAN address".to_owned());
+                return Err(SdkError::Cleanup {
+                    primary: "network cleanup failed".to_owned(),
+                    failures,
+                });
+            };
+            let uplink = network.config.uplink_name.clone().unwrap_or_default();
+            let IpAddr::V4(private_guest) = network.config.guest_address else {
+                failures.push("routed LAN network has no private guest address".to_owned());
+                return Err(SdkError::Cleanup {
+                    primary: "network cleanup failed".to_owned(),
+                    failures,
+                });
+            };
+            let private_network = private_guest_network(private_guest);
+            failures.extend(cleanup_routed_for_delete(&RoutedCleanup {
+                uplink: &uplink,
+                tap: &network.config.tap_name,
+                lan,
+                private_network,
+                private_guest,
+                applied: &network
+                    .resources
+                    .iter()
+                    .map(|item| item.resource)
+                    .collect::<Vec<_>>(),
+                forwarding_was_enabled: !network.forwarding_enabled_by_sdk,
+                proxy_was_enabled: !network.proxy_arp_enabled_by_sdk,
+            }));
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(SdkError::Cleanup {
+                primary: "network cleanup failed".to_owned(),
+                failures,
+            })
+        }
+    }
 }
 
 impl LinuxNetworkController {
@@ -1672,6 +1725,130 @@ fn cleanup_routed_rules(
     }
     delete_iptables_spec(&routed_nat_spec(uplink, tap, private_network))?;
     Ok(())
+}
+
+/// Delete-path routed cleanup: like [`cleanup_routed`], but an already-absent
+/// host route or proxy-neighbour entry counts as converged instead of failing.
+/// TAP removal, iptables-rule removal, and sysctl restorations reuse the same
+/// absent-tolerant primitives as the rollback path.
+fn cleanup_routed_for_delete(state: &RoutedCleanup<'_>) -> Vec<String> {
+    let mut failures = Vec::new();
+    let rules_owned = state.applied.contains(&NetworkResource::IptablesNat)
+        || state.applied.contains(&NetworkResource::ForwardRule);
+    if rules_owned
+        && let Err(error) = cleanup_routed_rules(
+            state.uplink,
+            state.tap,
+            state.lan,
+            state.private_network,
+            state.private_guest,
+        )
+    {
+        failures.push(error.to_string());
+    }
+    if state.applied.contains(&NetworkResource::ProxyArpEntry)
+        && let Err(error) = delete_proxy_entry_if_present(state.uplink, state.lan)
+    {
+        failures.push(error.to_string());
+    }
+    if state.applied.contains(&NetworkResource::HostRoute)
+        && let Err(error) = delete_host_route_if_present(state.tap, state.lan)
+    {
+        failures.push(error.to_string());
+    }
+    if state.applied.contains(&NetworkResource::Tap)
+        && let Err(error) = delete_link_if_present(state.tap)
+    {
+        failures.push(error.to_string());
+    }
+    if state.applied.contains(&NetworkResource::Forwarding)
+        && !state.forwarding_was_enabled
+        && let Err(error) = run_command("sysctl", &["-w", "net.ipv4.ip_forward=0"])
+    {
+        failures.push(error.to_string());
+    }
+    if !state.proxy_was_enabled
+        && state.applied.contains(&NetworkResource::Forwarding)
+        && let Err(error) = run_command(
+            "sysctl",
+            &[&format!("net.ipv4.conf.{}.proxy_arp=0", state.uplink)],
+        )
+    {
+        failures.push(error.to_string());
+    }
+    failures
+}
+
+/// Removes one `/32` host route when present; an already-absent route is converged.
+fn delete_host_route_if_present(tap: &str, lan: Ipv4Addr) -> Result<(), SdkError> {
+    let output = command_output(
+        "ip",
+        &["-4", "route", "show", &format!("{lan}/32"), "dev", tap],
+    )?;
+    if !output.status.success() {
+        return Err(host_command_error(
+            "ip",
+            &["-4", "route", "show", &format!("{lan}/32"), "dev", tap],
+            &output,
+        ));
+    }
+    if !String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .any(|line| line.contains(&format!("{lan}/32")) && line.contains(tap))
+    {
+        return Ok(());
+    }
+    match run_ip(&["route", "del", &format!("{lan}/32"), "dev", tap]) {
+        Ok(()) => Ok(()),
+        Err(primary) => {
+            let output = command_output(
+                "ip",
+                &["-4", "route", "show", &format!("{lan}/32"), "dev", tap],
+            )?;
+            if output.status.success()
+                && !String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .any(|line| line.contains(&format!("{lan}/32")) && line.contains(tap))
+            {
+                Ok(())
+            } else {
+                Err(primary)
+            }
+        }
+    }
+}
+
+/// Removes one proxy-neighbour entry when present; an already-absent entry is converged.
+fn delete_proxy_entry_if_present(uplink: &str, lan: Ipv4Addr) -> Result<(), SdkError> {
+    let output = command_output("ip", &["neigh", "show", "proxy", "dev", uplink])?;
+    if !output.status.success() {
+        return Err(host_command_error(
+            "ip",
+            &["neigh", "show", "proxy", "dev", uplink],
+            &output,
+        ));
+    }
+    if !String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .any(|line| line.contains(&lan.to_string()))
+    {
+        return Ok(());
+    }
+    match run_ip(&["neigh", "del", "proxy", &lan.to_string(), "dev", uplink]) {
+        Ok(()) => Ok(()),
+        Err(primary) => {
+            let output = command_output("ip", &["neigh", "show", "proxy", "dev", uplink])?;
+            if output.status.success()
+                && !String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .any(|line| line.contains(&lan.to_string()))
+            {
+                Ok(())
+            } else {
+                Err(primary)
+            }
+        }
+    }
 }
 
 fn reconcile_tap(

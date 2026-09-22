@@ -69,4 +69,15 @@ pub(crate) trait NetworkController: Send + Sync {
     ) -> Result<NetworkOutcome, SdkError>;
 
     fn cleanup(&self, network: &PersistedNetwork) -> Result<(), SdkError>;
+
+    /// Releases exactly the host items recorded as owned by this VM, skipping
+    /// already-absent items as already removed.
+    ///
+    /// Unlike [`NetworkController::cleanup`], which keeps strict accounting
+    /// for the creation-rollback path, this is the delete path: absent means
+    /// converged, not failed. A present-but-unreleasable item is a typed
+    /// error. Unowned host configuration is never addressed.
+    fn cleanup_for_delete(&self, network: &PersistedNetwork) -> Result<(), SdkError> {
+        self.cleanup(network)
+    }
 }

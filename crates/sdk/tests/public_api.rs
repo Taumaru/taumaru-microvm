@@ -111,6 +111,32 @@ fn stop_result_types_are_exported_with_stopped_state() {
     let _ = MicroVmState::Running;
     let _ = MicroVmState::Stopped;
 }
+#[test]
+fn delete_result_type_is_exported_with_deleted_name() {
+    use taumaru_microvm::MicroVmDeleteResult;
+    let deleted = MicroVmDeleteResult {
+        name: "build_vm".to_owned(),
+    };
+    assert_eq!(deleted.name, "build_vm");
+    let _ = std::mem::size_of::<MicroVmDeleteResult>();
+}
+
+#[tokio::test]
+async fn delete_validates_names_and_reports_unknown_vms_as_typed_errors() {
+    use taumaru_microvm::{MicroVmSdk, SdkError};
+    use tempfile::tempdir;
+
+    let home = tempdir().expect("temporary SDK home should be created");
+    let sdk = MicroVmSdk::new(home.path()).expect("SDK construction should work");
+
+    let invalid = sdk.delete_microvm("not path friendly").await;
+    assert!(matches!(invalid, Err(SdkError::InvalidRequest { field, .. }) if field == "name"));
+
+    let missing = sdk.delete_microvm("missing_vm").await;
+    assert!(
+        matches!(missing, Err(SdkError::NotFound { kind, id }) if kind == "MicroVM" && id == "missing_vm")
+    );
+}
 
 #[tokio::test]
 async fn stop_validates_names_and_reports_unknown_vms_as_typed_errors() {

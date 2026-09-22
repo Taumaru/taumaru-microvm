@@ -27,9 +27,10 @@ use crate::domain::config::minimum_memory_bytes;
 use crate::domain::lifecycle::{MicroVmState, NetworkMode};
 use crate::domain::microvm::{
     CreateMicroVmRequest, CreationEventPhase, CreationOutcome, CreationProgress, CreationStage,
-    MicroVmCreationResult, MicroVmRecord, MicroVmStartResult, MicroVmStopResult, MicroVmSummary,
-    NetworkConfigurationResult, PersistedCredential, PersistedNetwork, PersistedRuntime,
-    RunningMicroVm, SshConnectionInfo, TOTAL_CREATION_STEPS, unspecified_address,
+    MicroVmCreationResult, MicroVmDeleteResult, MicroVmRecord, MicroVmStartResult,
+    MicroVmStopResult, MicroVmSummary, NetworkConfigurationResult, PersistedCredential,
+    PersistedNetwork, PersistedRuntime, RunningMicroVm, SshConnectionInfo, TOTAL_CREATION_STEPS,
+    unspecified_address,
 };
 use crate::domain::registry::{
     Architecture, BinaryFile, BinaryPackage, Distribution, DistributionImage, Kernel,
@@ -1382,6 +1383,62 @@ impl MicroVmSdk {
             reason: "the machine is still running after forced termination".to_owned(),
             stopped: false,
         })
+    }
+
+    /// Deletes one stopped MicroVM and everything it owns.
+    ///
+    /// The operation takes only the VM name: the volume directory and every
+    /// owned reference are read from the inventory record, never from the
+    /// caller. A running machine (its control socket answers) is refused
+    /// with a stop-first lifecycle conflict and no host change; an
+    /// unprobable socket propagates its typed probe error without deleting.
+    /// Deletion runs host network release, then whole volume-directory
+    /// removal, then inventory-record deletion last: every failure keeps the
+    /// record so retrying the same delete resumes from the remaining owned
+    /// resources. Already-absent owned files and network items count as
+    /// already removed; only a fully unknown machine name fails as not-found.
+    /// On success the record is gone, the whole volume directory is gone,
+    /// and the VM's owned host network items are released, while shared
+    /// kernels, images, tools, and other VMs stay intact.
+    pub async fn delete_microvm(&self, name: &str) -> Result<MicroVmDeleteResult, SdkError> {
+        crate::domain::config::validate_vm_name(name)?;
+
+        let lookup_name = name.to_owned();
+        let name_lock_path = self.home.join("vms").join(name);
+        let name_lock = self.target_lock(&name_lock_path)?;
+        let _name_guard = name_lock.lock().await;
+        let stored = self
+            .run_repository(move |repository| repository.find_microvm(&lookup_name))
+            .await?
+            .ok_or_else(|| SdkError::NotFound {
+                kind: "MicroVM".to_owned(),
+                id: name.to_owned(),
+            })?;
+        let volume_lock = if stored.record.volume_path != name_lock_path {
+            Some(self.target_lock(&stored.record.volume_path)?)
+        } else {
+            None
+        };
+        let _volume_guard = match volume_lock.as_ref() {
+            Some(lock) => Some(lock.lock().await),
+            None => None,
+        };
+        if self.socket_answers(&stored.record.socket_path)? {
+            return Err(SdkError::LifecycleConflict {
+                name: stored.record.name.clone(),
+                state: MicroVmState::Running.to_string(),
+                operation: "delete MicroVM (stop the machine first)".to_owned(),
+            });
+        }
+        if let Some(network) = stored.network.clone() {
+            self.network.cleanup_for_delete(&network)?;
+        }
+        remove_owned_volume(&self.home, &stored)?;
+        let vm_id = stored.record.id;
+        let deleted_name = stored.record.name.clone();
+        self.run_repository(move |repository| repository.delete_microvm(vm_id))
+            .await?;
+        Ok(MicroVmDeleteResult { name: deleted_name })
     }
 
     /// Previews the kernels and images the next prune would reclaim.
@@ -3772,6 +3829,54 @@ fn path_entry_exists(path: &Path) -> Result<bool, SdkError> {
     }
 }
 
+/// Removes the VM's entire private volume directory after verifying it is
+/// contained in the SDK home and its owned paths have the expected shapes.
+///
+/// An already-absent directory counts as already removed. Shapes are checked
+/// whether or not the files still exist, so a tampered record can never
+/// redirect deletion outside the volume. Violations keep the record: the
+/// caller repairs the inventory instead of losing the deletion index.
+fn remove_owned_volume(home: &Path, stored: &StoredMicroVm) -> Result<(), SdkError> {
+    let volume_path = &stored.record.volume_path;
+    if !volume_path.is_absolute() || !path_is_below_home(home, volume_path) || volume_path == home {
+        return Err(SdkError::StorageConflict {
+            vm_name: stored.record.name.clone(),
+            volume_path: volume_path.clone(),
+            owner: "persisted VM volume".to_owned(),
+            reason: "the persisted VM volume must be a directory strictly below the SDK home"
+                .to_owned(),
+        });
+    }
+    if stored.record.rootfs_path != volume_path.join("rootfs.ext4")
+        || stored.record.socket_path != volume_path.join("firecracker.sock")
+    {
+        return Err(SdkError::StorageConflict {
+            vm_name: stored.record.name.clone(),
+            volume_path: volume_path.clone(),
+            owner: "persisted VM paths".to_owned(),
+            reason: "rootfs and socket paths must remain inside the VM volume".to_owned(),
+        });
+    }
+    if let Some(credential) = stored.credential.as_ref() {
+        let expected_private_key = volume_path.join("ssh/id_ed25519");
+        let expected_public_key = volume_path.join("ssh/id_ed25519.pub");
+        if credential.private_key_path != expected_private_key
+            || credential.public_key_path != expected_public_key
+        {
+            return Err(SdkError::Credential {
+                operation: "verify owned key paths".to_owned(),
+                path: volume_path.clone(),
+                reason: "credential paths are outside the VM volume".to_owned(),
+            });
+        }
+    }
+    match fs::remove_dir_all(volume_path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(SdkError::filesystem("remove VM volume", volume_path, error)),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn verify_local_artifact_with_progress(
     home: &Path,
@@ -4630,6 +4735,8 @@ mod tests {
 
     struct TestNetwork {
         cleanup_calls: AtomicUsize,
+        delete_cleanup_calls: AtomicUsize,
+        delete_cleanup_results: std::sync::Mutex<Vec<Result<(), String>>>,
     }
 
     impl NetworkController for TestNetwork {
@@ -4680,6 +4787,24 @@ mod tests {
         fn cleanup(&self, _network: &PersistedNetwork) -> Result<(), SdkError> {
             self.cleanup_calls.fetch_add(1, Ordering::Relaxed);
             Ok(())
+        }
+
+        fn cleanup_for_delete(&self, _network: &PersistedNetwork) -> Result<(), SdkError> {
+            self.delete_cleanup_calls.fetch_add(1, Ordering::Relaxed);
+            match self
+                .delete_cleanup_results
+                .lock()
+                .expect("test delete cleanup lock")
+                .pop()
+            {
+                Some(Ok(())) | None => Ok(()),
+                Some(Err(reason)) => Err(SdkError::Network {
+                    mode: NetworkMode::HostOnly.to_string(),
+                    operation: "release test network".to_owned(),
+                    resource: "test".to_owned(),
+                    reason,
+                }),
+            }
         }
     }
 
@@ -5244,7 +5369,6 @@ mod tests {
             volume_path: None,
         }
     }
-
     fn test_sdk(
         fail_runtime_verification: bool,
     ) -> (
@@ -5265,6 +5389,8 @@ mod tests {
         let credentials = Arc::new(TestCredentials::default());
         let network = Arc::new(TestNetwork {
             cleanup_calls: AtomicUsize::new(0),
+            delete_cleanup_calls: AtomicUsize::new(0),
+            delete_cleanup_results: std::sync::Mutex::new(Vec::new()),
         });
         let runtime = Arc::new(TestRuntime {
             verify_calls: AtomicUsize::new(0),
@@ -6959,6 +7085,449 @@ mod tests {
         assert_eq!(
             *runtime.terminate_calls.lock().expect("terminate lock"),
             vec![4242]
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_removes_a_stopped_vm_and_everything_it_owns() {
+        if std::env::consts::ARCH != "x86_64" {
+            return;
+        }
+        let (sdk, _directory, _storage, _credentials, network, runtime) = test_sdk(false);
+        let stored = start_fixture_vm(&sdk, "doomed_vm", false, None);
+        let volume_path = stored.record.volume_path.clone();
+        assert!(volume_path.join("rootfs.ext4").is_file());
+        let deleted = sdk
+            .delete_microvm("doomed_vm")
+            .await
+            .expect("stopped VM should delete");
+        assert_eq!(deleted.name, "doomed_vm");
+        assert!(!volume_path.exists(), "the whole volume directory is gone");
+        assert_eq!(
+            network.delete_cleanup_calls.load(Ordering::Relaxed),
+            1,
+            "owned network is released exactly once"
+        );
+        let missing = sdk
+            .run_repository(|repository| repository.find_microvm("doomed_vm"))
+            .await
+            .expect("lookup should work");
+        assert!(missing.is_none(), "the record no longer resolves");
+        let repeat = sdk.delete_microvm("doomed_vm").await;
+        assert!(
+            matches!(repeat, Err(SdkError::NotFound { kind, id }) if kind == "MicroVM" && id == "doomed_vm")
+        );
+        let _ = runtime;
+    }
+
+    #[tokio::test]
+    async fn delete_converges_when_owned_files_are_already_absent() {
+        if std::env::consts::ARCH != "x86_64" {
+            return;
+        }
+        let (sdk, _directory, _storage, _credentials, _network, _runtime) = test_sdk(false);
+        let stored = start_fixture_vm(&sdk, "ghost_files_vm", false, None);
+        std::fs::remove_dir_all(&stored.record.volume_path)
+            .expect("fixture volume should be removable");
+        let deleted = sdk
+            .delete_microvm("ghost_files_vm")
+            .await
+            .expect("absent owned files converge");
+        assert_eq!(deleted.name, "ghost_files_vm");
+        let missing = sdk
+            .run_repository(|repository| repository.find_microvm("ghost_files_vm"))
+            .await
+            .expect("lookup should work");
+        assert!(missing.is_none());
+    }
+
+    #[tokio::test]
+    async fn delete_removes_an_incomplete_creation_leftover() {
+        if std::env::consts::ARCH != "x86_64" {
+            return;
+        }
+        let (sdk, _directory, _storage, _credentials, _network, _runtime) = test_sdk(false);
+        start_fixture_vm(&sdk, "half_gone_vm", false, None);
+        delete_child_rows(&sdk, "half_gone_vm");
+        let deleted = sdk
+            .delete_microvm("half_gone_vm")
+            .await
+            .expect("incomplete leftover should delete");
+        assert_eq!(deleted.name, "half_gone_vm");
+        let missing = sdk
+            .run_repository(|repository| repository.find_microvm("half_gone_vm"))
+            .await
+            .expect("lookup should work");
+        assert!(missing.is_none());
+    }
+
+    #[tokio::test]
+    async fn delete_keeps_shared_artifacts_and_other_vms_intact() {
+        if std::env::consts::ARCH != "x86_64" {
+            return;
+        }
+        let (sdk, _directory, _storage, _credentials, _network, _runtime) = test_sdk(false);
+        start_fixture_vm(&sdk, "first_vm", false, None);
+        let survivor = start_fixture_vm(&sdk, "second_vm", false, None);
+        let survivor_volume = survivor.record.volume_path.clone();
+        let kernel_path = sdk.home.join("artifacts/kernels/linux-test-x86_64/vmlinux");
+        let deleted = sdk
+            .delete_microvm("first_vm")
+            .await
+            .expect("first VM should delete");
+        assert_eq!(deleted.name, "first_vm");
+        assert!(kernel_path.is_file(), "shared kernel is preserved");
+        assert!(
+            survivor_volume.join("rootfs.ext4").is_file(),
+            "surviving VM files are intact"
+        );
+        let survivor_still_there = sdk
+            .run_repository(|repository| repository.find_microvm("second_vm"))
+            .await
+            .expect("lookup should work");
+        assert!(survivor_still_there.is_some());
+    }
+
+    #[tokio::test]
+    async fn delete_refuses_an_escaping_volume_without_removing_anything() {
+        if std::env::consts::ARCH != "x86_64" {
+            return;
+        }
+        let (sdk, _directory, _storage, _credentials, network, _runtime) = test_sdk(false);
+        start_fixture_vm(&sdk, "escaped_vm", false, None);
+        let outside = sdk.home.join("outside-escape");
+        std::fs::create_dir_all(&outside).expect("outside directory should be created");
+        std::fs::write(outside.join("keep.txt"), b"keep").expect("outside file should be written");
+        {
+            use rusqlite::params;
+            let database = sdk.home.join("state").join("inventory.db");
+            let connection = rusqlite::Connection::open(&database).expect("inventory should open");
+            connection
+                .execute(
+                    "UPDATE microvms SET volume_path = ?1, rootfs_path = ?2, socket_path = ?3 WHERE name = 'escaped_vm'",
+                    params![
+                        outside.to_string_lossy().into_owned(),
+                        outside.join("rootfs.ext4").to_string_lossy().into_owned(),
+                        outside.join("firecracker.sock").to_string_lossy().into_owned(),
+                    ],
+                )
+                .expect("volume should be tampered");
+        }
+        let error = sdk
+            .delete_microvm("escaped_vm")
+            .await
+            .expect_err("escaping volume should fail");
+        assert!(
+            matches!(error, SdkError::Credential { .. }),
+            "tampered key paths fail the credential shape check, got: {error:?}"
+        );
+        assert!(
+            outside.join("keep.txt").is_file(),
+            "nothing outside the volume is removed"
+        );
+        assert_eq!(
+            network.delete_cleanup_calls.load(Ordering::Relaxed),
+            1,
+            "network release precedes containment per the plan order"
+        );
+        let still_there = sdk
+            .run_repository(|repository| repository.find_microvm("escaped_vm"))
+            .await
+            .expect("lookup should work");
+        assert!(still_there.is_some(), "the record is kept for repair");
+        std::fs::remove_dir_all(&outside).expect("outside directory should be removed");
+    }
+
+    #[tokio::test]
+    async fn delete_refuses_a_home_escaping_volume_without_removing_anything() {
+        if std::env::consts::ARCH != "x86_64" {
+            return;
+        }
+        let (sdk, _directory, _storage, _credentials, network, _runtime) = test_sdk(false);
+        start_fixture_vm(&sdk, "home_escaped_vm", false, None);
+        let outside = std::env::temp_dir().join(format!(
+            "taumaru-delete-escape-{}-home-escaped-vm",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&outside);
+        std::fs::create_dir_all(&outside).expect("outside directory should be created");
+        std::fs::write(outside.join("keep.txt"), b"keep").expect("outside file should be written");
+        {
+            use rusqlite::params;
+            let database = sdk.home.join("state").join("inventory.db");
+            let connection = rusqlite::Connection::open(&database).expect("inventory should open");
+            connection
+                .execute(
+                    "UPDATE microvms SET volume_path = ?1, rootfs_path = ?2, socket_path = ?3 WHERE name = 'home_escaped_vm'",
+                    params![
+                        outside.to_string_lossy().into_owned(),
+                        outside.join("rootfs.ext4").to_string_lossy().into_owned(),
+                        outside.join("firecracker.sock").to_string_lossy().into_owned(),
+                    ],
+                )
+                .expect("volume should be tampered");
+            connection
+                .execute(
+                    "UPDATE vm_credentials SET private_key_path = ?1, public_key_path = ?2 WHERE microvm_id = (SELECT id FROM microvms WHERE name = 'home_escaped_vm')",
+                    params![
+                        outside.join("ssh/id_ed25519").to_string_lossy().into_owned(),
+                        outside.join("ssh/id_ed25519.pub").to_string_lossy().into_owned(),
+                    ],
+                )
+                .expect("credential paths should be tampered");
+        }
+        let error = sdk
+            .delete_microvm("home_escaped_vm")
+            .await
+            .expect_err("home-escaping volume should fail");
+        assert!(
+            matches!(error, SdkError::StorageConflict { .. }),
+            "home escape fails the volume containment check, got: {error:?}"
+        );
+        assert!(
+            outside.join("keep.txt").is_file(),
+            "nothing outside the home is removed"
+        );
+        assert_eq!(
+            network.delete_cleanup_calls.load(Ordering::Relaxed),
+            1,
+            "network release precedes containment per the plan order"
+        );
+        let still_there = sdk
+            .run_repository(|repository| repository.find_microvm("home_escaped_vm"))
+            .await
+            .expect("lookup should work");
+        assert!(still_there.is_some(), "the record is kept for repair");
+        std::fs::remove_dir_all(&outside).expect("outside directory should be removed");
+    }
+
+    #[tokio::test]
+    async fn delete_keeps_the_record_when_the_volume_cannot_be_removed() {
+        if std::env::consts::ARCH != "x86_64" {
+            return;
+        }
+        let (sdk, _directory, _storage, _credentials, _network, _runtime) = test_sdk(false);
+        let stored = start_fixture_vm(&sdk, "locked_vm", false, None);
+        std::fs::remove_dir_all(&stored.record.volume_path)
+            .expect("fixture volume should be removable");
+        std::fs::write(&stored.record.volume_path, b"not-a-directory")
+            .expect("blocking file should be written");
+        let error = sdk
+            .delete_microvm("locked_vm")
+            .await
+            .expect_err("blocked volume should fail");
+        assert!(matches!(error, SdkError::Filesystem { .. }));
+        let still_there = sdk
+            .run_repository(|repository| repository.find_microvm("locked_vm"))
+            .await
+            .expect("lookup should work");
+        assert!(still_there.is_some(), "the record is kept for retry");
+        std::fs::remove_file(&stored.record.volume_path)
+            .expect("blocking file should be removable");
+        let deleted = sdk
+            .delete_microvm("locked_vm")
+            .await
+            .expect("retry should converge");
+        assert_eq!(deleted.name, "locked_vm");
+    }
+
+    #[tokio::test]
+    async fn delete_refuses_a_running_vm_without_host_changes() {
+        if std::env::consts::ARCH != "x86_64" {
+            return;
+        }
+        let (sdk, _directory, _storage, _credentials, network, runtime) = test_sdk(false);
+        let stored = start_fixture_vm(&sdk, "live_vm", false, Some(4242));
+        *runtime.live_socket.lock().expect("socket lock") = true;
+        let volume_snapshot = stored.record.volume_path.clone();
+        let rootfs_before =
+            std::fs::read(volume_snapshot.join("rootfs.ext4")).expect("rootfs should be readable");
+        let error = sdk
+            .delete_microvm("live_vm")
+            .await
+            .expect_err("running VM should be refused");
+        assert!(
+            matches!(&error, SdkError::LifecycleConflict { name, state, operation } if name == "live_vm" && state == "running" && operation.contains("stop")),
+            "stop-first refusal, got: {error:?}"
+        );
+        assert_eq!(
+            std::fs::read(volume_snapshot.join("rootfs.ext4")).expect("rootfs should be readable"),
+            rootfs_before,
+            "owned files are unchanged"
+        );
+        assert_eq!(
+            network.delete_cleanup_calls.load(Ordering::Relaxed),
+            0,
+            "no network release on refusal"
+        );
+        let still_there = sdk
+            .run_repository(|repository| repository.find_microvm("live_vm"))
+            .await
+            .expect("lookup should work");
+        assert!(still_there.is_some(), "the record is unchanged");
+        *runtime.live_socket.lock().expect("socket lock") = false;
+        let deleted = sdk
+            .delete_microvm("live_vm")
+            .await
+            .expect("stop-then-delete succeeds");
+        assert_eq!(deleted.name, "live_vm");
+    }
+
+    #[tokio::test]
+    async fn delete_propagates_an_unprobable_socket_without_deleting() {
+        if std::env::consts::ARCH != "x86_64" {
+            return;
+        }
+        let (sdk, _directory, _storage, _credentials, network, runtime) = test_sdk(false);
+        let stored = start_fixture_vm(&sdk, "unprobable_vm", false, None);
+        runtime
+            .socket_errors
+            .lock()
+            .expect("socket error lock")
+            .insert(stored.record.socket_path.to_string_lossy().into_owned());
+        let error = sdk
+            .delete_microvm("unprobable_vm")
+            .await
+            .expect_err("unprobable socket should fail");
+        assert!(
+            matches!(error, SdkError::TemporaryRuntime { .. }),
+            "probe error propagates, got: {error:?}"
+        );
+        assert_eq!(
+            network.delete_cleanup_calls.load(Ordering::Relaxed),
+            0,
+            "no network release on probe failure"
+        );
+        assert!(
+            stored.record.volume_path.exists(),
+            "owned files are unchanged"
+        );
+        let still_there = sdk
+            .run_repository(|repository| repository.find_microvm("unprobable_vm"))
+            .await
+            .expect("lookup should work");
+        assert!(still_there.is_some(), "the record is unchanged");
+    }
+
+    #[tokio::test]
+    async fn delete_runs_one_deletion_sequence_for_concurrent_deletes() {
+        if std::env::consts::ARCH != "x86_64" {
+            return;
+        }
+        let (sdk, _directory, _storage, _credentials, network, _runtime) = test_sdk(false);
+        start_fixture_vm(&sdk, "shared_delete_vm", false, None);
+        let sdk = std::sync::Arc::new(sdk);
+        let first = {
+            let sdk = sdk.clone();
+            tokio::spawn(async move { sdk.delete_microvm("shared_delete_vm").await })
+        };
+        let second = {
+            let sdk = sdk.clone();
+            tokio::spawn(async move { sdk.delete_microvm("shared_delete_vm").await })
+        };
+        let (first, second) = tokio::join!(first, second);
+        let first = first.expect("first delete should join");
+        let second = second.expect("second delete should join");
+        let successes = [&first, &second]
+            .iter()
+            .filter(|result| result.is_ok())
+            .count();
+        assert_eq!(
+            successes, 1,
+            "exactly one delete wins; the loser sees NotFound, got: {first:?} / {second:?}"
+        );
+        for result in [&first, &second] {
+            match result {
+                Ok(deleted) => assert_eq!(deleted.name, "shared_delete_vm"),
+                Err(SdkError::NotFound { kind, id }) => {
+                    assert_eq!(kind, "MicroVM");
+                    assert_eq!(id, "shared_delete_vm");
+                }
+                Err(other) => panic!("unexpected concurrent outcome: {other:?}"),
+            }
+        }
+        assert_eq!(
+            network.delete_cleanup_calls.load(Ordering::Relaxed),
+            1,
+            "one deletion sequence releases the network once"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_skips_absent_network_items_and_keeps_the_record_on_failure() {
+        if std::env::consts::ARCH != "x86_64" {
+            return;
+        }
+        let (sdk, _directory, _storage, _credentials, network, _runtime) = test_sdk(false);
+        start_fixture_vm(&sdk, "flaky_net_vm", false, None);
+        network
+            .delete_cleanup_results
+            .lock()
+            .expect("delete cleanup lock")
+            .push(Err("injected release failure".to_owned()));
+        let error = sdk
+            .delete_microvm("flaky_net_vm")
+            .await
+            .expect_err("unreleasable network should fail");
+        assert!(
+            matches!(error, SdkError::Network { .. }),
+            "present-but-unreleasable item is typed, got: {error:?}"
+        );
+        let still_there = sdk
+            .run_repository(|repository| repository.find_microvm("flaky_net_vm"))
+            .await
+            .expect("lookup should work");
+        assert!(still_there.is_some(), "the record is kept for retry");
+        assert!(
+            still_there
+                .expect("record should exist")
+                .record
+                .volume_path
+                .exists(),
+            "the volume is untouched when network release fails first"
+        );
+        let deleted = sdk
+            .delete_microvm("flaky_net_vm")
+            .await
+            .expect("retry should converge");
+        assert_eq!(deleted.name, "flaky_net_vm");
+        assert_eq!(
+            network.delete_cleanup_calls.load(Ordering::Relaxed),
+            2,
+            "retry releases the network again"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_scopes_network_release_to_exactly_this_vm() {
+        if std::env::consts::ARCH != "x86_64" {
+            return;
+        }
+        let (sdk, _directory, _storage, _credentials, network, _runtime) = test_sdk(false);
+        start_fixture_vm(&sdk, "netted_first_vm", false, None);
+        let survivor = start_fixture_vm(&sdk, "netted_second_vm", false, None);
+        let deleted = sdk
+            .delete_microvm("netted_first_vm")
+            .await
+            .expect("first VM should delete");
+        assert_eq!(deleted.name, "netted_first_vm");
+        assert_eq!(
+            network.delete_cleanup_calls.load(Ordering::Relaxed),
+            1,
+            "only the deleted VM releases its network"
+        );
+        let survivor_still_there = sdk
+            .run_repository(|repository| repository.find_microvm("netted_second_vm"))
+            .await
+            .expect("lookup should work");
+        let survivor_still_there = survivor_still_there.expect("surviving VM record is intact");
+        assert!(
+            survivor_still_there.network.is_some(),
+            "surviving VM keeps its network attachment"
+        );
+        assert!(
+            survivor.record.volume_path.join("rootfs.ext4").is_file(),
+            "surviving VM keeps its files"
         );
     }
 }

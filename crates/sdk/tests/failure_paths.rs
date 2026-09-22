@@ -438,3 +438,56 @@ async fn prune_rejects_an_invalid_home_without_deleting_anything() {
     let missing = MicroVmSdk::new(home.path().join("missing").join("..").join(""));
     assert!(missing.is_err());
 }
+
+#[tokio::test]
+async fn delete_rejects_unknown_and_invalid_names_without_host_changes() {
+    use taumaru_microvm::{MicroVmSdk, SdkError};
+
+    let home = tempdir().expect("temporary SDK home should be created");
+    let sdk = MicroVmSdk::new(home.path()).expect("SDK construction should work");
+    let unknown = sdk.delete_microvm("ghost_vm").await;
+    assert!(
+        matches!(unknown, Err(SdkError::NotFound { kind, id }) if kind == "MicroVM" && id == "ghost_vm")
+    );
+    let invalid = sdk.delete_microvm("bad name").await;
+    assert!(matches!(invalid, Err(SdkError::InvalidRequest { .. })));
+    assert!(
+        std::fs::read_dir(home.path().join("vms"))
+            .expect("managed VM directory should exist")
+            .next()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn delete_leaves_preflight_failures_silent_without_new_files() {
+    use taumaru_microvm::{MicroVmSdk, SdkError};
+
+    let home = tempdir().expect("temporary SDK home should be created");
+    let sdk = MicroVmSdk::new(home.path()).expect("SDK construction should work");
+    let error = sdk
+        .delete_microvm("ghost_vm")
+        .await
+        .expect_err("unknown VM should fail");
+    assert!(matches!(error, SdkError::NotFound { .. }));
+}
+
+#[tokio::test]
+async fn delete_validates_names_before_any_host_mutation() {
+    use taumaru_microvm::{MicroVmSdk, SdkError};
+
+    let home = tempdir().expect("temporary SDK home should be created");
+    let sdk = MicroVmSdk::new(home.path()).expect("SDK construction should work");
+    let invalid = sdk.delete_microvm("not path friendly").await;
+    assert!(matches!(invalid, Err(SdkError::InvalidRequest { field, .. }) if field == "name"));
+    let missing = sdk.delete_microvm("missing_vm").await;
+    assert!(
+        matches!(missing, Err(SdkError::NotFound { kind, id }) if kind == "MicroVM" && id == "missing_vm")
+    );
+    assert!(
+        std::fs::read_dir(home.path().join("vms"))
+            .expect("managed VM directory should exist")
+            .next()
+            .is_none()
+    );
+}

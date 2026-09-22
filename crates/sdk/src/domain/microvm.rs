@@ -212,6 +212,20 @@ pub struct MicroVmStopResult {
     pub forced: bool,
 }
 
+/// Result returned by [`crate::MicroVmSdk::delete_microvm`].
+///
+/// The operation takes only the VM name: the volume directory and every
+/// owned reference are read from the inventory record, never from the
+/// caller. On success the inventory record is gone, the whole volume
+/// directory is gone, and the VM's owned host network items are released,
+/// while shared kernels, distribution images, tool binaries, and other VMs
+/// are fully intact. Failures surface as typed errors with no result.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MicroVmDeleteResult {
+    /// Stable identifier of the deleted VM.
+    pub name: String,
+}
+
 /// Read-only inventory snapshot of one persisted MicroVM.
 ///
 /// Returned by [`crate::MicroVmSdk::list_microvms`] for selectors and listing
