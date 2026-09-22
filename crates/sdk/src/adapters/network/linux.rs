@@ -1786,6 +1786,9 @@ fn delete_host_route_if_present(tap: &str, lan: Ipv4Addr) -> Result<(), SdkError
         &["-4", "route", "show", &format!("{lan}/32"), "dev", tap],
     )?;
     if !output.status.success() {
+        if is_device_missing(&output) {
+            return Ok(());
+        }
         return Err(host_command_error(
             "ip",
             &["-4", "route", "show", &format!("{lan}/32"), "dev", tap],
@@ -1801,10 +1804,16 @@ fn delete_host_route_if_present(tap: &str, lan: Ipv4Addr) -> Result<(), SdkError
     match run_ip(&["route", "del", &format!("{lan}/32"), "dev", tap]) {
         Ok(()) => Ok(()),
         Err(primary) => {
+            if primary_device_is_missing(&primary) {
+                return Ok(());
+            }
             let output = command_output(
                 "ip",
                 &["-4", "route", "show", &format!("{lan}/32"), "dev", tap],
             )?;
+            if is_device_missing(&output) {
+                return Ok(());
+            }
             if output.status.success()
                 && !String::from_utf8_lossy(&output.stdout)
                     .lines()
@@ -1822,6 +1831,9 @@ fn delete_host_route_if_present(tap: &str, lan: Ipv4Addr) -> Result<(), SdkError
 fn delete_proxy_entry_if_present(uplink: &str, lan: Ipv4Addr) -> Result<(), SdkError> {
     let output = command_output("ip", &["neigh", "show", "proxy", "dev", uplink])?;
     if !output.status.success() {
+        if is_device_missing(&output) {
+            return Ok(());
+        }
         return Err(host_command_error(
             "ip",
             &["neigh", "show", "proxy", "dev", uplink],
@@ -1837,7 +1849,13 @@ fn delete_proxy_entry_if_present(uplink: &str, lan: Ipv4Addr) -> Result<(), SdkE
     match run_ip(&["neigh", "del", "proxy", &lan.to_string(), "dev", uplink]) {
         Ok(()) => Ok(()),
         Err(primary) => {
+            if primary_device_is_missing(&primary) {
+                return Ok(());
+            }
             let output = command_output("ip", &["neigh", "show", "proxy", "dev", uplink])?;
+            if is_device_missing(&output) {
+                return Ok(());
+            }
             if output.status.success()
                 && !String::from_utf8_lossy(&output.stdout)
                     .lines()
@@ -1997,9 +2015,27 @@ fn link_output(name: &str) -> Result<Option<String>, SdkError> {
     }
 }
 
+/// Reports whether a failed `ip` deletion already implies the device is gone.
+fn primary_device_is_missing(error: &SdkError) -> bool {
+    let SdkError::HostCommand { reason, .. } = error else {
+        return false;
+    };
+    reason.contains("Cannot find device") && !is_privilege_denied(reason)
+}
+
 fn is_link_missing(output: &std::process::Output) -> bool {
     let stderr = command_stderr(output);
     stderr.contains("does not exist") && !is_privilege_denied(&stderr)
+}
+
+/// Reports whether an `ip` failure means the queried device is gone.
+///
+/// A route or proxy-neighbour entry bound to a missing device cannot exist,
+/// so the delete path treats this as converged rather than failed. Anything
+/// else — including privilege errors — stays a real failure.
+fn is_device_missing(output: &std::process::Output) -> bool {
+    let stderr = command_stderr(output);
+    stderr.contains("Cannot find device") && !is_privilege_denied(&stderr)
 }
 
 fn link_is_tap(name: &str) -> Result<bool, SdkError> {
@@ -2099,8 +2135,9 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr};
 
     use super::{
-        GUEST_INTERFACE, allocate_subnet, automatic_lan_candidates, guest_mac, is_privilege_denied,
-        parse_uplink_cidr, tap_name, validate_lan_candidate,
+        GUEST_INTERFACE, allocate_subnet, automatic_lan_candidates, guest_mac, is_device_missing,
+        is_privilege_denied, parse_uplink_cidr, primary_device_is_missing, tap_name,
+        validate_lan_candidate,
     };
 
     #[test]
@@ -2210,6 +2247,32 @@ mod tests {
         ));
         assert!(is_privilege_denied("sysctl: permission denied on key"));
         assert!(!is_privilege_denied("Device does not exist"));
+    }
+
+    #[test]
+    fn missing_device_counts_as_converged_without_hiding_denied_rights() {
+        use std::os::unix::process::ExitStatusExt;
+        use std::process::Output;
+
+        let missing = Output {
+            status: ExitStatusExt::from_raw(0x100),
+            stdout: Vec::new(),
+            stderr: b"Cannot find device \"tm-f76d0b8f\"".to_vec(),
+        };
+        assert!(is_device_missing(&missing));
+        assert!(primary_device_is_missing(
+            &crate::error::SdkError::HostCommand {
+                program: "ip".to_owned(),
+                reason: "host command ip failed: Cannot find device \"tm-f76d0b8f\"".to_owned(),
+            }
+        ));
+
+        let denied = Output {
+            status: ExitStatusExt::from_raw(0x100),
+            stdout: Vec::new(),
+            stderr: b"Cannot find device \"tm-x\"; Operation not permitted".to_vec(),
+        };
+        assert!(!is_device_missing(&denied));
     }
 
     #[test]
