@@ -92,6 +92,30 @@ fn non_interactive_download_rejects_incomplete_selection_without_prompting() {
 }
 
 #[test]
+fn non_interactive_download_without_root_reports_privilege_error() {
+    let home = tempfile::tempdir().expect("temporary home should be created");
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_microvm"))
+        .args([
+            "artifacts",
+            "download",
+            "--non-interactive",
+            "--image",
+            "distro-a=image-a",
+        ])
+        .env("TAUMARU_HOME", home.path())
+        .env_remove("TAUMARU_ESCALATED")
+        .output()
+        .expect("failed to execute microvm");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    if unsafe { libc_geteuid() } == 0 {
+        return;
+    }
+    assert!(!output.status.success());
+    assert!(stderr.to_ascii_lowercase().contains("elevated rights"));
+}
+
+#[test]
 fn new_help_exposes_creation_options_without_lifecycle_flags() {
     let output = run_microvm(&["new", "--help"]);
     let stdout = String::from_utf8_lossy(&output.stdout);

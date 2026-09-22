@@ -1,10 +1,10 @@
-use std::collections::{BTreeMap, HashSet};
-use std::fmt;
-use std::io;
-
 use inquire::ui::{Color, RenderConfig, StyleSheet, Styled};
 use inquire::{Confirm, InquireError, MultiSelect};
 use semver::Version;
+use std::collections::{BTreeMap, HashSet};
+use std::ffi::OsString;
+use std::fmt;
+use std::io;
 use taumaru_microvm::{
     Architecture, BinaryPackage, Distribution, DistributionImage, DownloadCancellation,
     DownloadProgress, DownloadedBinary, DownloadedDistributionImage, DownloadedKernel, Kernel,
@@ -1148,6 +1148,18 @@ pub(crate) fn prompt_error(error: InquireError) -> CliError {
     }
 }
 
+pub(crate) fn escalated_child_command(images: &[String], non_interactive: bool) -> Vec<OsString> {
+    let mut command = vec![OsString::from("artifacts"), OsString::from("download")];
+    if non_interactive {
+        command.push(OsString::from("--non-interactive"));
+    }
+    for image in images {
+        command.push(OsString::from("--image"));
+        command.push(OsString::from(image));
+    }
+    command
+}
+
 pub(crate) async fn run(context: &CliContext, arguments: DownloadArgs) -> Result<u8, CliError> {
     let explicit = arguments.non_interactive || !arguments.images.is_empty();
     if !explicit && !context.terminal.interactive {
@@ -1159,6 +1171,21 @@ pub(crate) async fn run(context: &CliContext, arguments: DownloadArgs) -> Result
         return Err(CliError::Validation(
             "--non-interactive requires at least one --image DISTRIBUTION_ID=IMAGE_ID".to_owned(),
         ));
+    }
+    if arguments.non_interactive {
+        if let Some(exit) = crate::privilege::require_privileged(
+            &crate::privilege::SystemPrivilege,
+            context.terminal,
+            true,
+            crate::context::resolve_home().ok(),
+            &[],
+            Vec::new(),
+            "Run the same command with sudo or as root",
+        )
+        .await?
+        {
+            return Ok(exit);
+        }
     }
 
     let client = SdkArtifactClient::new(&context.sdk);
@@ -1194,6 +1221,27 @@ pub(crate) async fn run(context: &CliContext, arguments: DownloadArgs) -> Result
         }
     }
 
+    if !arguments.non_interactive {
+        let selected_images: Vec<String> = plan
+            .selections
+            .iter()
+            .map(|selection| format!("{}={}", selection.distribution.id, selection.image.id))
+            .collect();
+        let home = crate::context::resolve_home().ok();
+        if let Some(exit) = crate::privilege::require_privileged(
+            &crate::privilege::SystemPrivilege,
+            context.terminal,
+            false,
+            home,
+            &[],
+            escalated_child_command(&selected_images, true),
+            "Run the same command with sudo or as root",
+        )
+        .await?
+        {
+            return Ok(exit);
+        }
+    }
     let cancellation = DownloadCancellation::new();
     let mut renderer =
         crate::output::human::ProgressRenderer::new(plan.expected_bytes, context.terminal);
@@ -2132,5 +2180,29 @@ mod tests {
         assert_eq!(view.aggregate_expected_bytes, 180);
         assert_eq!(view.plan_total_bytes, 1_000);
         assert_eq!(view.phase, DownloadPhase::Downloading);
+    }
+
+    #[test]
+    fn escalated_child_replays_image_selection_non_interactively() {
+        let command = super::escalated_child_command(
+            &["distro-a=image-a".to_owned(), "distro-a=image-b".to_owned()],
+            true,
+        );
+        let rendered: Vec<String> = command
+            .iter()
+            .map(|part| part.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            rendered,
+            [
+                "artifacts",
+                "download",
+                "--non-interactive",
+                "--image",
+                "distro-a=image-a",
+                "--image",
+                "distro-a=image-b"
+            ]
+        );
     }
 }
