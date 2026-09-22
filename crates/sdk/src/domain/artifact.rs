@@ -161,6 +161,58 @@ pub struct DownloadedDistributionImage {
     /// Verified local image file.
     pub file: DownloadedFile,
 }
+/// Identity of one pruned distribution image.
+///
+/// The pair identifies one distribution image: the owning distribution registry
+/// ID together with the image registry ID within that distribution.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PrunedImageId {
+    /// Owning distribution registry ID.
+    pub distribution_id: String,
+    /// Image registry ID within its distribution.
+    pub image_id: String,
+}
+
+/// Outcome of a successful prune run: removed identities plus reclaimed bytes.
+///
+/// `removed_kernels` holds kernel registry IDs in ascending order and
+/// `removed_images` holds distribution image identities ordered by distribution
+/// then image, including reclaimed orphan records of each kind.
+/// `skipped_artifact_keys` holds the stable artifact keys left untouched because
+/// of an actively in-progress transfer, in ascending order. Removal counts are
+/// the lengths of the removed vecs. Byte counters use filesystem-observed sizes,
+/// so stale records (row present, file already absent) appear in the removed
+/// lists while contributing zero bytes. A no-op success returns empty vecs with
+/// zero counters, and repeating a prune with no intervening changes reports zero
+/// further removals.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PruneSummary {
+    /// Pruned kernel registry IDs, ascending.
+    pub removed_kernels: Vec<String>,
+    /// Pruned distribution images, ordered by distribution then image.
+    pub removed_images: Vec<PrunedImageId>,
+    /// Artifact keys skipped because of an active transfer, ascending.
+    pub skipped_artifact_keys: Vec<String>,
+    /// Reclaimed bytes from removed kernels.
+    pub freed_bytes_kernels: u64,
+    /// Reclaimed bytes from removed images.
+    pub freed_bytes_images: u64,
+    /// Checked sum of the two per-kind counters.
+    pub freed_bytes_total: u64,
+}
+
+/// One prune candidate that could not be reclaimed.
+///
+/// Surfaced inside the typed prune-incomplete error together with the partial
+/// summary, so the caller can repair the cause and retry without losing the
+/// record of what was already removed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PruneFailure {
+    /// Stable artifact key identifying the failed candidate.
+    pub artifact_key: String,
+    /// English cause; never key material or guest data.
+    pub reason: String,
+}
 
 /// Metadata for a verified runtime binary resolved from local inventory.
 #[derive(Clone, Debug)]

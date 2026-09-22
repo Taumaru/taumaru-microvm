@@ -145,3 +145,40 @@ async fn start_validates_names_and_reports_unknown_vms_as_typed_errors() {
         matches!(missing, Err(SdkError::NotFound { kind, id }) if kind == "MicroVM" && id == "missing_vm")
     );
 }
+
+#[test]
+fn prune_types_are_exported_with_ordered_summary_shape() {
+    use taumaru_microvm::{PruneFailure, PruneSummary, PrunedImageId, SdkError};
+    let _ = std::mem::size_of::<PruneSummary>();
+    let _ = std::mem::size_of::<PrunedImageId>();
+    let _ = std::mem::size_of::<PruneFailure>();
+    let summary = PruneSummary {
+        removed_kernels: vec!["kernel-b".to_owned(), "kernel-a".to_owned()],
+        removed_images: vec![
+            PrunedImageId {
+                distribution_id: "distro".to_owned(),
+                image_id: "image-b".to_owned(),
+            },
+            PrunedImageId {
+                distribution_id: "distro".to_owned(),
+                image_id: "image-a".to_owned(),
+            },
+        ],
+        skipped_artifact_keys: vec!["kernel:skipped".to_owned()],
+        freed_bytes_kernels: 10,
+        freed_bytes_images: 20,
+        freed_bytes_total: 30,
+    };
+    assert_eq!(summary.removed_kernels.len(), 2);
+    assert_eq!(summary.removed_images.len(), 1 + 1);
+    assert_eq!(summary.freed_bytes_total, 30);
+    let error = SdkError::PruneIncomplete {
+        summary,
+        failures: vec![PruneFailure {
+            artifact_key: "kernel:failed".to_owned(),
+            reason: "the recorded path is not a regular file".to_owned(),
+        }],
+    };
+    assert!(matches!(error, SdkError::PruneIncomplete { .. }));
+    assert!(error.to_string().contains("kernel:failed"));
+}

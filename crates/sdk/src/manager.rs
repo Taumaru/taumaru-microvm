@@ -20,7 +20,7 @@ use crate::domain::artifact::{
     ArtifactKind, DownloadCancellation, DownloadDisposition, DownloadPhase, DownloadProgress,
     DownloadSpec, DownloadedBinary, DownloadedDistribution, DownloadedDistributionImage,
     DownloadedFile, DownloadedKernel, FileIntegrity, InstalledBinary, ProgressTracker,
-    is_valid_sha256, validate_registry_path,
+    PruneFailure, PruneSummary, PrunedImageId, is_valid_sha256, validate_registry_path,
 };
 use crate::domain::config::minimum_memory_bytes;
 use crate::domain::lifecycle::{MicroVmState, NetworkMode};
@@ -55,6 +55,69 @@ pub(crate) enum CacheDecision {
     Replace,
     Adopt,
     Skip,
+}
+
+/// Internal outcome of guarding, locking, and deleting one prune file.
+/// `Skipped` means the per-target lock is held by an in-progress transfer, so
+/// the candidate is recorded in the skipped list untouched. `Absent` means no
+/// file exists, so the caller drops the stale row at zero bytes. `Failure`
+/// carries an English reason with the row kept. `Removed` carries the
+/// filesystem-observed size for byte accounting.
+enum PruneFileOutcome {
+    /// The candidate is actively transferring; leave it untouched.
+    Skipped,
+    /// No file exists; drop the stale row at zero bytes.
+    Absent,
+    /// The candidate could not be reclaimed; the row is kept.
+    Failure(String),
+    /// The regular file was deleted; accounts these bytes.
+    Removed {
+        /// Filesystem-observed size at deletion time.
+        freed_bytes: u64,
+    },
+}
+
+async fn delete_prune_file(
+    sdk: &MicroVmSdk,
+    absolute_path: &Path,
+    artifact_key: &str,
+) -> PruneFileOutcome {
+    if !path_is_below_home(&sdk.home, absolute_path) {
+        return PruneFileOutcome::Failure(format!(
+            "the recorded path for {artifact_key} escapes the SDK home"
+        ));
+    }
+    let lock = match sdk.target_lock(absolute_path) {
+        Ok(lock) => lock,
+        Err(error) => return PruneFileOutcome::Failure(error.to_string()),
+    };
+    let _guard = match lock.try_lock() {
+        Ok(guard) => guard,
+        Err(_) => return PruneFileOutcome::Skipped,
+    };
+    let metadata = match async_fs::symlink_metadata(absolute_path).await {
+        Ok(metadata) => metadata,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            return PruneFileOutcome::Absent;
+        }
+        Err(source) => {
+            return PruneFileOutcome::Failure(
+                SdkError::filesystem("inspect prune candidate", absolute_path, source).to_string(),
+            );
+        }
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return PruneFileOutcome::Failure(format!(
+            "the recorded path for {artifact_key} is not a regular file"
+        ));
+    }
+    let freed_bytes = metadata.len();
+    if let Err(source) = async_fs::remove_file(absolute_path).await {
+        return PruneFileOutcome::Failure(
+            SdkError::filesystem("remove unused artifact", absolute_path, source).to_string(),
+        );
+    }
+    PruneFileOutcome::Removed { freed_bytes }
 }
 
 fn target_is_reusable_file(file_type: std::fs::FileType, is_file: bool) -> bool {
@@ -1318,6 +1381,324 @@ impl MicroVmSdk {
             reason: "the machine is still running after forced termination".to_owned(),
             stopped: false,
         })
+    }
+
+    /// Deletes downloaded kernels and images no existing MicroVM references.
+    ///
+    /// The operation scans the whole SDK home: it enumerates recorded kernel
+    /// and image downloads (including orphan records with no member row),
+    /// builds the referenced set from every `microvms` row regardless of
+    /// lifecycle state, skips artifacts with an actively in-progress transfer
+    /// into a separate skipped list, and deletes the rest file-first then
+    /// rows. Referenced artifacts are never touched and appear in no list.
+    /// Repeating a prune with no intervening changes reports zero removals.
+    /// When one or more deletions fail, the operation continues with the
+    /// remaining candidates and returns `SdkError::PruneIncomplete` carrying
+    /// the partial summary plus per-artifact causes. The operation never
+    /// contacts the registry, emits no progress, and writes nothing to
+    /// standard output or error.
+    pub async fn prune_unused_artifacts(&self) -> Result<PruneSummary, SdkError> {
+        let kernels = self
+            .run_repository(|repository| repository.list_prunable_kernels())
+            .await?;
+        let images = self
+            .run_repository(|repository| repository.list_prunable_images())
+            .await?;
+        let orphans = self
+            .run_repository(|repository| repository.list_orphan_artifact_downloads())
+            .await?;
+        let references = self
+            .run_repository(|repository| repository.list_prune_references())
+            .await?;
+        let mut summary = PruneSummary {
+            removed_kernels: Vec::new(),
+            removed_images: Vec::new(),
+            skipped_artifact_keys: Vec::new(),
+            freed_bytes_kernels: 0,
+            freed_bytes_images: 0,
+            freed_bytes_total: 0,
+        };
+        let mut failures = Vec::new();
+        for kernel in &kernels {
+            if references.kernel_referenced(&kernel.registry_id) {
+                continue;
+            }
+            self.prune_kernel_candidate(kernel, &mut summary, &mut failures)
+                .await;
+        }
+        for image in &images {
+            if references.image_referenced(&image.distribution_id, &image.image_id) {
+                continue;
+            }
+            self.prune_image_candidate(image, &mut summary, &mut failures)
+                .await;
+        }
+        for orphan in &orphans {
+            self.prune_orphan_candidate(orphan, &references, &mut summary, &mut failures)
+                .await;
+        }
+        summary.removed_kernels.sort();
+        summary.removed_images.sort_by(|first, second| {
+            (&first.distribution_id, &first.image_id)
+                .cmp(&(&second.distribution_id, &second.image_id))
+        });
+        summary.skipped_artifact_keys.sort();
+        summary.freed_bytes_total = summary
+            .freed_bytes_kernels
+            .checked_add(summary.freed_bytes_images)
+            .ok_or_else(|| {
+                SdkError::invalid_metadata("prune summary", "reclaimed bytes exceed u64 range")
+            })?;
+        if failures.is_empty() {
+            Ok(summary)
+        } else {
+            Err(SdkError::PruneIncomplete { summary, failures })
+        }
+    }
+
+    async fn prune_kernel_candidate(
+        &self,
+        kernel: &crate::ports::repository::PrunableKernel,
+        summary: &mut PruneSummary,
+        failures: &mut Vec<PruneFailure>,
+    ) {
+        let artifact_key = format!("kernel:{}", kernel.registry_id);
+        match delete_prune_file(self, &kernel.absolute_path, &artifact_key).await {
+            PruneFileOutcome::Skipped => {
+                summary.skipped_artifact_keys.push(artifact_key);
+            }
+            PruneFileOutcome::Failure(reason) => {
+                failures.push(PruneFailure {
+                    artifact_key,
+                    reason,
+                });
+            }
+            PruneFileOutcome::Absent => {
+                let kernel_id = kernel.registry_id.clone();
+                match self
+                    .run_repository(move |repository| {
+                        repository.delete_kernel_if_unreferenced(&kernel_id)
+                    })
+                    .await
+                {
+                    Ok(true) => summary.removed_kernels.push(kernel.registry_id.clone()),
+                    Ok(false) => {}
+                    Err(error) => failures.push(PruneFailure {
+                        artifact_key,
+                        reason: error.to_string(),
+                    }),
+                }
+            }
+            PruneFileOutcome::Removed { freed_bytes } => {
+                let kernel_id = kernel.registry_id.clone();
+                match self
+                    .run_repository(move |repository| {
+                        repository.delete_kernel_if_unreferenced(&kernel_id)
+                    })
+                    .await
+                {
+                    Ok(true) => {
+                        summary.removed_kernels.push(kernel.registry_id.clone());
+                        summary.freed_bytes_kernels =
+                            summary.freed_bytes_kernels.saturating_add(freed_bytes);
+                    }
+                    Ok(false) => {
+                        failures.push(PruneFailure {
+                            artifact_key,
+                            reason:
+                                "the artifact became referenced before its rows could be removed"
+                                    .to_owned(),
+                        });
+                    }
+                    Err(error) => failures.push(PruneFailure {
+                        artifact_key,
+                        reason: error.to_string(),
+                    }),
+                }
+            }
+        }
+    }
+
+    async fn prune_image_candidate(
+        &self,
+        image: &crate::ports::repository::PrunableImage,
+        summary: &mut PruneSummary,
+        failures: &mut Vec<PruneFailure>,
+    ) {
+        let artifact_key = format!(
+            "distribution_image:{}:{}",
+            image.distribution_id, image.image_id
+        );
+        match delete_prune_file(self, &image.absolute_path, &artifact_key).await {
+            PruneFileOutcome::Skipped => {
+                summary.skipped_artifact_keys.push(artifact_key);
+            }
+            PruneFileOutcome::Failure(reason) => {
+                failures.push(PruneFailure {
+                    artifact_key,
+                    reason,
+                });
+            }
+            PruneFileOutcome::Absent => {
+                let distribution_id = image.distribution_id.clone();
+                let image_id = image.image_id.clone();
+                match self
+                    .run_repository(move |repository| {
+                        repository.delete_image_if_unreferenced(&distribution_id, &image_id)
+                    })
+                    .await
+                {
+                    Ok(true) => summary.removed_images.push(PrunedImageId {
+                        distribution_id: image.distribution_id.clone(),
+                        image_id: image.image_id.clone(),
+                    }),
+                    Ok(false) => {}
+                    Err(error) => failures.push(PruneFailure {
+                        artifact_key,
+                        reason: error.to_string(),
+                    }),
+                }
+            }
+            PruneFileOutcome::Removed { freed_bytes } => {
+                let distribution_id = image.distribution_id.clone();
+                let image_id = image.image_id.clone();
+                match self
+                    .run_repository(move |repository| {
+                        repository.delete_image_if_unreferenced(&distribution_id, &image_id)
+                    })
+                    .await
+                {
+                    Ok(true) => {
+                        summary.removed_images.push(PrunedImageId {
+                            distribution_id: image.distribution_id.clone(),
+                            image_id: image.image_id.clone(),
+                        });
+                        summary.freed_bytes_images =
+                            summary.freed_bytes_images.saturating_add(freed_bytes);
+                    }
+                    Ok(false) => {
+                        failures.push(PruneFailure {
+                            artifact_key,
+                            reason:
+                                "the artifact became referenced before its rows could be removed"
+                                    .to_owned(),
+                        });
+                    }
+                    Err(error) => failures.push(PruneFailure {
+                        artifact_key,
+                        reason: error.to_string(),
+                    }),
+                }
+            }
+        }
+    }
+
+    async fn prune_orphan_candidate(
+        &self,
+        orphan: &crate::ports::repository::OrphanArtifactDownload,
+        references: &crate::ports::repository::PruneReferences,
+        summary: &mut PruneSummary,
+        failures: &mut Vec<PruneFailure>,
+    ) {
+        let artifact_key = orphan.artifact_key.clone();
+        let Some(identity) = orphan.parse_identity() else {
+            failures.push(PruneFailure {
+                artifact_key,
+                reason: "the orphan artifact key does not match its recorded artifact type"
+                    .to_owned(),
+            });
+            return;
+        };
+        let referenced = match &identity {
+            crate::ports::repository::OrphanIdentity::Kernel { kernel_id } => {
+                references.kernel_referenced(kernel_id)
+            }
+            crate::ports::repository::OrphanIdentity::DistributionImage {
+                distribution_id,
+                image_id,
+            } => references.image_referenced(distribution_id, image_id),
+        };
+        if referenced {
+            return;
+        }
+        match delete_prune_file(self, &orphan.absolute_path, &artifact_key).await {
+            PruneFileOutcome::Skipped => {
+                summary.skipped_artifact_keys.push(artifact_key);
+            }
+            PruneFileOutcome::Failure(reason) => {
+                failures.push(PruneFailure {
+                    artifact_key,
+                    reason,
+                });
+            }
+            PruneFileOutcome::Absent => {
+                let key = artifact_key.clone();
+                match self
+                    .run_repository(move |repository| {
+                        repository.delete_orphan_download_if_unreferenced(&key)
+                    })
+                    .await
+                {
+                    Ok(true) => match identity {
+                        crate::ports::repository::OrphanIdentity::Kernel { kernel_id } => {
+                            summary.removed_kernels.push(kernel_id);
+                        }
+                        crate::ports::repository::OrphanIdentity::DistributionImage {
+                            distribution_id,
+                            image_id,
+                        } => summary.removed_images.push(PrunedImageId {
+                            distribution_id,
+                            image_id,
+                        }),
+                    },
+                    Ok(false) => {}
+                    Err(error) => failures.push(PruneFailure {
+                        artifact_key,
+                        reason: error.to_string(),
+                    }),
+                }
+            }
+            PruneFileOutcome::Removed { freed_bytes } => {
+                let key = artifact_key.clone();
+                match self
+                    .run_repository(move |repository| {
+                        repository.delete_orphan_download_if_unreferenced(&key)
+                    })
+                    .await
+                {
+                    Ok(true) => match identity {
+                        crate::ports::repository::OrphanIdentity::Kernel { kernel_id } => {
+                            summary.removed_kernels.push(kernel_id);
+                            summary.freed_bytes_kernels =
+                                summary.freed_bytes_kernels.saturating_add(freed_bytes);
+                        }
+                        crate::ports::repository::OrphanIdentity::DistributionImage {
+                            distribution_id,
+                            image_id,
+                        } => {
+                            summary.removed_images.push(PrunedImageId {
+                                distribution_id,
+                                image_id,
+                            });
+                            summary.freed_bytes_images =
+                                summary.freed_bytes_images.saturating_add(freed_bytes);
+                        }
+                    },
+                    Ok(false) => {
+                        failures.push(PruneFailure {
+                            artifact_key,
+                            reason:
+                                "the artifact became referenced before its rows could be removed"
+                                    .to_owned(),
+                        });
+                    }
+                    Err(error) => failures.push(PruneFailure {
+                        artifact_key,
+                        reason: error.to_string(),
+                    }),
+                }
+            }
+        }
     }
 
     fn socket_answers(&self, socket_path: &Path) -> Result<bool, SdkError> {
@@ -6451,6 +6832,36 @@ mod tests {
                 .expect("terminate lock")
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn prune_skips_a_candidate_whose_target_lock_is_held() {
+        let (sdk, _directory, _storage, _credentials, _network, _runtime) = test_sdk(false);
+        let kernel_id = "linux-test-x86_64".to_owned();
+        let target = sdk.home.join("artifacts/kernels/linux-test-x86_64/vmlinux");
+        assert!(target.is_file());
+        let held = sdk
+            .target_lock(&target)
+            .expect("prune target lock should resolve");
+        let _guard = held.lock().await;
+        let summary = sdk
+            .prune_unused_artifacts()
+            .await
+            .expect("prune with a held lock should succeed");
+        assert_eq!(
+            summary.skipped_artifact_keys,
+            vec!["kernel:linux-test-x86_64".to_owned()]
+        );
+        assert!(summary.removed_kernels.is_empty());
+        assert!(target.is_file());
+        drop(_guard);
+        let summary = sdk
+            .prune_unused_artifacts()
+            .await
+            .expect("prune after releasing the lock should succeed");
+        assert!(summary.skipped_artifact_keys.is_empty());
+        assert_eq!(summary.removed_kernels, vec![kernel_id]);
+        assert!(!target.exists());
     }
 
     #[tokio::test]

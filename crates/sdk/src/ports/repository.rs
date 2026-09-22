@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
@@ -66,6 +67,23 @@ pub(crate) trait ArtifactRepository: Send + Sync {
 
     #[allow(dead_code)]
     fn list_installed_binaries(&self) -> Result<Vec<InstalledBinary>, SdkError>;
+
+    fn list_prune_references(&self) -> Result<PruneReferences, SdkError>;
+
+    fn list_prunable_kernels(&self) -> Result<Vec<PrunableKernel>, SdkError>;
+
+    fn list_prunable_images(&self) -> Result<Vec<PrunableImage>, SdkError>;
+
+    fn list_orphan_artifact_downloads(&self) -> Result<Vec<OrphanArtifactDownload>, SdkError>;
+    fn delete_kernel_if_unreferenced(&self, kernel_id: &str) -> Result<bool, SdkError>;
+
+    fn delete_image_if_unreferenced(
+        &self,
+        distribution_id: &str,
+        image_id: &str,
+    ) -> Result<bool, SdkError>;
+
+    fn delete_orphan_download_if_unreferenced(&self, artifact_key: &str) -> Result<bool, SdkError>;
 }
 
 /// A verified artifact relationship loaded from the local inventory.
@@ -74,6 +92,114 @@ pub(crate) struct LocalArtifact {
     pub path: PathBuf,
     pub size_bytes: u64,
     pub sha256: String,
+}
+
+/// The artifact references held by every existing MicroVM record.
+///
+/// Built from one light inventory read. Existence of the MicroVM row alone
+/// protects an artifact: lifecycle state, process liveness, socket
+/// responsiveness, and creation completeness never influence membership.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct PruneReferences {
+    /// Referenced kernel registry IDs.
+    pub kernels: HashSet<String>,
+    /// Referenced `(distribution_id, image_id)` pairs.
+    pub images: HashSet<(String, String)>,
+}
+
+impl PruneReferences {
+    /// Returns whether any existing MicroVM references this kernel.
+    pub(crate) fn kernel_referenced(&self, kernel_id: &str) -> bool {
+        self.kernels.contains(kernel_id)
+    }
+
+    /// Returns whether any existing MicroVM references this distribution image.
+    pub(crate) fn image_referenced(&self, distribution_id: &str, image_id: &str) -> bool {
+        self.images
+            .contains(&(distribution_id.to_owned(), image_id.to_owned()))
+    }
+}
+
+/// One recorded kernel download that may be pruned.
+#[derive(Clone, Debug)]
+pub(crate) struct PrunableKernel {
+    /// Kernel registry ID.
+    pub registry_id: String,
+    /// Recorded absolute file path.
+    pub absolute_path: PathBuf,
+}
+
+/// One recorded distribution image download that may be pruned.
+#[derive(Clone, Debug)]
+pub(crate) struct PrunableImage {
+    /// Owning distribution registry ID.
+    pub distribution_id: String,
+    /// Image registry ID within its distribution.
+    pub image_id: String,
+    /// Recorded absolute file path.
+    pub absolute_path: PathBuf,
+}
+
+/// One orphan `downloads` row of kernel or image type with no member row.
+///
+/// Orphans are the only sense in which incomplete or failed downloads exist in
+/// the schema: leftovers from a crash between the download insert and the
+/// member insert, or from a cancelled transfer that committed the download row.
+#[derive(Clone, Debug)]
+pub(crate) struct OrphanArtifactDownload {
+    /// Stable artifact key (`kernel:{id}` or `distribution_image:{dist}:{image}`).
+    pub artifact_key: String,
+    /// Inventory artifact type (`kernel` or `distribution_image`).
+    pub artifact_type: String,
+    /// Recorded absolute file path.
+    pub absolute_path: PathBuf,
+}
+
+/// The prune identity recovered from an orphan artifact key.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum OrphanIdentity {
+    /// A kernel orphan with its registry ID.
+    Kernel {
+        /// Kernel registry ID.
+        kernel_id: String,
+    },
+    /// A distribution image orphan with its owning distribution and image IDs.
+    DistributionImage {
+        /// Owning distribution registry ID.
+        distribution_id: String,
+        /// Image registry ID within its distribution.
+        image_id: String,
+    },
+}
+
+impl OrphanArtifactDownload {
+    /// Recovers the prune identity from the stable artifact key.
+    ///
+    /// Returns `None` when the key does not match the recorded artifact type.
+    /// Unparseable orphans are never deleted; they become failure entries.
+    pub(crate) fn parse_identity(&self) -> Option<OrphanIdentity> {
+        if self.artifact_type == "kernel" {
+            let kernel_id = self.artifact_key.strip_prefix("kernel:")?;
+            if kernel_id.is_empty() {
+                return None;
+            }
+            Some(OrphanIdentity::Kernel {
+                kernel_id: kernel_id.to_owned(),
+            })
+        } else if self.artifact_type == "distribution_image" {
+            let rest = self.artifact_key.strip_prefix("distribution_image:")?;
+            let (distribution_id, image_id) = rest.split_once(':')?;
+            if distribution_id.is_empty() || image_id.is_empty() {
+                return None;
+            }
+            Some(OrphanIdentity::DistributionImage {
+                distribution_id: distribution_id.to_owned(),
+                image_id: image_id.to_owned(),
+            })
+        } else {
+            None
+        }
+    }
 }
 
 /// Durable VM state and its child records loaded from SQLite.

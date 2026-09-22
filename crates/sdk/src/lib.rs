@@ -14,7 +14,8 @@ pub use domain::{
     Distribution, DistributionImage, DistributionRequirements, DownloadCancellation,
     DownloadDisposition, DownloadPhase, DownloadProgress, DownloadedBinary, DownloadedDistribution,
     DownloadedDistributionImage, DownloadedFile, DownloadedKernel, ElfMetadata, Endianness,
-    FilesystemMetadata, InstalledBinary, Kernel, Linkage,
+    FilesystemMetadata, InstalledBinary, Kernel, Linkage, PruneFailure, PruneSummary,
+    PrunedImageId,
 };
 pub use domain::{
     CreateMicroVmRequest, CreationEventPhase, CreationOutcome, CreationProgress, CreationStage,

@@ -422,3 +422,19 @@ async fn stop_leaves_preflight_failures_silent_without_new_files() {
         .expect_err("unknown VM should fail");
     assert!(matches!(error, SdkError::NotFound { .. }));
 }
+
+#[tokio::test]
+async fn prune_rejects_an_invalid_home_without_deleting_anything() {
+    use taumaru_microvm::MicroVmSdk;
+
+    let home = tempdir().expect("temporary SDK home should be created");
+    let sdk = MicroVmSdk::new(home.path()).expect("SDK construction should work");
+    drop(sdk);
+    std::fs::remove_dir_all(home.path().join("state")).expect("state should be removed");
+    std::fs::write(home.path().join("state"), b"not-a-directory")
+        .expect("blocking state file should be written");
+    let blocked = MicroVmSdk::new(home.path());
+    assert!(blocked.is_err());
+    let missing = MicroVmSdk::new(home.path().join("missing").join("..").join(""));
+    assert!(missing.is_err());
+}

@@ -3,6 +3,8 @@ use std::path::PathBuf;
 
 use thiserror::Error;
 
+use crate::domain::artifact::{PruneFailure, PruneSummary};
+
 /// Errors returned by public SDK operations.
 #[derive(Debug, Error)]
 pub enum SdkError {
@@ -197,7 +199,18 @@ pub enum SdkError {
     #[error("artifact {artifact} is incompatible: {reason}")]
     IncompatibleArtifact { artifact: String, reason: String },
 
-    /// A download was cancelled before its current unverified file could be published.
+    /// A prune run reclaimed some artifacts but one or more candidates failed.
+    ///
+    /// Carries the partial summary (everything removed so far plus the skipped
+    /// list) together with one entry per failed candidate, so the caller can
+    /// repair the cause and retry without losing the success record.
+    #[error("prune incomplete: summary={summary:?}, failures={failures:?}")]
+    PruneIncomplete {
+        /// Removed identities, freed bytes so far, and skipped transfers.
+        summary: PruneSummary,
+        /// One entry per candidate that could not be reclaimed.
+        failures: Vec<PruneFailure>,
+    },
     #[error("download was cancelled")]
     Cancelled,
 }

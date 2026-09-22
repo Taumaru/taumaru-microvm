@@ -17,7 +17,8 @@ use crate::domain::registry::{
 };
 use crate::error::SdkError;
 use crate::ports::repository::{
-    ArtifactRepository, InventoryState, LocalArtifact, MicroVmRepository, StoredMicroVm,
+    ArtifactRepository, InventoryState, LocalArtifact, MicroVmRepository, OrphanArtifactDownload,
+    OrphanIdentity, PrunableImage, PrunableKernel, PruneReferences, StoredMicroVm,
 };
 
 use super::migrations;
@@ -733,6 +734,195 @@ impl ArtifactRepository for SqliteRepository {
             })
         })
         .collect()
+    }
+
+    fn list_prune_references(&self) -> Result<PruneReferences, SdkError> {
+        let connection = self.connection()?;
+        let mut statement =
+            connection.prepare("SELECT distribution_id, image_id, kernel_id FROM microvms")?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        let mut references = PruneReferences::default();
+        for row in rows {
+            let (distribution_id, image_id, kernel_id) = row?;
+            references.kernels.insert(kernel_id);
+            references.images.insert((distribution_id, image_id));
+        }
+        Ok(references)
+    }
+
+    fn list_prunable_kernels(&self) -> Result<Vec<PrunableKernel>, SdkError> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT k.registry_id, d.absolute_path
+             FROM kernels k
+             JOIN downloads d ON d.id = k.download_id
+             WHERE k.download_id IS NOT NULL
+             ORDER BY k.registry_id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok(PrunableKernel {
+                registry_id: row.get(0)?,
+                absolute_path: PathBuf::from(row.get::<_, String>(1)?),
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(SdkError::from)
+    }
+
+    fn list_prunable_images(&self) -> Result<Vec<PrunableImage>, SdkError> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT dist.registry_id, di.registry_id, d.absolute_path
+             FROM distribution_images di
+             JOIN distributions dist ON dist.id = di.distribution_id
+             JOIN downloads d ON d.id = di.download_id
+             ORDER BY dist.registry_id, di.registry_id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok(PrunableImage {
+                distribution_id: row.get(0)?,
+                image_id: row.get(1)?,
+                absolute_path: PathBuf::from(row.get::<_, String>(2)?),
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(SdkError::from)
+    }
+
+    fn list_orphan_artifact_downloads(&self) -> Result<Vec<OrphanArtifactDownload>, SdkError> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT d.artifact_key, d.artifact_type, d.absolute_path
+             FROM downloads d
+             WHERE d.artifact_type IN ('kernel', 'distribution_image')
+               AND NOT EXISTS (
+                    SELECT 1 FROM kernels k WHERE k.download_id = d.id
+               )
+               AND NOT EXISTS (
+                    SELECT 1 FROM distribution_images di WHERE di.download_id = d.id
+               )
+             ORDER BY d.artifact_key",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok(OrphanArtifactDownload {
+                artifact_key: row.get(0)?,
+                artifact_type: row.get(1)?,
+                absolute_path: PathBuf::from(row.get::<_, String>(2)?),
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(SdkError::from)
+    }
+
+    fn delete_kernel_if_unreferenced(&self, kernel_id: &str) -> Result<bool, SdkError> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        if kernel_is_referenced(&transaction, kernel_id)? {
+            return Ok(false);
+        }
+        let kernel: Option<(i64, Option<i64>)> = transaction
+            .query_row(
+                "SELECT id, download_id FROM kernels WHERE registry_id = ?1",
+                params![kernel_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((kernel_row_id, Some(download_id))) = kernel else {
+            return Ok(false);
+        };
+        transaction.execute(
+            "DELETE FROM distribution_kernels WHERE kernel_id = ?1",
+            params![kernel_row_id],
+        )?;
+        transaction.execute("DELETE FROM kernels WHERE id = ?1", params![kernel_row_id])?;
+        transaction.execute("DELETE FROM downloads WHERE id = ?1", params![download_id])?;
+        transaction.commit()?;
+        Ok(true)
+    }
+
+    fn delete_image_if_unreferenced(
+        &self,
+        distribution_id: &str,
+        image_id: &str,
+    ) -> Result<bool, SdkError> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        if image_is_referenced(&transaction, distribution_id, image_id)? {
+            return Ok(false);
+        }
+        let image: Option<(i64, i64)> = transaction
+            .query_row(
+                "SELECT di.id, di.download_id
+                 FROM distribution_images di
+                 JOIN distributions d ON d.id = di.distribution_id
+                 WHERE d.registry_id = ?1 AND di.registry_id = ?2",
+                params![distribution_id, image_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((image_row_id, download_id)) = image else {
+            return Ok(false);
+        };
+        transaction.execute(
+            "DELETE FROM distribution_images WHERE id = ?1",
+            params![image_row_id],
+        )?;
+        transaction.execute("DELETE FROM downloads WHERE id = ?1", params![download_id])?;
+        transaction.commit()?;
+        Ok(true)
+    }
+
+    fn delete_orphan_download_if_unreferenced(&self, artifact_key: &str) -> Result<bool, SdkError> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let orphan: Option<(i64, String, String, i64)> = transaction
+            .query_row(
+                "SELECT d.id, d.artifact_type, d.absolute_path,
+                        (SELECT COUNT(*) FROM kernels k WHERE k.download_id = d.id)
+                          + (SELECT COUNT(*) FROM distribution_images di
+                             WHERE di.download_id = d.id)
+                 FROM downloads d
+                 WHERE d.artifact_key = ?1
+                   AND d.artifact_type IN ('kernel', 'distribution_image')",
+                params![artifact_key],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?;
+        let Some((download_id, artifact_type, absolute_path, member_count)) = orphan else {
+            return Ok(false);
+        };
+        if member_count != 0 {
+            return Ok(false);
+        }
+        let orphan = OrphanArtifactDownload {
+            artifact_key: artifact_key.to_owned(),
+            artifact_type,
+            absolute_path: PathBuf::from(absolute_path),
+        };
+        let Some(identity) = orphan.parse_identity() else {
+            return Ok(false);
+        };
+        match identity {
+            OrphanIdentity::Kernel { kernel_id } => {
+                if kernel_is_referenced(&transaction, &kernel_id)? {
+                    return Ok(false);
+                }
+            }
+            OrphanIdentity::DistributionImage {
+                distribution_id,
+                image_id,
+            } => {
+                if image_is_referenced(&transaction, &distribution_id, &image_id)? {
+                    return Ok(false);
+                }
+            }
+        }
+        transaction.execute("DELETE FROM downloads WHERE id = ?1", params![download_id])?;
+        transaction.commit()?;
+        Ok(true)
     }
 }
 
@@ -1992,6 +2182,28 @@ fn linkage_name(value: &Linkage) -> &'static str {
         Linkage::Static => "static",
         Linkage::Dynamic => "dynamic",
     }
+}
+
+fn kernel_is_referenced(transaction: &Transaction<'_>, kernel_id: &str) -> Result<bool, SdkError> {
+    let count: i64 = transaction.query_row(
+        "SELECT COUNT(*) FROM microvms WHERE kernel_id = ?1",
+        params![kernel_id],
+        |row| row.get(0),
+    )?;
+    Ok(count != 0)
+}
+
+fn image_is_referenced(
+    transaction: &Transaction<'_>,
+    distribution_id: &str,
+    image_id: &str,
+) -> Result<bool, SdkError> {
+    let count: i64 = transaction.query_row(
+        "SELECT COUNT(*) FROM microvms WHERE distribution_id = ?1 AND image_id = ?2",
+        params![distribution_id, image_id],
+        |row| row.get(0),
+    )?;
+    Ok(count != 0)
 }
 
 #[cfg(test)]
