@@ -22,6 +22,8 @@ pub(crate) enum Command {
     Start(StartArgs),
     /// Stop a running MicroVM by name or interactive selection.
     Stop(StopArgs),
+    /// Delete a MicroVM by name or interactive selection.
+    Delete(DeleteArgs),
     /// List all MicroVMs with state and configured capacities.
     #[command(visible_alias = "list")]
     Ls(LsArgs),
@@ -126,6 +128,21 @@ pub(crate) struct StopArgs {
     #[arg(long = "non-interactive")]
     pub(crate) non_interactive: bool,
 }
+
+#[derive(Debug, Args, Clone)]
+pub(crate) struct DeleteArgs {
+    /// Machine name; skips the machine selector when supplied.
+    pub(crate) name: Option<String>,
+
+    /// Equivalent to the positional name; must agree when both are given.
+    #[arg(long = "name")]
+    pub(crate) explicit_name: Option<String>,
+
+    /// Disable prompts; the name is required and root is required up front.
+    #[arg(long = "non-interactive")]
+    pub(crate) non_interactive: bool,
+}
+
 #[derive(Debug, Args, Clone)]
 pub(crate) struct LsArgs {
     /// Disable prompts; root is required up front.
@@ -276,6 +293,25 @@ mod tests {
         assert!(Cli::try_parse_from(["microvm", "stop", "--image", "x"]).is_err());
         assert!(Cli::try_parse_from(["microvm", "stop", "--disk-gb", "20"]).is_err());
         assert!(Cli::try_parse_from(["microvm", "stop", "--expose-lan"]).is_err());
+    }
+
+    #[test]
+    fn delete_parser_accepts_positional_name_and_flag() {
+        let cli = Cli::try_parse_from(["microvm", "delete", "web-01", "--non-interactive"])
+            .expect("valid explicit delete arguments");
+
+        let Some(Command::Delete(arguments)) = cli.command else {
+            panic!("delete command should be parsed");
+        };
+        assert_eq!(arguments.name.as_deref(), Some("web-01"));
+        assert!(arguments.non_interactive);
+    }
+
+    #[test]
+    fn delete_parser_rejects_lifecycle_flags() {
+        assert!(Cli::try_parse_from(["microvm", "delete", "--image", "x"]).is_err());
+        assert!(Cli::try_parse_from(["microvm", "delete", "--disk-gb", "20"]).is_err());
+        assert!(Cli::try_parse_from(["microvm", "delete", "--expose-lan"]).is_err());
     }
 
     #[test]

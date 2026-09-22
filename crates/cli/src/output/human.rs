@@ -145,6 +145,48 @@ impl StopSpinner {
     }
 }
 
+pub(crate) struct DeleteSpinner {
+    bar: ProgressBar,
+    interactive: bool,
+}
+
+impl DeleteSpinner {
+    pub(crate) fn new(name: &str, capabilities: TerminalCapabilities) -> Self {
+        let bar = if capabilities.interactive {
+            let bar = ProgressBar::new_spinner();
+            let template = if capabilities.color {
+                "{spinner:.dim} {msg}"
+            } else {
+                "{spinner} {msg}"
+            };
+            let style = match ProgressStyle::with_template(template) {
+                Ok(style) => {
+                    style.tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"])
+                }
+                Err(_) => ProgressStyle::default_spinner(),
+            };
+            bar.set_style(style);
+            bar.set_message(format!("Deleting MicroVM {name}"));
+            bar.enable_steady_tick(Duration::from_millis(90));
+            bar
+        } else {
+            eprintln!("·  Deleting MicroVM {name}");
+            ProgressBar::hidden()
+        };
+
+        Self {
+            bar,
+            interactive: capabilities.interactive,
+        }
+    }
+
+    pub(crate) fn finish(self) {
+        if self.interactive {
+            self.bar.finish_and_clear();
+        }
+    }
+}
+
 pub(crate) fn write_catalog_ready(
     capabilities: TerminalCapabilities,
     distribution_count: usize,
@@ -994,6 +1036,38 @@ pub(crate) fn write_stop_result(
     write!(stdout, "{}", format_stop_result(result, capabilities))
 }
 
+pub(crate) fn format_delete_result(
+    result: &taumaru_microvm::MicroVmDeleteResult,
+    capabilities: TerminalCapabilities,
+) -> String {
+    let title = paint(
+        format!("MicroVM {} deleted", result.name),
+        ANSI_BOLD,
+        capabilities.color,
+    );
+    let check = paint("✓", ANSI_GREEN, capabilities.color);
+    let rule = divider(capabilities);
+    let removed_label = paint("Removed:", ANSI_DIM, capabilities.color);
+    let preserved_label = paint("Preserved:", ANSI_DIM, capabilities.color);
+    let create_label = paint("Create:", ANSI_DIM, capabilities.color);
+    let mut output = String::from("\n");
+    output.push_str(&format!("{check} {title}\n{rule}\n\n"));
+    output.push_str(&format!(
+        "  {removed_label}  record, volume, and owned network attachment\n"
+    ));
+    output.push_str(&format!("  {preserved_label} shared kernels and images\n"));
+    output.push_str(&format!("  {create_label}    microvm new\n"));
+    output
+}
+
+pub(crate) fn write_delete_result(
+    result: &taumaru_microvm::MicroVmDeleteResult,
+    capabilities: TerminalCapabilities,
+) -> Result<(), io::Error> {
+    let mut stdout = io::stdout().lock();
+    write!(stdout, "{}", format_delete_result(result, capabilities))
+}
+
 fn ls_network_cell(summary: &taumaru_microvm::MicroVmSummary) -> String {
     let (Some(mode), Some(guest)) = (summary.network_mode, summary.guest_address) else {
         return String::from("-");
@@ -1543,6 +1617,57 @@ mod stop_tests {
         assert!(!forced.contains("graceful — the guest exited on its own"));
         assert!(graceful.contains("graceful — the guest exited on its own"));
         assert_ne!(forced, graceful);
+    }
+}
+
+#[cfg(test)]
+mod delete_tests {
+    use super::format_delete_result;
+    use crate::context::TerminalCapabilities;
+    use taumaru_microvm::MicroVmDeleteResult;
+
+    fn capabilities() -> TerminalCapabilities {
+        TerminalCapabilities {
+            interactive: false,
+            color: false,
+            width: Some(120),
+        }
+    }
+
+    fn delete_result() -> MicroVmDeleteResult {
+        MicroVmDeleteResult {
+            name: String::from("web-01"),
+        }
+    }
+
+    #[test]
+    fn deleted_report_names_machine_with_removed_and_preserved_lines() {
+        let report = format_delete_result(&delete_result(), capabilities());
+        assert!(report.contains("MicroVM web-01 deleted"));
+        assert!(report.contains("Removed:"));
+        assert!(report.contains("record, volume, and owned network attachment"));
+        assert!(report.contains("Preserved:"));
+        assert!(report.contains("shared kernels and images"));
+        assert!(report.contains("microvm new"));
+    }
+
+    #[test]
+    fn deleted_report_stays_text_readable_without_color() {
+        let plain = format_delete_result(&delete_result(), capabilities());
+        let colored = format_delete_result(
+            &delete_result(),
+            TerminalCapabilities {
+                interactive: false,
+                color: true,
+                width: Some(40),
+            },
+        );
+        for report in [&plain, &colored] {
+            assert!(report.contains("MicroVM web-01 deleted"));
+            assert!(report.contains("Removed:"));
+            assert!(report.contains("Preserved:"));
+            assert!(report.contains("microvm new"));
+        }
     }
 }
 

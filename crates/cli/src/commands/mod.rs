@@ -1,3 +1,4 @@
+pub(crate) mod delete;
 pub(crate) mod download;
 pub(crate) mod ls;
 pub(crate) mod new;
@@ -24,6 +25,7 @@ pub(crate) async fn run(cli: Cli) -> Result<u8, crate::error::CliError> {
         crate::cli::Command::Start(arguments) => start::run(&context, arguments).await,
         crate::cli::Command::Ssh(arguments) => ssh::run(&context, arguments).await,
         crate::cli::Command::Stop(arguments) => stop::run(&context, arguments).await,
+        crate::cli::Command::Delete(arguments) => delete::run(&context, arguments).await,
         crate::cli::Command::Ls(arguments) => ls::run(&context, arguments).await,
     }
 }

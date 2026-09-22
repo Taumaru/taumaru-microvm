@@ -180,6 +180,39 @@ impl CliError {
         ))
     }
 
+    pub(crate) fn delete_not_found(name: &str) -> Self {
+        Self::Creation(format!(
+            "MicroVM {name:?} was not found\u{1f}no created machine named {name:?} exists in this home\u{1f}Run `microvm new` to create it, then try again"
+        ))
+    }
+
+    pub(crate) fn delete_empty() -> Self {
+        Self::Creation(
+            "No MicroVMs to delete\u{1f}no created machines exist in this home\u{1f}Run `microvm new` to create one, then try again"
+                .to_string(),
+        )
+    }
+
+    pub(crate) fn delete_cancelled() -> Self {
+        Self::Creation(
+            "MicroVM delete cancelled\u{1f}no machine was deleted\u{1f}Run `microvm delete` again when you are ready"
+                .to_string(),
+        )
+    }
+
+    pub(crate) fn delete_running(name: &str) -> Self {
+        Self::Creation(format!(
+            "MicroVM {name:?} is running\u{1f}machine {name:?} must be stopped before it can be deleted\u{1f}Run `microvm stop {name}`, then run `microvm delete {name}` again"
+        ))
+    }
+
+    pub(crate) fn delete_failed(what: impl Into<String>, error: &SdkError) -> Self {
+        Self::Creation(format!(
+            "{}\u{1f}{error}\u{1f}Check the reported cause, fix it, then retry the delete",
+            what.into()
+        ))
+    }
+
     pub(crate) fn ls_failed(what: impl Into<String>, error: &SdkError) -> Self {
         Self::Creation(format!(
             "{}\u{1f}{error}\u{1f}Check the reported cause, then retry the listing",
@@ -223,6 +256,7 @@ impl CliError {
             Self::Creation(payload) if payload.starts_with("MicroVM start cancelled") => 130,
             Self::Creation(payload) if payload.starts_with("MicroVM connection cancelled") => 130,
             Self::Creation(payload) if payload.starts_with("MicroVM stop cancelled") => 130,
+            Self::Creation(payload) if payload.starts_with("MicroVM delete cancelled") => 130,
             Self::Creation(payload) if payload.starts_with("MicroVM prune cancelled") => 130,
             _ => 1,
         }
