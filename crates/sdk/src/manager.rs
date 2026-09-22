@@ -20,7 +20,8 @@ use crate::domain::artifact::{
     ArtifactKind, DownloadCancellation, DownloadDisposition, DownloadPhase, DownloadProgress,
     DownloadSpec, DownloadedBinary, DownloadedDistribution, DownloadedDistributionImage,
     DownloadedFile, DownloadedKernel, FileIntegrity, InstalledBinary, ProgressTracker,
-    PruneFailure, PruneSummary, PrunedImageId, is_valid_sha256, validate_registry_path,
+    PruneFailure, PrunePreview, PruneSummary, PrunedImageId, is_valid_sha256,
+    validate_registry_path,
 };
 use crate::domain::config::minimum_memory_bytes;
 use crate::domain::lifecycle::{MicroVmState, NetworkMode};
@@ -1383,20 +1384,92 @@ impl MicroVmSdk {
         })
     }
 
-    /// Deletes downloaded kernels and images no existing MicroVM references.
+    /// Previews the kernels and images the next prune would reclaim.
     ///
-    /// The operation scans the whole SDK home: it enumerates recorded kernel
-    /// and image downloads (including orphan records with no member row),
-    /// builds the referenced set from every `microvms` row regardless of
-    /// lifecycle state, skips artifacts with an actively in-progress transfer
-    /// into a separate skipped list, and deletes the rest file-first then
-    /// rows. Referenced artifacts are never touched and appear in no list.
-    /// Repeating a prune with no intervening changes reports zero removals.
-    /// When one or more deletions fail, the operation continues with the
-    /// remaining candidates and returns `SdkError::PruneIncomplete` carrying
-    /// the partial summary plus per-artifact causes. The operation never
-    /// contacts the registry, emits no progress, and writes nothing to
-    /// standard output or error.
+    /// Returns the unreferenced candidates in the same deterministic order
+    /// the deleting operation uses (kernels by ID, images by distribution
+    /// then image, orphans by artifact key), with recorded byte sizes for
+    /// display estimates. The preview is read-only: it opens no write
+    /// transaction, deletes nothing, and treats existence of a MicroVM row
+    /// alone as a reference. Callers must treat the result as an estimate:
+    /// inventory may change before the deleting call runs.
+    pub async fn list_prune_candidates(&self) -> Result<PrunePreview, SdkError> {
+        let kernels = self
+            .run_repository(|repository| repository.list_prunable_kernels())
+            .await?;
+        let images = self
+            .run_repository(|repository| repository.list_prunable_images())
+            .await?;
+        let orphans = self
+            .run_repository(|repository| repository.list_orphan_artifact_downloads())
+            .await?;
+        let references = self
+            .run_repository(|repository| repository.list_prune_references())
+            .await?;
+        let mut preview = PrunePreview {
+            kernels: Vec::new(),
+            images: Vec::new(),
+            estimated_bytes: 0,
+        };
+        for kernel in &kernels {
+            if references.kernel_referenced(&kernel.registry_id) {
+                continue;
+            }
+            preview.estimated_bytes = preview.estimated_bytes.saturating_add(kernel.size_bytes);
+            preview.kernels.push(kernel.registry_id.clone());
+        }
+        for image in &images {
+            if references.image_referenced(&image.distribution_id, &image.image_id) {
+                continue;
+            }
+            preview.estimated_bytes = preview.estimated_bytes.saturating_add(image.size_bytes);
+            preview.images.push(PrunedImageId {
+                distribution_id: image.distribution_id.clone(),
+                image_id: image.image_id.clone(),
+            });
+        }
+        for orphan in &orphans {
+            let Some(identity) = orphan.parse_identity() else {
+                continue;
+            };
+            match identity {
+                crate::ports::repository::OrphanIdentity::Kernel { kernel_id } => {
+                    if references.kernel_referenced(&kernel_id) {
+                        continue;
+                    }
+                    preview.estimated_bytes =
+                        preview.estimated_bytes.saturating_add(orphan.size_bytes);
+                    if !preview.kernels.contains(&kernel_id) {
+                        preview.kernels.push(kernel_id);
+                    }
+                }
+                crate::ports::repository::OrphanIdentity::DistributionImage {
+                    distribution_id,
+                    image_id,
+                } => {
+                    if references.image_referenced(&distribution_id, &image_id) {
+                        continue;
+                    }
+                    preview.estimated_bytes =
+                        preview.estimated_bytes.saturating_add(orphan.size_bytes);
+                    let candidate = PrunedImageId {
+                        distribution_id,
+                        image_id,
+                    };
+                    if !preview.images.contains(&candidate) {
+                        preview.images.push(candidate);
+                    }
+                }
+            }
+        }
+        preview.kernels.sort();
+        preview.images.sort_by(|first, second| {
+            (&first.distribution_id, &first.image_id)
+                .cmp(&(&second.distribution_id, &second.image_id))
+        });
+        Ok(preview)
+    }
+
     pub async fn prune_unused_artifacts(&self) -> Result<PruneSummary, SdkError> {
         let kernels = self
             .run_repository(|repository| repository.list_prunable_kernels())

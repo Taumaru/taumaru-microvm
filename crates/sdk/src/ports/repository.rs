@@ -127,6 +127,8 @@ pub(crate) struct PrunableKernel {
     pub registry_id: String,
     /// Recorded absolute file path.
     pub absolute_path: PathBuf,
+    /// Recorded byte size for preview estimates.
+    pub size_bytes: u64,
 }
 
 /// One recorded distribution image download that may be pruned.
@@ -138,6 +140,8 @@ pub(crate) struct PrunableImage {
     pub image_id: String,
     /// Recorded absolute file path.
     pub absolute_path: PathBuf,
+    /// Recorded byte size for preview estimates.
+    pub size_bytes: u64,
 }
 
 /// One orphan `downloads` row of kernel or image type with no member row.
@@ -153,6 +157,8 @@ pub(crate) struct OrphanArtifactDownload {
     pub artifact_type: String,
     /// Recorded absolute file path.
     pub absolute_path: PathBuf,
+    /// Recorded byte size for preview estimates.
+    pub size_bytes: u64,
 }
 
 /// The prune identity recovered from an orphan artifact key.

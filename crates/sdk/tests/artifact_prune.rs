@@ -460,3 +460,35 @@ async fn prune_is_silent_on_success_and_partial_failure() -> Result<(), Box<dyn 
     assert!(repeat.removed_kernels.is_empty());
     Ok(())
 }
+
+#[tokio::test]
+async fn prune_preview_lists_unreferenced_identities_without_deleting()
+-> Result<(), Box<dyn Error + Send + Sync>> {
+    let server = FixtureServer::start().await?;
+    let home = tempdir()?;
+    let sdk = MicroVmSdk::with_registry_base_url(home.path(), server.base_url())?;
+    sdk.download_kernel("linux-test-x86_64", |_| {}).await?;
+    sdk.download_distribution_image("alpine-test-1.0", "alpine-test-minimal", |_| {})
+        .await?;
+    sdk.download_distribution_image("alpine-test-1.0", "alpine-test-debug", |_| {})
+        .await?;
+    let connection = open_inventory(home.path())?;
+    insert_vm(
+        &connection,
+        "owner_vm",
+        "alpine-test-1.0",
+        "alpine-test-minimal",
+        "linux-test-x86_64",
+    );
+    drop(connection);
+    let preview = sdk.list_prune_candidates().await?;
+    assert!(preview.kernels.is_empty());
+    assert_eq!(preview.images.len(), 1);
+    assert_eq!(preview.images[0].distribution_id, "alpine-test-1.0");
+    assert_eq!(preview.images[0].image_id, "alpine-test-debug");
+    assert!(preview.estimated_bytes > 0);
+    let summary = sdk.prune_unused_artifacts().await?;
+    assert_eq!(summary.removed_images.len(), 1);
+    assert_eq!(preview.images, summary.removed_images);
+    Ok(())
+}

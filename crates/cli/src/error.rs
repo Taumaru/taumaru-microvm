@@ -187,6 +187,20 @@ impl CliError {
         ))
     }
 
+    pub(crate) fn prune_failed(what: impl Into<String>, error: &SdkError) -> Self {
+        Self::Creation(format!(
+            "{}\u{1f}{error}\u{1f}Check the reported cause, then retry the prune",
+            what.into()
+        ))
+    }
+
+    pub(crate) fn prune_cancelled() -> Self {
+        Self::Creation(
+            "MicroVM prune cancelled\u{1f}no artifact was deleted\u{1f}Run `microvm artifacts prune` again when you are ready"
+                .to_string(),
+        )
+    }
+
     pub(crate) fn ssh_key_unreadable(path: &std::path::Path) -> Self {
         Self::Creation(format!(
             "SSH key is missing or unreadable\u{1f}the private key at {} is not a readable file\u{1f}Repair the machine volume or recreate the machine, then try again",
@@ -209,6 +223,7 @@ impl CliError {
             Self::Creation(payload) if payload.starts_with("MicroVM start cancelled") => 130,
             Self::Creation(payload) if payload.starts_with("MicroVM connection cancelled") => 130,
             Self::Creation(payload) if payload.starts_with("MicroVM stop cancelled") => 130,
+            Self::Creation(payload) if payload.starts_with("MicroVM prune cancelled") => 130,
             _ => 1,
         }
     }

@@ -14,7 +14,7 @@ pub use domain::{
     Distribution, DistributionImage, DistributionRequirements, DownloadCancellation,
     DownloadDisposition, DownloadPhase, DownloadProgress, DownloadedBinary, DownloadedDistribution,
     DownloadedDistributionImage, DownloadedFile, DownloadedKernel, ElfMetadata, Endianness,
-    FilesystemMetadata, InstalledBinary, Kernel, Linkage, PruneFailure, PruneSummary,
+    FilesystemMetadata, InstalledBinary, Kernel, Linkage, PruneFailure, PrunePreview, PruneSummary,
     PrunedImageId,
 };
 pub use domain::{

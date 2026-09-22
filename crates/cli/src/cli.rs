@@ -39,6 +39,8 @@ pub(crate) struct ArtifactsArgs {
 pub(crate) enum ArtifactsCommand {
     /// Select and download runtime, kernel, and distribution image artifacts.
     Download(DownloadArgs),
+    /// Delete downloaded kernels and images no existing MicroVM references.
+    Prune(PruneArgs),
 }
 
 #[derive(Debug, Args, Clone)]
@@ -48,6 +50,13 @@ pub(crate) struct DownloadArgs {
     pub(crate) images: Vec<String>,
 
     /// Disable prompts and require complete explicit selections.
+    #[arg(long = "non-interactive")]
+    pub(crate) non_interactive: bool,
+}
+
+#[derive(Debug, Args, Clone)]
+pub(crate) struct PruneArgs {
+    /// Disable prompts; root is required up front.
     #[arg(long = "non-interactive")]
     pub(crate) non_interactive: bool,
 }
@@ -172,7 +181,9 @@ mod tests {
         let Some(Command::Artifacts(arguments)) = cli.command else {
             panic!("download command should be parsed");
         };
-        let ArtifactsCommand::Download(download) = arguments.command;
+        let ArtifactsCommand::Download(download) = arguments.command else {
+            panic!("download command should be parsed");
+        };
         assert!(download.non_interactive);
         assert_eq!(
             download.images,
@@ -290,6 +301,40 @@ mod tests {
         assert!(Cli::try_parse_from(["microvm", "ls", "--name", "web-01"]).is_err());
         assert!(Cli::try_parse_from(["microvm", "ls", "--image", "x"]).is_err());
         assert!(Cli::try_parse_from(["microvm", "ls", "--disk-gb", "20"]).is_err());
+    }
+
+    #[test]
+    fn prune_parser_accepts_flag_only_form() {
+        let cli = Cli::try_parse_from(["microvm", "artifacts", "prune", "--non-interactive"])
+            .expect("valid explicit prune arguments");
+        let Some(Command::Artifacts(arguments)) = cli.command else {
+            panic!("prune command should be parsed");
+        };
+        let ArtifactsCommand::Prune(prune) = arguments.command else {
+            panic!("prune command should be parsed");
+        };
+        assert!(prune.non_interactive);
+
+        let cli =
+            Cli::try_parse_from(["microvm", "artifacts", "prune"]).expect("bare prune parses");
+        let Some(Command::Artifacts(arguments)) = cli.command else {
+            panic!("prune command should be parsed");
+        };
+        let ArtifactsCommand::Prune(prune) = arguments.command else {
+            panic!("prune command should be parsed");
+        };
+        assert!(!prune.non_interactive);
+    }
+
+    #[test]
+    fn prune_parser_rejects_positionals_and_selection_flags() {
+        assert!(Cli::try_parse_from(["microvm", "artifacts", "prune", "web-01"]).is_err());
+        assert!(Cli::try_parse_from(["microvm", "artifacts", "prune", "--image", "x=y"]).is_err());
+        assert!(Cli::try_parse_from(["microvm", "artifacts", "prune", "--name", "x"]).is_err());
+        assert!(Cli::try_parse_from(["microvm", "artifacts", "prune", "--disk-gb", "20"]).is_err());
+        assert!(Cli::try_parse_from(["microvm", "artifacts", "prune", "--memory", "2GB"]).is_err());
+        assert!(Cli::try_parse_from(["microvm", "artifacts", "prune", "--vcpus", "2"]).is_err());
+        assert!(Cli::try_parse_from(["microvm", "artifacts", "prune", "--expose-lan"]).is_err());
     }
 
     #[test]

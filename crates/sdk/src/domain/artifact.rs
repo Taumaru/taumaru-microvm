@@ -201,6 +201,24 @@ pub struct PruneSummary {
     pub freed_bytes_total: u64,
 }
 
+/// Read-only preview of the kernels and images the next prune would reclaim.
+///
+/// Returned by the preview operation without deleting anything. `kernels`
+/// holds kernel registry IDs in ascending order and `images` holds
+/// distribution image identities ordered by distribution then image, both in
+/// the same order the deleting operation uses. `estimated_bytes` sums the
+/// recorded byte sizes and is an estimate only: inventory may change before
+/// the deleting call runs.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PrunePreview {
+    /// Unreferenced kernel registry IDs, ascending.
+    pub kernels: Vec<String>,
+    /// Unreferenced distribution images, ordered by distribution then image.
+    pub images: Vec<PrunedImageId>,
+    /// Sum of recorded byte sizes, saturating.
+    pub estimated_bytes: u64,
+}
+
 /// One prune candidate that could not be reclaimed.
 ///
 /// Surfaced inside the typed prune-incomplete error together with the partial

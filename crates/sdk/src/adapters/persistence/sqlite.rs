@@ -759,16 +759,18 @@ impl ArtifactRepository for SqliteRepository {
     fn list_prunable_kernels(&self) -> Result<Vec<PrunableKernel>, SdkError> {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
-            "SELECT k.registry_id, d.absolute_path
+            "SELECT k.registry_id, d.absolute_path, d.actual_size_bytes
              FROM kernels k
              JOIN downloads d ON d.id = k.download_id
              WHERE k.download_id IS NOT NULL
              ORDER BY k.registry_id",
         )?;
         let rows = statement.query_map([], |row| {
+            let size: i64 = row.get(2)?;
             Ok(PrunableKernel {
                 registry_id: row.get(0)?,
                 absolute_path: PathBuf::from(row.get::<_, String>(1)?),
+                size_bytes: u64::try_from(size).unwrap_or(0),
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(SdkError::from)
@@ -777,17 +779,19 @@ impl ArtifactRepository for SqliteRepository {
     fn list_prunable_images(&self) -> Result<Vec<PrunableImage>, SdkError> {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
-            "SELECT dist.registry_id, di.registry_id, d.absolute_path
+            "SELECT dist.registry_id, di.registry_id, d.absolute_path, d.actual_size_bytes
              FROM distribution_images di
              JOIN distributions dist ON dist.id = di.distribution_id
              JOIN downloads d ON d.id = di.download_id
              ORDER BY dist.registry_id, di.registry_id",
         )?;
         let rows = statement.query_map([], |row| {
+            let size: i64 = row.get(3)?;
             Ok(PrunableImage {
                 distribution_id: row.get(0)?,
                 image_id: row.get(1)?,
                 absolute_path: PathBuf::from(row.get::<_, String>(2)?),
+                size_bytes: u64::try_from(size).unwrap_or(0),
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(SdkError::from)
@@ -796,7 +800,7 @@ impl ArtifactRepository for SqliteRepository {
     fn list_orphan_artifact_downloads(&self) -> Result<Vec<OrphanArtifactDownload>, SdkError> {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
-            "SELECT d.artifact_key, d.artifact_type, d.absolute_path
+            "SELECT d.artifact_key, d.artifact_type, d.absolute_path, d.actual_size_bytes
              FROM downloads d
              WHERE d.artifact_type IN ('kernel', 'distribution_image')
                AND NOT EXISTS (
@@ -808,10 +812,12 @@ impl ArtifactRepository for SqliteRepository {
              ORDER BY d.artifact_key",
         )?;
         let rows = statement.query_map([], |row| {
+            let size: i64 = row.get(3)?;
             Ok(OrphanArtifactDownload {
                 artifact_key: row.get(0)?,
                 artifact_type: row.get(1)?,
                 absolute_path: PathBuf::from(row.get::<_, String>(2)?),
+                size_bytes: u64::try_from(size).unwrap_or(0),
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(SdkError::from)
@@ -901,6 +907,7 @@ impl ArtifactRepository for SqliteRepository {
             artifact_key: artifact_key.to_owned(),
             artifact_type,
             absolute_path: PathBuf::from(absolute_path),
+            size_bytes: 0,
         };
         let Some(identity) = orphan.parse_identity() else {
             return Ok(false);

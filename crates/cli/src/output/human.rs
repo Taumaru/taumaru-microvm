@@ -1100,6 +1100,317 @@ pub(crate) fn write_ls_empty(capabilities: TerminalCapabilities) -> Result<(), i
     write!(stdout, "{}", format_ls_empty(capabilities))
 }
 
+pub(crate) fn format_prune_preview(
+    kernels: &[String],
+    images: &[(String, String)],
+    estimated_bytes: u64,
+    capabilities: TerminalCapabilities,
+) -> String {
+    let mut output = String::from("\n");
+    output.push_str(&format!(
+        "{} {}\n{}\n\n",
+        paint("◆", ANSI_BLUE, capabilities.color),
+        paint("Prune preview", ANSI_BOLD, capabilities.color),
+        divider(capabilities),
+    ));
+    output.push_str(&format!(
+        "{}\n",
+        paint("Kernels", ANSI_BOLD, capabilities.color)
+    ));
+    if kernels.is_empty() {
+        output.push_str(&format!(
+            "  {}  {}\n",
+            paint("-", ANSI_DIM, capabilities.color),
+            paint("no kernels to reclaim", ANSI_DIM, capabilities.color),
+        ));
+    } else {
+        for kernel in kernels {
+            output.push_str(&format!(
+                "  {}  {}\n",
+                paint("•", ANSI_BLUE, capabilities.color),
+                kernel,
+            ));
+        }
+    }
+    output.push_str(&format!(
+        "\n{}\n",
+        paint("Images", ANSI_BOLD, capabilities.color)
+    ));
+    if images.is_empty() {
+        output.push_str(&format!(
+            "  {}  {}\n",
+            paint("-", ANSI_DIM, capabilities.color),
+            paint("no images to reclaim", ANSI_DIM, capabilities.color),
+        ));
+    } else {
+        for (distribution, image) in images {
+            output.push_str(&format!(
+                "  {}  {} / {}\n",
+                paint("•", ANSI_BLUE, capabilities.color),
+                distribution,
+                image,
+            ));
+        }
+    }
+    output.push_str(&format!(
+        "\n{} · {} kernels · {} images\n\n",
+        format_bytes(estimated_bytes),
+        kernels.len(),
+        images.len(),
+    ));
+    output.push_str(&format!(
+        "{}\n",
+        paint(
+            "Review the artifacts above. Pruning starts after confirmation.",
+            ANSI_DIM,
+            capabilities.color,
+        )
+    ));
+    output
+}
+
+pub(crate) fn write_prune_preview(
+    kernels: &[String],
+    images: &[(String, String)],
+    estimated_bytes: u64,
+    capabilities: TerminalCapabilities,
+) -> Result<(), io::Error> {
+    let mut stdout = io::stdout().lock();
+    write!(
+        stdout,
+        "{}",
+        format_prune_preview(kernels, images, estimated_bytes, capabilities)
+    )
+}
+
+pub(crate) fn format_prune_result(
+    summary: &taumaru_microvm::PruneSummary,
+    capabilities: TerminalCapabilities,
+) -> String {
+    let mut output = String::from("\n");
+    output.push_str(&format!(
+        "{} {}\n{}\n\n",
+        paint("✓", ANSI_GREEN, capabilities.color),
+        paint("Artifacts pruned", ANSI_BOLD, capabilities.color),
+        divider(capabilities),
+    ));
+    output.push_str(&format!(
+        "  {} removed {} · {}\n",
+        paint("Kernels:", ANSI_DIM, capabilities.color),
+        kernel_count_text(summary.removed_kernels.len()),
+        format_bytes(summary.freed_bytes_kernels),
+    ));
+    for kernel in &summary.removed_kernels {
+        output.push_str(&format!(
+            "  {}  {}\n",
+            paint("•", ANSI_GREEN, capabilities.color),
+            kernel,
+        ));
+    }
+    output.push_str(&format!(
+        "  {} removed {} · {}\n",
+        paint("Images:", ANSI_DIM, capabilities.color),
+        image_count_text(summary.removed_images.len()),
+        format_bytes(summary.freed_bytes_images),
+    ));
+    for image in &summary.removed_images {
+        output.push_str(&format!(
+            "  {}  {} / {}\n",
+            paint("•", ANSI_GREEN, capabilities.color),
+            image.distribution_id,
+            image.image_id,
+        ));
+    }
+    output.push_str(&format!(
+        "\n  {} {}\n",
+        paint("Total freed:", ANSI_DIM, capabilities.color),
+        format_bytes(summary.freed_bytes_total),
+    ));
+    if !summary.skipped_artifact_keys.is_empty() {
+        output.push_str(&format!(
+            "\n{}\n",
+            paint(
+                "Skipped (active transfer, kept intact)",
+                ANSI_BOLD,
+                capabilities.color
+            )
+        ));
+        for key in &summary.skipped_artifact_keys {
+            output.push_str(&format!(
+                "  {}  {} · skipped\n",
+                paint("○", ANSI_YELLOW, capabilities.color),
+                key,
+            ));
+        }
+    }
+    output
+}
+
+pub(crate) fn write_prune_result(
+    summary: &taumaru_microvm::PruneSummary,
+    capabilities: TerminalCapabilities,
+) -> Result<(), io::Error> {
+    let mut stdout = io::stdout().lock();
+    write!(stdout, "{}", format_prune_result(summary, capabilities))
+}
+
+pub(crate) fn format_prune_empty(capabilities: TerminalCapabilities) -> String {
+    let mut output = String::from("\n");
+    output.push_str(&format!(
+        "{} {}\n",
+        paint("○", ANSI_DIM, capabilities.color),
+        paint("Nothing to prune", ANSI_BOLD, capabilities.color)
+    ));
+    output.push_str(&format!(
+        "  {} Every downloaded kernel and image is referenced by an existing MicroVM.\n",
+        paint("State:", ANSI_DIM, capabilities.color)
+    ));
+    output
+}
+
+pub(crate) fn write_prune_empty(capabilities: TerminalCapabilities) -> Result<(), io::Error> {
+    let mut stdout = io::stdout().lock();
+    write!(stdout, "{}", format_prune_empty(capabilities))
+}
+
+pub(crate) fn format_prune_partial(
+    summary: &taumaru_microvm::PruneSummary,
+    failures: &[taumaru_microvm::PruneFailure],
+    capabilities: TerminalCapabilities,
+) -> String {
+    let mut output = format_prune_result(summary, capabilities);
+    output.push_str(&format!(
+        "\n{}\n",
+        paint("Failed", ANSI_BOLD, capabilities.color)
+    ));
+    for failure in failures {
+        output.push_str(&format!(
+            "  {}  {} · failed — {}\n",
+            paint("×", ANSI_RED, capabilities.color),
+            failure.artifact_key,
+            failure.reason,
+        ));
+    }
+    output.push_str(&format!(
+        "\n  {} Repair the cause above, then run `microvm artifacts prune` again.\n",
+        paint("Next:", ANSI_BOLD, capabilities.color)
+    ));
+    output
+}
+
+pub(crate) fn write_prune_partial(
+    summary: &taumaru_microvm::PruneSummary,
+    failures: &[taumaru_microvm::PruneFailure],
+    capabilities: TerminalCapabilities,
+) -> Result<(), io::Error> {
+    let mut stdout = io::stdout().lock();
+    write!(
+        stdout,
+        "{}",
+        format_prune_partial(summary, failures, capabilities)
+    )
+}
+
+fn kernel_count_text(count: usize) -> String {
+    if count == 1 {
+        String::from("1 kernel")
+    } else {
+        format!("{count} kernels")
+    }
+}
+
+fn image_count_text(count: usize) -> String {
+    if count == 1 {
+        String::from("1 image")
+    } else {
+        format!("{count} images")
+    }
+}
+
+#[cfg(test)]
+mod prune_tests {
+    use super::{
+        format_prune_empty, format_prune_partial, format_prune_preview, format_prune_result,
+    };
+    use crate::context::TerminalCapabilities;
+
+    fn capabilities() -> TerminalCapabilities {
+        TerminalCapabilities {
+            interactive: false,
+            color: false,
+            width: Some(120),
+        }
+    }
+
+    fn summary() -> taumaru_microvm::PruneSummary {
+        taumaru_microvm::PruneSummary {
+            removed_kernels: vec!["linux-6.18".to_owned()],
+            removed_images: vec![taumaru_microvm::PrunedImageId {
+                distribution_id: "ubuntu-24.04".to_owned(),
+                image_id: "base".to_owned(),
+            }],
+            skipped_artifact_keys: vec!["kernel:busy-kernel".to_owned()],
+            freed_bytes_kernels: 2048,
+            freed_bytes_images: 3072,
+            freed_bytes_total: 5120,
+        }
+    }
+
+    #[test]
+    fn preview_lists_identities_with_estimated_bytes() {
+        let report = format_prune_preview(
+            &["linux-6.18".to_owned()],
+            &[("ubuntu-24.04".to_owned(), "base".to_owned())],
+            5120,
+            capabilities(),
+        );
+        assert!(report.contains("Prune preview"));
+        assert!(report.contains("linux-6.18"));
+        assert!(report.contains("ubuntu-24.04 / base"));
+        assert!(report.contains("5.0 KiB"));
+        assert!(report.contains("1 kernels"));
+        assert!(report.contains("1 images"));
+    }
+
+    #[test]
+    fn result_groups_removed_and_skipped_with_text_labels() {
+        let report = format_prune_result(&summary(), capabilities());
+        assert!(report.contains("Artifacts pruned"));
+        assert!(report.contains("removed 1 kernel"));
+        assert!(report.contains("removed 1 image"));
+        assert!(report.contains("linux-6.18"));
+        assert!(report.contains("ubuntu-24.04 / base"));
+        assert!(report.contains("2.0 KiB"));
+        assert!(report.contains("3.0 KiB"));
+        assert!(report.contains("5.0 KiB"));
+        assert!(report.contains("Skipped"));
+        assert!(report.contains("kernel:busy-kernel"));
+        assert!(report.contains("skipped"));
+    }
+
+    #[test]
+    fn empty_report_is_calm_with_no_removal_list() {
+        let report = format_prune_empty(capabilities());
+        assert!(report.contains("Nothing to prune"));
+        assert!(!report.contains("removed"));
+        assert!(!report.contains("Failed"));
+    }
+
+    #[test]
+    fn partial_keeps_removed_set_with_named_causes() {
+        let failures = vec![taumaru_microvm::PruneFailure {
+            artifact_key: "kernel:stuck-kernel".to_owned(),
+            reason: "permission denied".to_owned(),
+        }];
+        let report = format_prune_partial(&summary(), &failures, capabilities());
+        assert!(report.contains("linux-6.18"));
+        assert!(report.contains("Failed"));
+        assert!(report.contains("kernel:stuck-kernel"));
+        assert!(report.contains("permission denied"));
+        assert!(report.contains("microvm artifacts prune"));
+    }
+}
+
 #[cfg(test)]
 mod ls_tests {
     use super::{format_ls_empty, format_ls_table};

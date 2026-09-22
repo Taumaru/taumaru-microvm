@@ -397,3 +397,41 @@ fn non_interactive_ls_without_root_reports_privilege_error() {
     assert!(!output.status.success());
     assert!(stderr.to_ascii_lowercase().contains("elevated rights"));
 }
+
+#[test]
+fn prune_help_exposes_flag_only_surface() {
+    let output = run_microvm(&["artifacts", "prune", "--help"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(output.status.success());
+    assert!(stdout.contains("--non-interactive"));
+    assert!(!stdout.contains("--image"));
+    assert!(!stdout.contains("--disk-gb"));
+    assert!(!stdout.contains("--memory"));
+    assert!(!stdout.contains("--vcpus"));
+    assert!(!stdout.contains("--expose-lan"));
+}
+
+#[test]
+fn prune_rejects_positional_name() {
+    let output = run_microvm(&["artifacts", "prune", "web-01"]);
+    assert!(!output.status.success());
+}
+
+#[test]
+fn non_interactive_prune_without_root_reports_privilege_error() {
+    let home = tempfile::tempdir().expect("temporary home should be created");
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_microvm"))
+        .args(["artifacts", "prune", "--non-interactive"])
+        .env("TAUMARU_HOME", home.path())
+        .env_remove("TAUMARU_ESCALATED")
+        .output()
+        .expect("failed to execute microvm");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    if unsafe { libc_geteuid() } == 0 {
+        return;
+    }
+    assert!(!output.status.success());
+    assert!(stderr.to_ascii_lowercase().contains("elevated rights"));
+}
