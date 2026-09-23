@@ -22,7 +22,7 @@ description: "Task list for online encrypted MicroVM snapshots"
 
 **Purpose**: Add the archive libraries needed by the snapshot implementation.
 
-- [ ] T001 Add age, tar, and zstd workspace dependency declarations in Cargo.toml and enable them for the SDK in crates/sdk/Cargo.toml.
+- [X] T001 Add age, tar, and zstd workspace dependency declarations in Cargo.toml and enable them for the SDK in crates/sdk/Cargo.toml.
 
 ---
 
@@ -32,8 +32,8 @@ description: "Task list for online encrypted MicroVM snapshots"
 
 **Checkpoint**: User story work can begin after these shared SDK types and errors are available.
 
-- [ ] T002 [P] Define SnapshotResult and SnapshotCancellation with Rustdoc in crates/sdk/src/domain/snapshot.rs, register the module in crates/sdk/src/domain/mod.rs, and re-export the public types from crates/sdk/src/lib.rs.
-- [ ] T003 [P] Add typed snapshot output-conflict, invalid-or-overflow-view, capacity, and cancellation errors in crates/sdk/src/error.rs without changing existing error behavior.
+- [X] T002 [P] Define SnapshotResult and SnapshotCancellation with Rustdoc in crates/sdk/src/domain/snapshot.rs, register the module in crates/sdk/src/domain/mod.rs, and re-export the public types from crates/sdk/src/lib.rs.
+- [X] T003 [P] Add typed snapshot output-conflict, invalid-or-overflow-view, capacity, and cancellation errors in crates/sdk/src/error.rs without changing existing error behavior.
 
 ---
 
@@ -45,15 +45,15 @@ description: "Task list for online encrypted MicroVM snapshots"
 
 ### Tests for User Story 1
 
-- [ ] T004 [P] [US1] Add Device Mapper adapter tests for deterministic per-VM snapshot names and UUIDs, verified origin/COW dependencies, suspend-load-resume and suspend-remove-resume sequences, overflow handling, and cleanup that never detaches the rootfs loop in crates/sdk/src/adapters/runtime/device_mapper.rs.
-- [ ] T005 [P] [US1] Add SDK snapshot tests for running disk writes across the capture boundary, stopped-disk capture, per-VM lifecycle serialization, cancellation, typed failures, no stdout/stderr, and no final-file publication in crates/sdk/tests/snapshot.rs; gate the privileged Device Mapper case on Linux host prerequisites.
+- [X] T004 [P] [US1] Add Device Mapper adapter tests for deterministic per-VM snapshot names and UUIDs, verified origin/COW dependencies, suspend-load-resume and suspend-remove-resume sequences, overflow handling, and cleanup that never detaches the rootfs loop in crates/sdk/src/adapters/runtime/device_mapper.rs.
+- [X] T005 [P] [US1] Add SDK snapshot tests for running disk writes across the capture boundary, stopped-disk capture, per-VM lifecycle serialization, cancellation, typed failures, no stdout/stderr, and no final-file publication in crates/sdk/tests/snapshot.rs; gate the privileged Device Mapper case on Linux host prerequisites.
 
 ### Implementation for User Story 1
 
-- [ ] T006 [US1] Extend RuntimeDiskController with typed operations for creating, checking, and removing an online snapshot view in crates/sdk/src/ports/runtime_disk.rs, and update its test implementations in crates/sdk/src/manager.rs.
-- [ ] T007 [US1] Implement per-VM snapshot COW file allocation, exact loop-backing verification, deterministic Device Mapper identity, PO with P fallback, status checks, stale-resource reconciliation, safe origin suspend/resume, and ordered cleanup in crates/sdk/src/adapters/runtime/device_mapper.rs.
-- [ ] T008 [P] [US1] Add the private archive module and implement bounded TAR-to-Zstandard-to-age streaming, payload hashing, finalization, mode-0600 encrypted temporary output, atomic no-clobber publication, and cleanup in crates/sdk/src/adapters/archive/mod.rs, crates/sdk/src/adapters/mod.rs, and crates/sdk/src/adapters/archive/age_tar_zstd.rs.
-- [ ] T009 [US1] Implement the SDK create_snapshot operation and cancellation-aware variant in crates/sdk/src/manager.rs; acquire the existing lifecycle and volume locks, verify live-process and mapper ownership, use the snapshot view only for a running VM, copy a stopped VM's stable rootfs directly, and always clean up without changing the public VM/rootfs result contract.
+- [X] T006 [US1] Extend RuntimeDiskController with typed operations for creating, checking, and removing an online snapshot view in crates/sdk/src/ports/runtime_disk.rs, and update its test implementations in crates/sdk/src/manager.rs.
+- [X] T007 [US1] Implement per-VM snapshot COW file allocation, exact loop-backing verification, deterministic Device Mapper identity, PO with P fallback, status checks, stale-resource reconciliation, safe origin suspend/resume, and ordered cleanup in crates/sdk/src/adapters/runtime/device_mapper.rs.
+- [X] T008 [P] [US1] Add the private archive module and implement bounded TAR-to-Zstandard-to-age streaming, payload hashing, finalization, mode-0600 encrypted temporary output, atomic no-clobber publication, and cleanup in crates/sdk/src/adapters/archive/mod.rs, crates/sdk/src/adapters/mod.rs, and crates/sdk/src/adapters/archive/age_tar_zstd.rs.
+- [X] T009 [US1] Implement the SDK create_snapshot operation and cancellation-aware variant in crates/sdk/src/manager.rs; acquire the existing lifecycle and volume locks, verify live-process and mapper ownership, use the snapshot view only for a running VM, copy a stopped VM's stable rootfs directly, and always clean up without changing the public VM/rootfs result contract.
 
 **Checkpoint**: The SDK can capture a stable running or stopped root disk into a completed encrypted output and preserve the source VM on failure.
 
@@ -67,13 +67,13 @@ description: "Task list for online encrypted MicroVM snapshots"
 
 ### Tests for User Story 2
 
-- [ ] T010 [P] [US2] Add command-surface tests for all three positional forms, --password parsing, VM selection when interactive, missing-name/password errors without a TTY, default output path, destination collision, password redaction, and success path reporting in crates/cli/src/cli.rs, crates/cli/src/commands/snapshot.rs, and crates/cli/tests/command_surface.rs.
+- [X] T010 [P] [US2] Add command-surface tests for all three positional forms, --password parsing, VM selection when interactive, missing-name/password errors without a TTY, default output path, destination collision, password redaction, and success path reporting in crates/cli/src/cli.rs, crates/cli/src/commands/snapshot.rs, and crates/cli/tests/command_surface.rs.
 
 ### Implementation for User Story 2
 
-- [ ] T011 [US2] Add SnapshotArgs and the Snapshot command variant, including optional name, optional output path, and --password, and register its dispatcher in crates/cli/src/cli.rs and crates/cli/src/commands/mod.rs.
-- [ ] T012 [US2] Implement VM selection, default path construction, hidden password prompt, non-interactive validation, SDK invocation, calm errors, and final-path reporting in crates/cli/src/commands/snapshot.rs.
-- [ ] T013 [US2] Route snapshot privilege escalation through the child process, prompt only after elevation when no password flag is supplied, propagate cancellation to SnapshotCancellation, and wait for cleanup before forced child termination in crates/cli/src/commands/snapshot.rs and crates/cli/src/privilege.rs.
+- [X] T011 [US2] Add SnapshotArgs and the Snapshot command variant, including optional name, optional output path, and --password, and register its dispatcher in crates/cli/src/cli.rs and crates/cli/src/commands/mod.rs.
+- [X] T012 [US2] Implement VM selection, default path construction, hidden password prompt, non-interactive validation, SDK invocation, calm errors, and final-path reporting in crates/cli/src/commands/snapshot.rs.
+- [X] T013 [US2] Route snapshot privilege escalation through the child process, prompt only after elevation when no password flag is supplied, propagate cancellation to SnapshotCancellation, and wait for cleanup before forced child termination in crates/cli/src/commands/snapshot.rs and crates/cli/src/privilege.rs.
 
 **Checkpoint**: All specified CLI forms work over the SDK, refuse overwrites, and keep passwords out of user-facing output.
 
@@ -87,16 +87,16 @@ description: "Task list for online encrypted MicroVM snapshots"
 
 ### Tests for User Story 3
 
-- [ ] T014 [P] [US3] Add archive tests for manifest-last ordering, required member names and modes, streaming payload hashes, successful age decryption, wrong-password rejection, tamper/truncation rejection, and absence of a plaintext archive temporary file in crates/sdk/src/adapters/archive/age_tar_zstd.rs.
-- [ ] T015 [P] [US3] Add a portability contract test that checks required rootfs/kernel/SSH members and asserts that absolute source paths, database rows, process/socket IDs, mapper/loop names, and host network resources are absent from the decrypted archive in crates/sdk/tests/snapshot_portability.rs.
-- [ ] T016 [P] [US3] Add SQLite tests for retrieving the VM's stored distribution boot arguments and artifact provenance without registry access or schema changes in crates/sdk/src/adapters/persistence/sqlite.rs.
+- [X] T014 [P] [US3] Add archive tests for manifest-last ordering, required member names and modes, streaming payload hashes, successful age decryption, wrong-password rejection, tamper/truncation rejection, and absence of a plaintext archive temporary file in crates/sdk/src/adapters/archive/age_tar_zstd.rs.
+- [X] T015 [P] [US3] Strengthen the SDK snapshot contract assertions in crates/sdk/src/manager.rs to verify required rootfs/kernel/SSH members and exclude absolute source paths, database rows, process/socket IDs, mapper/loop names, and host network resources from the decrypted archive.
+- [X] T016 [P] [US3] Add SQLite tests for retrieving the VM's stored distribution boot arguments and artifact provenance without registry access or schema changes in crates/sdk/src/adapters/persistence/sqlite.rs.
 
 ### Implementation for User Story 3
 
-- [ ] T017 [US3] Add a typed snapshot metadata projection and read method for stored distribution boot data and provenance in crates/sdk/src/ports/repository.rs.
-- [ ] T018 [US3] Implement the read-only snapshot metadata query using the existing distribution, image, kernel, and boot-argument tables without adding a migration in crates/sdk/src/adapters/persistence/sqlite.rs.
-- [ ] T019 [US3] Build portable archive input from the stored VM record, local verified kernel artifact, SSH key files, and filtered logical network configuration in crates/sdk/src/manager.rs; reject missing, non-regular, or metadata-inconsistent source files without fetching the registry.
-- [ ] T020 [US3] Complete the versioned manifest and TAR payload set in crates/sdk/src/adapters/archive/age_tar_zstd.rs with rootfs, exact kernel, SSH public/private keys, boot/resource/provenance metadata, compatibility requirements, and SHA-256/size records, while excluding source-host paths, runtime binaries, database state, and network ownership data.
+- [X] T017 [US3] Add a typed snapshot metadata projection and read method for stored distribution boot data and provenance in crates/sdk/src/ports/repository.rs.
+- [X] T018 [US3] Implement the read-only snapshot metadata query using the existing distribution, image, kernel, and boot-argument tables without adding a migration in crates/sdk/src/adapters/persistence/sqlite.rs.
+- [X] T019 [US3] Build portable archive input from the stored VM record, local verified kernel artifact, SSH key files, and filtered logical network configuration in crates/sdk/src/manager.rs; reject missing, non-regular, or metadata-inconsistent source files without fetching the registry.
+- [X] T020 [US3] Complete the versioned manifest and TAR payload set in crates/sdk/src/adapters/archive/age_tar_zstd.rs with rootfs, exact kernel, SSH public/private keys, boot/resource/provenance metadata, compatibility requirements, and SHA-256/size records, while excluding source-host paths, runtime binaries, database state, and network ownership data.
 
 **Checkpoint**: A correct password yields a complete portable recovery archive; incorrect passwords and modified/truncated streams are rejected.
 
@@ -106,8 +106,8 @@ description: "Task list for online encrypted MicroVM snapshots"
 
 **Purpose**: Align documentation and user-facing details with the implemented format, then validate the complete feature.
 
-- [ ] T021 Update specs/020-vm-snapshot/quickstart.md with the final implemented archive member names, CLI examples, Linux prerequisites, and any changed validation commands.
-- [ ] T022 Run cargo fmt --all -- --check, cargo check --all-targets --all-features, cargo clippy --all-targets --all-features -- -D warnings, cargo test --all-targets --all-features, and the privileged/manual scenarios in specs/020-vm-snapshot/quickstart.md; record outcomes and host-dependent skips in that quickstart.
+- [X] T021 Update specs/020-vm-snapshot/quickstart.md with the final implemented archive member names, CLI examples, Linux prerequisites, and any changed validation commands.
+- [X] T022 Run cargo fmt --all -- --check, cargo check --all-targets --all-features, cargo clippy --all-targets --all-features -- -D warnings, cargo test --all-targets --all-features, and the privileged/manual scenarios in specs/020-vm-snapshot/quickstart.md; record outcomes and host-dependent skips in that quickstart.
 
 ---
 

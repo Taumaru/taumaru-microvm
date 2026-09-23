@@ -250,9 +250,22 @@ impl StoredMicroVm {
     }
 }
 
+/// Portable distribution and kernel boot metadata required to recreate a VM.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SnapshotStoredMetadata {
+    pub distribution_name: String,
+    pub distribution_version: String,
+    pub root_device: String,
+    pub kernel_args: Vec<String>,
+    pub image_sha256: String,
+    pub guest_architecture: String,
+}
+
 /// Local inventory and lifecycle persistence for MicroVM records.
 pub(crate) trait MicroVmRepository: Send + Sync {
     fn find_microvm(&self, name: &str) -> Result<Option<StoredMicroVm>, SdkError>;
+
+    fn snapshot_metadata(&self, name: &str) -> Result<SnapshotStoredMetadata, SdkError>;
 
     fn list_stored_microvms(&self) -> Result<Vec<StoredMicroVm>, SdkError>;
 

@@ -1172,8 +1172,8 @@ pub(crate) async fn run(context: &CliContext, arguments: DownloadArgs) -> Result
             "--non-interactive requires at least one --image DISTRIBUTION_ID=IMAGE_ID".to_owned(),
         ));
     }
-    if arguments.non_interactive {
-        if let Some(exit) = crate::privilege::require_privileged(
+    if arguments.non_interactive
+        && let Some(exit) = crate::privilege::require_privileged(
             &crate::privilege::SystemPrivilege,
             context.terminal,
             true,
@@ -1183,9 +1183,8 @@ pub(crate) async fn run(context: &CliContext, arguments: DownloadArgs) -> Result
             "Run the same command with sudo or as root",
         )
         .await?
-        {
-            return Ok(exit);
-        }
+    {
+        return Ok(exit);
     }
 
     let client = SdkArtifactClient::new(&context.sdk);

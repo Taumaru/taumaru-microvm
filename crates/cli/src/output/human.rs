@@ -1,4 +1,6 @@
 use std::io::{self, Write};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crate::commands::download::DownloadProgressView;
@@ -9,7 +11,7 @@ use crate::commands::new::{
 use crate::context::TerminalCapabilities;
 use crate::output::ProgressSink;
 use indicatif::{ProgressBar, ProgressStyle};
-use taumaru_microvm::DownloadPhase;
+use taumaru_microvm::{DownloadPhase, SnapshotProgress, SnapshotProgressStage};
 
 const ANSI_BOLD: &str = "\u{1b}[1m";
 const ANSI_DIM: &str = "\u{1b}[2m";
@@ -237,6 +239,83 @@ impl ProgressRenderer {
         if self.capabilities.interactive {
             self.bar.finish_and_clear();
         }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct SnapshotProgressRenderer {
+    bar: ProgressBar,
+    interactive: bool,
+    color: bool,
+    determinate: Arc<AtomicBool>,
+}
+
+impl SnapshotProgressRenderer {
+    pub(crate) fn new(vm_name: &str, capabilities: TerminalCapabilities) -> Self {
+        let bar = if capabilities.interactive {
+            ProgressBar::new_spinner()
+        } else {
+            ProgressBar::hidden()
+        };
+        bar.set_style(snapshot_progress_style(capabilities.color, false));
+        bar.set_message(format!("Preparing snapshot for {vm_name}"));
+        if capabilities.interactive {
+            bar.enable_steady_tick(Duration::from_millis(90));
+        }
+        Self {
+            bar,
+            interactive: capabilities.interactive,
+            color: capabilities.color,
+            determinate: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    pub(crate) fn on_progress(&self, progress: SnapshotProgress) {
+        let has_byte_progress = matches!(
+            progress.stage,
+            SnapshotProgressStage::AllocatingCowStore | SnapshotProgressStage::StreamingPayloads
+        );
+        if self.determinate.swap(has_byte_progress, Ordering::AcqRel) != has_byte_progress {
+            self.bar
+                .set_style(snapshot_progress_style(self.color, has_byte_progress));
+        }
+        if has_byte_progress {
+            self.bar.set_length(progress.total_bytes.max(1));
+            self.bar
+                .set_position(progress.completed_bytes.min(progress.total_bytes));
+        }
+        let message = match progress.stage {
+            SnapshotProgressStage::PreparingDiskView => "Preparing point-in-time disk view",
+            SnapshotProgressStage::AllocatingCowStore => "Allocating snapshot COW store",
+            SnapshotProgressStage::InstallingDiskView => "Installing snapshot block view",
+            SnapshotProgressStage::PreparingArchive => "Preparing encrypted archive",
+            SnapshotProgressStage::StreamingPayloads => "Copying and encrypting snapshot",
+            SnapshotProgressStage::FinalizingArchive => "Finalizing encrypted snapshot",
+        };
+        self.bar.set_message(message);
+    }
+
+    pub(crate) fn finish(self) {
+        if self.interactive {
+            self.bar.finish_and_clear();
+        }
+    }
+}
+
+fn snapshot_progress_style(color: bool, determinate: bool) -> ProgressStyle {
+    let template = match (color, determinate) {
+        (true, true) => "{spinner:.dim} {bar:28} {bytes}/{total_bytes} {msg}",
+        (false, true) => "{spinner} {bar:28} {bytes}/{total_bytes} {msg}",
+        (true, false) => "{spinner:.dim} {msg}",
+        (false, false) => "{spinner} {msg}",
+    };
+    match ProgressStyle::with_template(template) {
+        Ok(style) if determinate => style
+            .progress_chars("━╸─")
+            .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
+        Ok(style) => style.tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
+        Err(_) if determinate => ProgressStyle::default_bar().progress_chars("=>-"),
+        Err(_) => ProgressStyle::default_spinner(),
     }
 }
 

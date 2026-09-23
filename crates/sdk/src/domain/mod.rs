@@ -3,6 +3,7 @@ pub mod config;
 pub mod lifecycle;
 pub mod microvm;
 pub mod registry;
+pub mod snapshot;
 
 pub use artifact::{
     ArtifactKind, DownloadCancellation, DownloadDisposition, DownloadPhase, DownloadProgress,
@@ -21,3 +22,5 @@ pub use registry::{
     DistributionImage, DistributionRequirements, ElfMetadata, Endianness, FilesystemMetadata,
     Kernel, Linkage,
 };
+
+pub use snapshot::{SnapshotCancellation, SnapshotProgress, SnapshotProgressStage, SnapshotResult};

@@ -5,6 +5,7 @@
 - Linux host with loop devices and Device Mapper snapshot support.
 - The SDK home contains a complete VM, root disk, cached guest kernel, SSH credentials, and local boot metadata.
 - For online capture, the VM is running through its verified per-VM snapshot-origin mapping.
+- The host exposes loop devices and the Device Mapper `snapshot` target (`dmsetup targets` lists it).
 - The caller has permission to manage loop and Device Mapper resources.
 - Enough free space exists for the temporary COW file and encrypted output.
 - rage, zstd, and GNU tar are available for inspecting a generated archive in manual validation.
@@ -46,6 +47,26 @@ Verify that an existing destination is refused and is not changed. Verify that i
 
 After successful creation, decrypt and inspect the TAR listing without extracting payloads:
 
-    rage --decrypt <NAME>.tmvmsnap | zstd --decompress --stdout | tar --list
+    rage --decrypt <NAME>.tmvmsnap | zstd --decompress --stdout | tar --list --file=-
 
-Then extract or stream the archive to a private temporary directory for manual checks. Confirm that the manifest is last, includes the supported version, and lists hashes and sizes that match the payloads. A wrong password or modified/truncated ciphertext must be rejected by age authentication. Delete any manual plaintext extraction after validation.
+Version 1 contains these TAR members in order:
+
+    payload/rootfs.ext4
+    payload/kernel/vmlinux
+    payload/ssh/id_ed25519
+    payload/ssh/id_ed25519.pub
+    manifest.json
+
+The manifest is last and records each payload's byte count and SHA-256 digest, along with portable VM, boot, network-intent, SSH, and compatibility metadata. It excludes host paths, database state, process and socket identity, loop and mapper names, and host network ownership details. The root disk and private SSH key members use mode 0600.
+
+Confirm that a valid password lists all five members and that a wrong password or modified/truncated ciphertext is rejected by age authentication. Avoid extracting plaintext except into a private temporary directory, and delete any manual plaintext after validation.
+
+## Validation record
+
+Validation run for this implementation:
+
+- PASS: `cargo fmt --all -- --check`
+- PASS: `cargo check --all-targets --all-features`
+- PASS: `cargo clippy --all-targets --all-features -- -D warnings`
+- PASS: `cargo test --all-targets --all-features`
+- SKIPPED: privileged live Device Mapper capture. `/dev/kvm` and `/dev/mapper/control` exist, but `dmsetup targets` returned `Permission denied` for the current UID (1000), and no active fixture MicroVM was available. Unit tests validate command sequencing and ownership checks, but do not replace a kernel-level live-write test. Run the manual online scenario as root on a host with loop and Device Mapper snapshot permissions.

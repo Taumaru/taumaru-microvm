@@ -18,7 +18,8 @@ use crate::domain::registry::{
 use crate::error::SdkError;
 use crate::ports::repository::{
     ArtifactRepository, InventoryState, LocalArtifact, MicroVmRepository, OrphanArtifactDownload,
-    OrphanIdentity, PrunableImage, PrunableKernel, PruneReferences, StoredMicroVm,
+    OrphanIdentity, PrunableImage, PrunableKernel, PruneReferences, SnapshotStoredMetadata,
+    StoredMicroVm,
 };
 
 use super::migrations;
@@ -934,6 +935,53 @@ impl ArtifactRepository for SqliteRepository {
 }
 
 impl MicroVmRepository for SqliteRepository {
+    fn snapshot_metadata(&self, name: &str) -> Result<SnapshotStoredMetadata, SdkError> {
+        let connection = self.connection()?;
+        let metadata = connection
+            .query_row(
+                "SELECT d.display_name, d.version, d.root_device, di.sha256, k.architecture
+                 FROM microvms m
+                 JOIN distributions d ON d.registry_id = m.distribution_id
+                 JOIN distribution_images di
+                   ON di.distribution_id = d.id AND di.registry_id = m.image_id
+                 JOIN distribution_kernels dk ON dk.distribution_id = d.id
+                 JOIN kernels k ON k.id = dk.kernel_id AND k.registry_id = m.kernel_id
+                 WHERE m.name = ?1",
+                params![name],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or_else(|| SdkError::InvalidMetadata {
+                artifact: name.to_owned(),
+                reason: "stored distribution, image, or kernel provenance is incomplete".to_owned(),
+            })?;
+        let mut statement = connection.prepare(
+            "SELECT argument FROM distribution_boot_args
+             WHERE distribution_id = (SELECT id FROM distributions WHERE registry_id =
+                 (SELECT distribution_id FROM microvms WHERE name = ?1))
+             ORDER BY position",
+        )?;
+        let kernel_args = statement
+            .query_map(params![name], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(SnapshotStoredMetadata {
+            distribution_name: metadata.0,
+            distribution_version: metadata.1,
+            root_device: metadata.2,
+            kernel_args,
+            image_sha256: metadata.3,
+            guest_architecture: metadata.4,
+        })
+    }
+
     fn find_microvm(&self, name: &str) -> Result<Option<StoredMicroVm>, SdkError> {
         let connection = self.connection()?;
         let row = connection
@@ -2217,7 +2265,7 @@ fn image_is_referenced(
 mod tests {
     use tempfile::TempDir;
 
-    use crate::ports::repository::ArtifactRepository;
+    use crate::ports::repository::{ArtifactRepository, MicroVmRepository};
 
     use super::{SqliteRepository, open_connection};
 
@@ -2227,6 +2275,131 @@ mod tests {
         let repository =
             SqliteRepository::initialize(database_path).expect("repository should initialize");
         (directory, repository)
+    }
+
+    #[test]
+    fn reads_snapshot_boot_metadata_from_sqlite_without_registry_or_schema_changes() {
+        let (directory, repository) = empty_repository();
+        let database_path = directory.path().join("inventory.db");
+        let connection = open_connection(&database_path).expect("inventory connection should open");
+        connection
+            .execute(
+                "INSERT INTO distributions (
+                    registry_id, name, display_name, description, distribution, version,
+                    codename, architecture, vendor, homepage, default_kernel_registry_id,
+                    root_device, min_memory_mb, min_vcpus, created_at, updated_at
+                ) VALUES ('distro-1', 'linux-fixture', 'Linux Fixture', 'fixture', 'Linux',
+                          '1.0', 'stable', 'x86_64', 'Taumaru', 'https://fixture.invalid',
+                          'kernel-1', '/dev/vda', 128, 1, 1, 1)",
+                [],
+            )
+            .expect("distribution should insert");
+        connection
+            .execute(
+                "INSERT INTO kernels (
+                    registry_id, download_id, name, display_name, version, architecture,
+                    registry_path, registry_url, filename, size_bytes, sha256, format,
+                    mime_type, modified_at, created_at, updated_at
+                ) VALUES ('kernel-1', NULL, 'linux', 'Linux Kernel', '1.0', 'x86_64',
+                          'kernels/vmlinux', 'https://fixture.invalid/kernel', 'vmlinux',
+                          4, ?1, 'elf', 'application/octet-stream', '2026-09-23T00:00:00Z', 1, 1)",
+                rusqlite::params!["a".repeat(64)],
+            )
+            .expect("kernel should insert");
+        let distribution_row: i64 = connection
+            .query_row(
+                "SELECT id FROM distributions WHERE registry_id = 'distro-1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("distribution row should exist");
+        connection
+            .execute(
+                "INSERT INTO distribution_kernels (distribution_id, kernel_id, is_default)
+                 VALUES (?1, (SELECT id FROM kernels WHERE registry_id = 'kernel-1'), 1)",
+                rusqlite::params![distribution_row],
+            )
+            .expect("default kernel relation should insert");
+        connection
+            .execute(
+                "INSERT INTO downloads (
+                    artifact_key, artifact_type, registry_path, registry_url, filename,
+                    relative_path, absolute_path, expected_size_bytes, expected_sha256,
+                    actual_size_bytes, actual_sha256, verification_status, created_at, updated_at
+                ) VALUES ('distribution_image:distro-1:image-1', 'distribution_image',
+                    'images/rootfs.ext4', 'https://fixture.invalid/rootfs', 'rootfs.ext4',
+                    'artifacts/rootfs.ext4', ?1, 4, ?2, 4, ?2, 'verified', 1, 1)",
+                rusqlite::params![
+                    directory
+                        .path()
+                        .join("rootfs.ext4")
+                        .to_string_lossy()
+                        .as_ref(),
+                    "b".repeat(64)
+                ],
+            )
+            .expect("image download should insert");
+        let download_id: i64 = connection
+            .query_row(
+                "SELECT id FROM downloads WHERE artifact_key = 'distribution_image:distro-1:image-1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("image download should be present");
+        connection
+            .execute(
+                "INSERT INTO distribution_images (
+                    distribution_id, download_id, registry_id, name, display_name, description,
+                    variant, format, registry_path, registry_url, filename, size_bytes, sha256,
+                    mime_type, modified_at, created_at, updated_at
+                ) VALUES (?1, ?2, 'image-1', 'minimal', 'Minimal', 'fixture image',
+                          'minimal', 'ext4', 'images/rootfs.ext4',
+                          'https://fixture.invalid/rootfs', 'rootfs.ext4', 4, ?3,
+                          'application/octet-stream', '2026-09-23T00:00:00Z', 1, 1)",
+                rusqlite::params![distribution_row, download_id, "b".repeat(64)],
+            )
+            .expect("distribution image should insert");
+        connection
+            .execute(
+                "INSERT INTO microvms (
+                    name, distribution_id, image_id, kernel_id, firecracker_package_id,
+                    firectl_package_id, disk_size_bytes, memory_requested_bytes,
+                    memory_effective_mib, vcpu_count, volume_path, rootfs_path, socket_path,
+                    expose_on_lan, created_at, updated_at
+                ) VALUES ('vm-1', 'distro-1', 'image-1', 'kernel-1', 'fc-1', 'firectl-1',
+                          4, 134217728, 128, 1, '/tmp/vms/vm-1', '/tmp/vms/vm-1/rootfs.ext4',
+                          '/tmp/vms/vm-1/firecracker.sock', 0, 1, 1)",
+                [],
+            )
+            .expect("VM row should insert");
+        connection
+            .execute(
+                "INSERT INTO distribution_boot_args (distribution_id, position, argument)
+                 VALUES (?1, 0, 'console=ttyS0'), (?1, 1, 'panic=1')",
+                rusqlite::params![distribution_row],
+            )
+            .expect("boot args should insert");
+        let schema_version: i64 = connection
+            .query_row("SELECT max(version) FROM schema_migrations", [], |row| {
+                row.get(0)
+            })
+            .expect("schema version should be readable");
+        drop(connection);
+
+        let metadata = repository
+            .snapshot_metadata("vm-1")
+            .expect("snapshot metadata should be read from the local inventory");
+
+        assert_eq!(metadata.distribution_name, "Linux Fixture");
+        assert_eq!(metadata.distribution_version, "1.0");
+        assert_eq!(metadata.root_device, "/dev/vda");
+        assert_eq!(metadata.kernel_args, ["console=ttyS0", "panic=1"]);
+        assert_eq!(metadata.image_sha256, "b".repeat(64));
+        assert_eq!(metadata.guest_architecture, "x86_64");
+        assert_eq!(
+            schema_version, 4,
+            "snapshot metadata must not require a migration"
+        );
     }
 
     fn seed_binary_repository() -> (TempDir, SqliteRepository) {

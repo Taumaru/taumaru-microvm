@@ -1,3 +1,4 @@
+pub(crate) mod archive;
 pub(crate) mod credentials;
 pub(crate) mod network;
 pub(crate) mod persistence;

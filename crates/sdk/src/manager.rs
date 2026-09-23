@@ -10,6 +10,9 @@ use sha2::{Digest, Sha256};
 use tokio::fs as async_fs;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+use crate::adapters::archive::age_tar_zstd::{
+    self, SnapshotArchiveInput, SnapshotPayload, SnapshotPortableMetadata,
+};
 use crate::adapters::credentials::ed25519::Ed25519CredentialStore;
 use crate::adapters::network::linux::LinuxNetworkController;
 use crate::adapters::persistence::sqlite::SqliteRepository;
@@ -37,6 +40,9 @@ use crate::domain::registry::{
     Architecture, BinaryFile, BinaryPackage, Distribution, DistributionImage, Kernel,
     TaumaruRegistry,
 };
+use crate::domain::snapshot::{
+    SnapshotCancellation, SnapshotProgress, SnapshotProgressStage, SnapshotResult,
+};
 use crate::error::SdkError;
 use crate::ports::artifacts::ArtifactSource;
 use crate::ports::credentials::CredentialStore;
@@ -54,6 +60,14 @@ const STOP_EXIT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(6
 /// Re-verification wait after SIGKILL before reporting the forced outcome.
 const STOP_KILL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+struct SnapshotFutureCancellation(tokio_util::sync::CancellationToken);
+
+impl Drop for SnapshotFutureCancellation {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CacheDecision {
     Replace,
@@ -284,6 +298,16 @@ fn creation_terminal_event(
         bytes_completed: None,
         expected_bytes: None,
         outcome: Some(outcome),
+    }
+}
+
+fn snapshot_cleanup_error(primary: SdkError, cleanup: Option<SdkError>) -> SdkError {
+    match cleanup {
+        Some(cleanup) => SdkError::Cleanup {
+            primary: primary.to_string(),
+            failures: vec![cleanup.to_string()],
+        },
+        None => primary,
     }
 }
 
@@ -790,6 +814,330 @@ impl MicroVmSdk {
     /// The observer is caller-owned, infallible, and non-blocking, and cannot change
     /// integrity, persistence, or error decisions. When `None`, no events are emitted
     /// and behavior is identical to an unobserved creation.
+    /// Creates one encrypted, portable snapshot of a stopped or running MicroVM.
+    ///
+    /// A running VM remains active while a Device Mapper snapshot view preserves the disk
+    /// contents captured at the point the view is attached. This is a disk-only,
+    /// crash-consistent snapshot; it does not include guest memory or application quiescing.
+    /// Existing output files are never overwritten.
+    pub async fn create_snapshot(
+        &self,
+        vm_name: &str,
+        output_path: &Path,
+        password: &str,
+    ) -> Result<SnapshotResult, SdkError> {
+        self.create_snapshot_with_cancellation(
+            vm_name,
+            output_path,
+            password,
+            SnapshotCancellation::new(),
+        )
+        .await
+    }
+
+    /// Creates an encrypted MicroVM snapshot and observes a caller-owned cancellation handle.
+    ///
+    /// Cancellation is cooperative between bounded disk reads. The operation retains its
+    /// per-VM locks and cleans up temporary snapshot resources before returning. Dropping the
+    /// returned future also requests cancellation; its blocking worker keeps the locks until
+    /// cleanup finishes.
+    pub async fn create_snapshot_with_cancellation(
+        &self,
+        vm_name: &str,
+        output_path: &Path,
+        password: &str,
+        cancellation: SnapshotCancellation,
+    ) -> Result<SnapshotResult, SdkError> {
+        self.create_snapshot_with_cancellation_and_progress(
+            vm_name,
+            output_path,
+            password,
+            cancellation,
+            |_| {},
+        )
+        .await
+    }
+
+    /// Creates an encrypted snapshot, reports operation progress, and observes cancellation.
+    ///
+    /// Progress events report COW-store allocation and uncompressed payload bytes read into the
+    /// archive stream. The callback runs synchronously on the snapshot's blocking worker, so it
+    /// should return promptly and avoid blocking operations. The callback owns its output policy;
+    /// the SDK itself remains silent.
+    pub async fn create_snapshot_with_cancellation_and_progress<F>(
+        &self,
+        vm_name: &str,
+        output_path: &Path,
+        password: &str,
+        cancellation: SnapshotCancellation,
+        on_progress: F,
+    ) -> Result<SnapshotResult, SdkError>
+    where
+        F: FnMut(SnapshotProgress) + Send + 'static,
+    {
+        crate::domain::config::validate_vm_name(vm_name)?;
+        if password.is_empty() {
+            return Err(SdkError::InvalidRequest {
+                field: "password".to_owned(),
+                reason: "must not be empty".to_owned(),
+            });
+        }
+        let runtime_lock = acquire_lifecycle_lock(&self.home, vm_name).await?;
+        let lookup_name = vm_name.to_owned();
+        let name_lock = self.target_lock(&self.home.join("vms").join(vm_name))?;
+        let name_guard = name_lock.lock_owned().await;
+        let stored = self
+            .run_repository(move |repository| repository.find_microvm(&lookup_name))
+            .await?
+            .ok_or_else(|| SdkError::NotFound {
+                kind: "MicroVM".to_owned(),
+                id: vm_name.to_owned(),
+            })?;
+        stored.require_complete("create snapshot")?;
+        validate_start_prerequisites(&stored)?;
+        let volume_guard = if stored.record.volume_path != self.home.join("vms").join(vm_name) {
+            Some(
+                self.target_lock(&stored.record.volume_path)?
+                    .lock_owned()
+                    .await,
+            )
+        } else {
+            None
+        };
+
+        let running = self.snapshot_source_is_running(&stored)?;
+        let metadata_name = stored.record.name.clone();
+        let stored_metadata = self
+            .run_repository(move |repository| repository.snapshot_metadata(&metadata_name))
+            .await?;
+        let kernel_id = stored.record.kernel_id.clone();
+        let kernel = self
+            .run_repository(move |repository| repository.resolve_kernel(&kernel_id))
+            .await?;
+        verify_regular_file(&kernel.path, "verify snapshot kernel")?;
+        let kernel_metadata = fs::metadata(&kernel.path).map_err(|error| {
+            SdkError::filesystem("inspect snapshot kernel", &kernel.path, error)
+        })?;
+        if kernel_metadata.len() != kernel.size_bytes {
+            return Err(SdkError::ArtifactPrerequisite {
+                kind: "kernel".to_owned(),
+                id: stored.record.kernel_id.clone(),
+                path: kernel.path,
+                reason: "the local kernel size does not match its verified inventory".to_owned(),
+            });
+        }
+        let (network, credential, _) = stored.require_full("create snapshot")?;
+        let rootfs_size = fs::metadata(&stored.record.rootfs_path)
+            .map_err(|error| {
+                SdkError::filesystem(
+                    "inspect snapshot root disk",
+                    &stored.record.rootfs_path,
+                    error,
+                )
+            })?
+            .len();
+        if rootfs_size != stored.record.disk_size_bytes {
+            return Err(SdkError::GuestFilesystem {
+                operation: "validate snapshot root disk".to_owned(),
+                path: stored.record.rootfs_path.clone(),
+                reason: "the root disk size no longer matches the VM record".to_owned(),
+            });
+        }
+        let input = SnapshotArchiveInput {
+            vm_name: stored.record.name.clone(),
+            output_path: output_path.to_path_buf(),
+            password: password.to_owned(),
+            metadata: SnapshotPortableMetadata {
+                guest_architecture: stored_metadata.guest_architecture,
+                distribution_id: stored.record.distribution_id.clone(),
+                distribution_name: stored_metadata.distribution_name,
+                distribution_version: stored_metadata.distribution_version,
+                image_id: stored.record.image_id.clone(),
+                image_sha256: stored_metadata.image_sha256,
+                kernel_id: stored.record.kernel_id.clone(),
+                disk_size_bytes: stored.record.disk_size_bytes,
+                memory_bytes: stored.record.memory_bytes,
+                memory_effective_mib: stored.record.memory_effective_mib,
+                vcpu_count: stored.record.vcpu_count,
+                root_device: stored_metadata.root_device,
+                kernel_args: stored_metadata.kernel_args,
+                network_mode: network.config.mode.to_string(),
+                expose_on_lan: stored.record.expose_on_lan,
+                guest_mac: network.guest_mac.clone(),
+                ssh_user: credential.ssh_user.clone(),
+                ssh_port: credential.ssh_port,
+                ssh_key_type: credential.key_type.clone(),
+                ssh_public_key_fingerprint: credential.public_key_fingerprint.clone(),
+            },
+            payloads: vec![
+                SnapshotPayload {
+                    archive_path: "payload/rootfs.ext4",
+                    source_path: stored.record.rootfs_path.clone(),
+                    mode: 0o600,
+                    expected_size_bytes: Some(stored.record.disk_size_bytes),
+                    expected_sha256: None,
+                },
+                SnapshotPayload {
+                    archive_path: "payload/kernel/vmlinux",
+                    source_path: kernel.path,
+                    mode: 0o644,
+                    expected_size_bytes: Some(kernel.size_bytes),
+                    expected_sha256: Some(kernel.sha256),
+                },
+                SnapshotPayload {
+                    archive_path: "payload/ssh/id_ed25519",
+                    source_path: credential.private_key_path.clone(),
+                    mode: 0o600,
+                    expected_size_bytes: None,
+                    expected_sha256: None,
+                },
+                SnapshotPayload {
+                    archive_path: "payload/ssh/id_ed25519.pub",
+                    source_path: credential.public_key_path.clone(),
+                    mode: 0o644,
+                    expected_size_bytes: None,
+                    expected_sha256: None,
+                },
+            ],
+        };
+
+        let home = self.home.clone();
+        let vm_name = stored.record.name.clone();
+        let rootfs_path = stored.record.rootfs_path.clone();
+        let runtime_disk = Arc::clone(&self.runtime_disk);
+        let token = cancellation.token();
+        let future_cancellation = SnapshotFutureCancellation(token.clone());
+        let worker = tokio::task::spawn_blocking(move || {
+            let _runtime_lock = runtime_lock;
+            let _name_guard = name_guard;
+            let _volume_guard = volume_guard;
+            if token.is_cancelled() {
+                return Err(SdkError::SnapshotCancelled);
+            }
+            let mut input = input;
+            let mut on_progress = on_progress;
+            if running {
+                on_progress(SnapshotProgress {
+                    stage: SnapshotProgressStage::PreparingDiskView,
+                    completed_bytes: 0,
+                    total_bytes: 0,
+                });
+            }
+            let snapshot_view = if running {
+                Some(runtime_disk.create_snapshot_view(
+                    &home,
+                    &vm_name,
+                    &rootfs_path,
+                    &mut on_progress,
+                )?)
+            } else {
+                None
+            };
+            on_progress(SnapshotProgress {
+                stage: SnapshotProgressStage::PreparingArchive,
+                completed_bytes: 0,
+                total_bytes: 0,
+            });
+            if let Some(path) = snapshot_view.as_ref() {
+                input.payloads[0].source_path = path.clone();
+            }
+            let view_disk = Arc::clone(&runtime_disk);
+            let view_home = home.clone();
+            let view_name = vm_name.clone();
+            let view_rootfs = rootfs_path.clone();
+            let archive_result = age_tar_zstd::create_archive_with_progress(
+                input,
+                token.clone(),
+                move || {
+                    if running {
+                        view_disk.check_snapshot_view(&view_home, &view_name, &view_rootfs)
+                    } else {
+                        Ok(())
+                    }
+                },
+                on_progress,
+            );
+            let cleanup_result = if snapshot_view.is_some() {
+                runtime_disk.remove_snapshot_view(&home, &vm_name, &rootfs_path)
+            } else {
+                Ok(())
+            };
+            match (archive_result, cleanup_result) {
+                (Ok(archive), Ok(())) => Ok(SnapshotResult {
+                    vm_name,
+                    output_path: archive.output_path,
+                    encrypted_size_bytes: archive.encrypted_size_bytes,
+                    source_was_running: running,
+                }),
+                (Err(primary), Ok(())) => Err(primary),
+                (Ok(archive), Err(cleanup)) => {
+                    let output_cleanup = fs::remove_file(&archive.output_path).err().map(|error| {
+                        SdkError::filesystem(
+                            "remove unpublished snapshot after cleanup failure",
+                            &archive.output_path,
+                            error,
+                        )
+                    });
+                    Err(snapshot_cleanup_error(cleanup, output_cleanup))
+                }
+                (Err(primary), Err(cleanup)) => Err(snapshot_cleanup_error(primary, Some(cleanup))),
+            }
+        });
+        let result = worker.await?;
+        drop(future_cancellation);
+        result
+    }
+
+    fn snapshot_source_is_running(&self, stored: &StoredMicroVm) -> Result<bool, SdkError> {
+        let socket_live = self.socket_answers(&stored.record.socket_path)?;
+        let runtime = stored
+            .runtime
+            .as_ref()
+            .ok_or_else(|| SdkError::LifecycleConflict {
+                name: stored.record.name.clone(),
+                state: "creation incomplete".to_owned(),
+                operation: "create snapshot".to_owned(),
+            })?;
+        if socket_live {
+            if runtime.process_state != "running" {
+                return Err(SdkError::LifecycleConflict {
+                    name: stored.record.name.clone(),
+                    state: runtime.process_state.clone(),
+                    operation: "snapshot a transitioning VM".to_owned(),
+                });
+            }
+            let process_id = runtime
+                .process_id
+                .ok_or_else(|| SdkError::TemporaryRuntime {
+                    component: "firecracker".to_owned(),
+                    reason: "the live VM has no recorded process identifier".to_owned(),
+                    stopped: false,
+                })?;
+            if !self.runtime.process_references_vm(
+                process_id,
+                &stored.record.socket_path,
+                &runtime.firectl_path,
+                &runtime.firecracker_path,
+            )? {
+                return Err(SdkError::TemporaryRuntime {
+                    component: "firecracker".to_owned(),
+                    reason: "the live VM process does not match its persisted identity".to_owned(),
+                    stopped: false,
+                });
+            }
+            return Ok(true);
+        }
+        self.verify_recorded_process_exited(stored)?;
+        if runtime.process_state == "starting" {
+            return Err(SdkError::LifecycleConflict {
+                name: stored.record.name.clone(),
+                state: "starting".to_owned(),
+                operation: "create snapshot".to_owned(),
+            });
+        }
+        Ok(false)
+    }
+
     pub async fn create_microvm<F>(
         &self,
         request: CreateMicroVmRequest,
@@ -4611,11 +4959,13 @@ fn create_managed_directories(home: &Path) -> Result<(), SdkError> {
 #[cfg(test)]
 mod tests {
     use std::fs::{self, OpenOptions};
+    use std::io::{BufReader, Read};
     use std::net::{IpAddr, Ipv4Addr};
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use age::secrecy::SecretString;
     use sha2::{Digest, Sha256};
     use tempfile::tempdir;
 
@@ -4627,6 +4977,7 @@ mod tests {
         PersistedNetworkResource, PersistedRuntime, TOTAL_CREATION_STEPS,
     };
     use crate::domain::registry::TaumaruRegistry;
+    use crate::domain::snapshot::SnapshotCancellation;
     use crate::error::SdkError;
     use crate::ports::artifacts::{ArtifactSource, RegistryFuture};
     use crate::ports::credentials::{CredentialStore, GeneratedCredential};
@@ -5149,6 +5500,10 @@ mod tests {
         disk_events: std::sync::Mutex<Vec<String>>,
         disk_ensure_result: std::sync::Mutex<Result<(), String>>,
         disk_release_result: std::sync::Mutex<Result<(), String>>,
+        snapshot_write_after_capture: std::sync::Mutex<bool>,
+        snapshot_active: AtomicUsize,
+        snapshot_max_active: AtomicUsize,
+        snapshot_delay: std::sync::Mutex<bool>,
     }
 
     impl RuntimeController for TestRuntime {
@@ -5346,6 +5701,84 @@ mod tests {
     }
 
     impl crate::ports::runtime_disk::RuntimeDiskController for TestRuntime {
+        fn create_snapshot_view(
+            &self,
+            sdk_home: &Path,
+            vm_name: &str,
+            rootfs_path: &Path,
+            _on_progress: &mut dyn FnMut(crate::domain::snapshot::SnapshotProgress),
+        ) -> Result<PathBuf, SdkError> {
+            self.disk_events
+                .lock()
+                .expect("test disk event lock")
+                .push(format!("snapshot-create:{vm_name}"));
+            let view_path = sdk_home
+                .join("tmp")
+                .join(format!("test-snapshot-{vm_name}.ext4"));
+            fs::copy(rootfs_path, &view_path).map_err(|error| {
+                SdkError::filesystem("create test snapshot view", &view_path, error)
+            })?;
+            let active = self.snapshot_active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.snapshot_max_active.fetch_max(active, Ordering::SeqCst);
+            if *self.snapshot_delay.lock().expect("snapshot delay lock") {
+                std::thread::sleep(std::time::Duration::from_millis(75));
+            }
+            if *self
+                .snapshot_write_after_capture
+                .lock()
+                .expect("snapshot write lock")
+            {
+                fs::write(rootfs_path, b"post-capture!!").map_err(|error| {
+                    SdkError::filesystem("simulate guest write after capture", rootfs_path, error)
+                })?;
+            }
+            Ok(view_path)
+        }
+
+        fn check_snapshot_view(
+            &self,
+            sdk_home: &Path,
+            vm_name: &str,
+            _rootfs_path: &Path,
+        ) -> Result<(), SdkError> {
+            self.disk_events
+                .lock()
+                .expect("test disk event lock")
+                .push(format!("snapshot-check:{vm_name}"));
+            let view_path = sdk_home
+                .join("tmp")
+                .join(format!("test-snapshot-{vm_name}.ext4"));
+            if !view_path.is_file() {
+                return Err(SdkError::SnapshotViewInvalid {
+                    vm_name: vm_name.to_owned(),
+                    reason: "test snapshot view disappeared".to_owned(),
+                });
+            }
+            Ok(())
+        }
+
+        fn remove_snapshot_view(
+            &self,
+            sdk_home: &Path,
+            vm_name: &str,
+            _rootfs_path: &Path,
+        ) -> Result<(), SdkError> {
+            self.disk_events
+                .lock()
+                .expect("test disk event lock")
+                .push(format!("snapshot-remove:{vm_name}"));
+            let view_path = sdk_home
+                .join("tmp")
+                .join(format!("test-snapshot-{vm_name}.ext4"));
+            if view_path.exists() {
+                fs::remove_file(&view_path).map_err(|error| {
+                    SdkError::filesystem("remove test snapshot view", &view_path, error)
+                })?;
+            }
+            self.snapshot_active.fetch_sub(1, Ordering::SeqCst);
+            Ok(())
+        }
+
         fn ensure_mapping(
             &self,
             _sdk_home: &Path,
@@ -5394,6 +5827,35 @@ mod tests {
                 }),
             }
         }
+    }
+
+    fn decrypt_snapshot_members(path: &Path, password: &str) -> Vec<(String, Vec<u8>)> {
+        let file = fs::File::open(path).expect("snapshot should open");
+        let decryptor = age::Decryptor::new(BufReader::new(file)).expect("age header should parse");
+        let identity = age::scrypt::Identity::new(SecretString::from(password.to_owned()));
+        let reader = decryptor
+            .decrypt(std::iter::once(&identity as &dyn age::Identity))
+            .expect("snapshot password should decrypt");
+        let decoder =
+            zstd::stream::read::Decoder::new(reader).expect("Zstandard stream should decode");
+        let mut archive = tar::Archive::new(decoder);
+        archive
+            .entries()
+            .expect("TAR archive should parse")
+            .map(|entry| {
+                let mut entry = entry.expect("TAR member should parse");
+                let name = entry
+                    .path()
+                    .expect("member path should parse")
+                    .to_string_lossy()
+                    .into_owned();
+                let mut bytes = Vec::new();
+                entry
+                    .read_to_end(&mut bytes)
+                    .expect("TAR member should read");
+                (name, bytes)
+            })
+            .collect()
     }
 
     fn fixture_manifest() -> TaumaruRegistry {
@@ -5644,6 +6106,10 @@ mod tests {
             disk_events: std::sync::Mutex::new(Vec::new()),
             disk_ensure_result: std::sync::Mutex::new(Ok(())),
             disk_release_result: std::sync::Mutex::new(Ok(())),
+            snapshot_write_after_capture: std::sync::Mutex::new(false),
+            snapshot_active: AtomicUsize::new(0),
+            snapshot_max_active: AtomicUsize::new(0),
+            snapshot_delay: std::sync::Mutex::new(false),
         });
         sdk.storage = storage.clone();
         sdk.credentials = credentials.clone();
@@ -6169,6 +6635,192 @@ mod tests {
         assert_eq!(observed.network.mode, unobserved.network.mode);
         assert_eq!(observed.ssh.user, unobserved.ssh.user);
         assert_eq!(observed.ssh.port, unobserved.ssh.port);
+    }
+
+    #[tokio::test]
+    async fn creates_a_stopped_vm_snapshot_with_portable_payloads() {
+        let (sdk, directory, _storage, _credentials, _network, runtime) = test_sdk(false);
+        let stored = start_fixture_vm(&sdk, "stopped_snapshot", false, None);
+        let output = directory.path().join("stopped.tmvmsnap");
+
+        let result = sdk
+            .create_snapshot("stopped_snapshot", &output, "snapshot-passphrase")
+            .await
+            .expect("stopped VM snapshot should succeed");
+
+        assert!(!result.source_was_running);
+        assert_eq!(result.vm_name, "stopped_snapshot");
+        assert_eq!(result.output_path, output);
+        assert!(stored.record.rootfs_path.is_file());
+        assert!(
+            runtime
+                .disk_events
+                .lock()
+                .expect("disk event lock")
+                .iter()
+                .all(|event| !event.starts_with("snapshot-"))
+        );
+        let members = decrypt_snapshot_members(&result.output_path, "snapshot-passphrase");
+        let names = members
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            [
+                "payload/rootfs.ext4",
+                "payload/kernel/vmlinux",
+                "payload/ssh/id_ed25519",
+                "payload/ssh/id_ed25519.pub",
+                "manifest.json",
+            ]
+        );
+        assert_eq!(members[0].1, b"fixture rootfs");
+        assert_eq!(members[2].1, b"fixture private key");
+        assert_eq!(members[3].1, b"ssh-ed25519 AAAA fixture");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&members[4].1).expect("snapshot manifest should decode");
+        let rendered = manifest.to_string();
+        assert!(rendered.contains("disk_only_crash_consistent"));
+        let source_home = sdk.home.to_string_lossy().into_owned();
+        for host_only_value in [
+            source_home.as_str(),
+            "inventory.db",
+            "firecracker.sock",
+            "tap-stopped_snapshot",
+            "process_id",
+            "socket_path",
+            "rootfs_path",
+            "volume_path",
+            "host_address",
+            "host_ip",
+            "network_resources",
+            "mapper",
+            "loop",
+        ] {
+            assert!(
+                !rendered.contains(host_only_value),
+                "portable manifest must exclude {host_only_value}"
+            );
+        }
+        assert!(!rendered.contains("snapshot-passphrase"));
+        assert!(matches!(
+            sdk.create_snapshot(
+                "stopped_snapshot",
+                &result.output_path,
+                "snapshot-passphrase"
+            )
+            .await,
+            Err(SdkError::SnapshotOutputExists { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn running_snapshot_keeps_the_capture_boundary_when_guest_writes_continue() {
+        let (sdk, directory, _storage, _credentials, _network, runtime) = test_sdk(false);
+        let stored = start_fixture_vm(&sdk, "live_snapshot", false, Some(4242));
+        runtime
+            .process_answers
+            .lock()
+            .expect("process map lock")
+            .replace([(4242, true)].into_iter().collect());
+        runtime
+            .socket_answers
+            .lock()
+            .expect("socket map lock")
+            .replace(
+                [(
+                    stored.record.socket_path.to_string_lossy().into_owned(),
+                    true,
+                )]
+                .into_iter()
+                .collect(),
+            );
+        *runtime
+            .snapshot_write_after_capture
+            .lock()
+            .expect("snapshot write lock") = true;
+        let output = directory.path().join("live.tmvmsnap");
+
+        let result = sdk
+            .create_snapshot("live_snapshot", &output, "snapshot-passphrase")
+            .await
+            .expect("running VM snapshot should succeed");
+
+        assert!(result.source_was_running);
+        assert_eq!(
+            fs::read(&stored.record.rootfs_path).expect("running root disk should remain"),
+            b"post-capture!!"
+        );
+        let members = decrypt_snapshot_members(&result.output_path, "snapshot-passphrase");
+        assert_eq!(members[0].1, b"fixture rootfs");
+        let events = runtime.disk_events.lock().expect("disk event lock").clone();
+        let create = events
+            .iter()
+            .position(|event| event == "snapshot-create:live_snapshot")
+            .unwrap();
+        let remove = events
+            .iter()
+            .position(|event| event == "snapshot-remove:live_snapshot")
+            .unwrap();
+        assert!(create < remove);
+        assert!(
+            !directory
+                .path()
+                .join("tmp/test-snapshot-live_snapshot.ext4")
+                .exists()
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_and_same_vm_snapshots_preserve_cleanup_and_serialization() {
+        let (sdk, directory, _storage, _credentials, _network, runtime) = test_sdk(false);
+        let stored = start_fixture_vm(&sdk, "serialized_snapshot", false, Some(4242));
+        runtime
+            .process_answers
+            .lock()
+            .expect("process map lock")
+            .replace([(4242, true)].into_iter().collect());
+        runtime
+            .socket_answers
+            .lock()
+            .expect("socket map lock")
+            .replace(
+                [(
+                    stored.record.socket_path.to_string_lossy().into_owned(),
+                    true,
+                )]
+                .into_iter()
+                .collect(),
+            );
+
+        *runtime.snapshot_delay.lock().expect("snapshot delay lock") = true;
+        let first = directory.path().join("first.tmvmsnap");
+        let second = directory.path().join("second.tmvmsnap");
+        let (first_result, second_result) = tokio::join!(
+            sdk.create_snapshot("serialized_snapshot", &first, "snapshot-passphrase"),
+            sdk.create_snapshot("serialized_snapshot", &second, "snapshot-passphrase"),
+        );
+        first_result.expect("first serialized snapshot should finish");
+        second_result.expect("second serialized snapshot should finish");
+        assert_eq!(runtime.snapshot_max_active.load(Ordering::SeqCst), 1);
+        assert_eq!(runtime.snapshot_active.load(Ordering::SeqCst), 0);
+
+        let cancellation = SnapshotCancellation::new();
+        cancellation.cancel();
+        let cancelled = directory.path().join("cancelled.tmvmsnap");
+        let error = sdk
+            .create_snapshot_with_cancellation(
+                "serialized_snapshot",
+                &cancelled,
+                "snapshot-passphrase",
+                cancellation,
+            )
+            .await
+            .expect_err("pre-cancelled operation should not publish");
+        assert!(matches!(error, SdkError::SnapshotCancelled));
+        assert!(!cancelled.exists());
+        assert_eq!(runtime.snapshot_active.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

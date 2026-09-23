@@ -78,8 +78,13 @@ impl Privilege for SystemPrivilege {
         let status = tokio::select! {
             status = child.wait() => status.map_err(CliError::from)?,
             _ = tokio::signal::ctrl_c() => {
-                child.kill().await.map_err(CliError::from)?;
-                child.wait().await.map_err(CliError::from)?
+                match tokio::time::timeout(std::time::Duration::from_secs(30), child.wait()).await {
+                    Ok(status) => status.map_err(CliError::from)?,
+                    Err(_) => {
+                        child.kill().await.map_err(CliError::from)?;
+                        child.wait().await.map_err(CliError::from)?
+                    }
+                }
             }
         };
         Ok(status)

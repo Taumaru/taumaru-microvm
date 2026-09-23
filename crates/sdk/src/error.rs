@@ -195,6 +195,29 @@ pub enum SdkError {
     #[error("host command {program} failed: {reason}")]
     HostCommand { program: String, reason: String },
 
+    /// A snapshot destination already exists and will not be overwritten.
+    #[error("snapshot destination already exists: {path}")]
+    SnapshotOutputExists { path: PathBuf },
+
+    /// An online snapshot view is invalid or its copy-on-write store overflowed.
+    #[error("snapshot view for VM {vm_name} is invalid: {reason}")]
+    SnapshotViewInvalid { vm_name: String, reason: String },
+
+    /// The copy-on-write backing store cannot be allocated or filled safely.
+    #[error("snapshot copy-on-write capacity failed for VM {vm_name}: {reason}")]
+    SnapshotCapacity { vm_name: String, reason: String },
+
+    /// Snapshot archive creation or finalization failed.
+    #[error("snapshot archive {operation} failed: {reason}")]
+    SnapshotArchive {
+        operation: &'static str,
+        reason: String,
+    },
+
+    /// Snapshot creation was cooperatively cancelled.
+    #[error("snapshot creation was cancelled")]
+    SnapshotCancelled,
+
     /// A registry artifact is valid JSON but cannot be used by the requested operation.
     #[error("artifact {artifact} is incompatible: {reason}")]
     IncompatibleArtifact { artifact: String, reason: String },

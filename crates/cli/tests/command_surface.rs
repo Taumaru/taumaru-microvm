@@ -25,6 +25,63 @@ fn help_identifies_the_microvm_command() {
 }
 
 #[test]
+fn snapshot_help_exposes_name_output_path_and_password() {
+    let output = run_microvm(&["snapshot", "--help"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(output.status.success());
+    assert!(stdout.contains("Usage: microvm snapshot"));
+    assert!(stdout.contains("[NAME]"));
+    assert!(stdout.contains("[OUTPUT_PATH]"));
+    assert!(stdout.contains("--password <PASSWORD>"));
+}
+
+#[test]
+fn non_interactive_snapshot_rejects_missing_name_without_prompting() {
+    let home = tempfile::tempdir().expect("temporary home should be created");
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_microvm"))
+        .arg("snapshot")
+        .env("TAUMARU_HOME", home.path())
+        .output()
+        .expect("failed to execute microvm");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(!output.status.success());
+    assert!(stderr.contains("Missing machine name"));
+    assert!(!stderr.contains("Choose a MicroVM"));
+}
+
+#[test]
+fn snapshot_rejects_an_empty_password_without_escalating() {
+    let home = tempfile::tempdir().expect("temporary home should be created");
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_microvm"))
+        .args(["snapshot", "web-01", "--password", ""])
+        .env("TAUMARU_HOME", home.path())
+        .output()
+        .expect("failed to execute microvm");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(!output.status.success());
+    assert!(stderr.contains("Snapshot password is empty"));
+    assert!(!stderr.contains("elevated rights"));
+}
+
+#[test]
+fn non_interactive_snapshot_rejects_missing_password_without_escalating() {
+    let home = tempfile::tempdir().expect("temporary home should be created");
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_microvm"))
+        .args(["snapshot", "web-01"])
+        .env("TAUMARU_HOME", home.path())
+        .output()
+        .expect("failed to execute microvm");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(!output.status.success());
+    assert!(stderr.contains("Missing snapshot password"));
+    assert!(!stderr.contains("elevated rights"));
+}
+
+#[test]
 fn version_exits_successfully() {
     let output = run_microvm(&["--version"]);
     let stdout = String::from_utf8_lossy(&output.stdout);

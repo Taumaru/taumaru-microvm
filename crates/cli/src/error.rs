@@ -13,13 +13,13 @@ pub(crate) enum CliError {
     Provisioning(String),
     Conflict(String),
     Cancelled,
-    Sdk(SdkError),
+    Sdk(Box<SdkError>),
     Io(io::Error),
 }
 
 impl From<SdkError> for CliError {
     fn from(error: SdkError) -> Self {
-        Self::Sdk(error)
+        Self::Sdk(Box::new(error))
     }
 }
 
@@ -180,6 +180,13 @@ impl CliError {
         ))
     }
 
+    pub(crate) fn snapshot_cancelled() -> Self {
+        Self::Creation(
+            "MicroVM snapshot cancelled\u{1f}the running VM was left active and the incomplete archive was removed\u{1f}Run `microvm snapshot` again when you are ready"
+                .to_string(),
+        )
+    }
+
     pub(crate) fn delete_not_found(name: &str) -> Self {
         Self::Creation(format!(
             "MicroVM {name:?} was not found\u{1f}no created machine named {name:?} exists in this home\u{1f}Run `microvm new` to create it, then try again"
@@ -251,13 +258,14 @@ impl CliError {
     pub(crate) fn exit_code(&self) -> u8 {
         match self {
             Self::Prompt(message) if message == "cancelled" => 130,
-            Self::Sdk(SdkError::Cancelled) => 130,
+            Self::Sdk(error) if matches!(error.as_ref(), SdkError::Cancelled) => 130,
             Self::Cancelled => 130,
             Self::Creation(payload) if payload.starts_with("MicroVM start cancelled") => 130,
             Self::Creation(payload) if payload.starts_with("MicroVM connection cancelled") => 130,
             Self::Creation(payload) if payload.starts_with("MicroVM stop cancelled") => 130,
             Self::Creation(payload) if payload.starts_with("MicroVM delete cancelled") => 130,
             Self::Creation(payload) if payload.starts_with("MicroVM prune cancelled") => 130,
+            Self::Creation(payload) if payload.starts_with("MicroVM snapshot cancelled") => 130,
             _ => 1,
         }
     }
@@ -285,7 +293,7 @@ impl CliError {
                 message.clone(),
                 "Check terminal input and try again".to_owned(),
             ),
-            Self::Sdk(SdkError::Cancelled) => (
+            Self::Sdk(error) if matches!(error.as_ref(), SdkError::Cancelled) => (
                 "Download cancelled".to_owned(),
                 "The SDK stopped before publishing an unverified partial artifact".to_owned(),
                 "Retry `microvm artifacts download` to acquire the remaining groups".to_owned(),
@@ -320,7 +328,9 @@ impl CliError {
         };
         let marker = match self {
             Self::Prompt(message) if message == "cancelled" => paint("!", ANSI_YELLOW, color),
-            Self::Sdk(SdkError::Cancelled) => paint("!", ANSI_YELLOW, color),
+            Self::Sdk(error) if matches!(error.as_ref(), SdkError::Cancelled) => {
+                paint("!", ANSI_YELLOW, color)
+            }
             Self::Cancelled => paint("!", ANSI_YELLOW, color),
             Self::Validation(_) | Self::MissingValue(_) => paint("!", ANSI_YELLOW, color),
             _ => paint("×", ANSI_RED, color),

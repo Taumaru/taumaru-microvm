@@ -22,6 +22,8 @@ pub(crate) enum Command {
     Start(StartArgs),
     /// Stop a running MicroVM by name or interactive selection.
     Stop(StopArgs),
+    /// Create a password-encrypted snapshot archive for a MicroVM.
+    Snapshot(SnapshotArgs),
     /// Delete a MicroVM by name or interactive selection.
     Delete(DeleteArgs),
     /// List all MicroVMs with state and configured capacities.
@@ -130,6 +132,20 @@ pub(crate) struct StopArgs {
 }
 
 #[derive(Debug, Args, Clone)]
+pub(crate) struct SnapshotArgs {
+    /// Machine name; skips the machine selector when supplied.
+    pub(crate) name: Option<String>,
+
+    /// Destination archive file; interactive mode asks for a folder when omitted.
+    /// Non-interactive mode defaults to ./<NAME>.tmvmsnap.
+    pub(crate) output_path: Option<std::path::PathBuf>,
+
+    /// Snapshot encryption password. Omit to enter it through a hidden prompt.
+    #[arg(long = "password", value_name = "PASSWORD")]
+    pub(crate) password: Option<String>,
+}
+
+#[derive(Debug, Args, Clone)]
 pub(crate) struct DeleteArgs {
     /// Machine name; skips the machine selector when supplied.
     pub(crate) name: Option<String>,
@@ -210,6 +226,46 @@ mod tests {
                 "distro-z=image-z"
             ]
         );
+    }
+
+    #[test]
+    fn snapshot_parser_accepts_interactive_name_and_output_forms() {
+        for (arguments, expected_name, expected_output, expected_password) in [
+            (vec!["microvm", "snapshot"], None, None, None),
+            (
+                vec!["microvm", "snapshot", "web-01"],
+                Some("web-01"),
+                None,
+                None,
+            ),
+            (
+                vec![
+                    "microvm",
+                    "snapshot",
+                    "web-01",
+                    "./copy.tmvmsnap",
+                    "--password",
+                    "secret",
+                ],
+                Some("web-01"),
+                Some("./copy.tmvmsnap"),
+                Some("secret"),
+            ),
+        ] {
+            let cli = Cli::try_parse_from(arguments).expect("snapshot command should parse");
+            let Some(Command::Snapshot(snapshot)) = cli.command else {
+                panic!("snapshot command should be selected");
+            };
+            assert_eq!(snapshot.name.as_deref(), expected_name);
+            assert_eq!(
+                snapshot
+                    .output_path
+                    .as_deref()
+                    .map(|path| path.to_string_lossy()),
+                expected_output.map(std::borrow::Cow::Borrowed)
+            );
+            assert_eq!(snapshot.password.as_deref(), expected_password);
+        }
     }
 
     #[test]
