@@ -71,6 +71,89 @@ fn constructor_creates_idempotent_inventory_schema() {
 }
 
 #[test]
+fn runtime_disk_mappings_stay_transient_across_sdk_reopen() {
+    let directory = tempdir().expect("temporary directory should be created");
+    let sdk = MicroVmSdk::new(directory.path()).expect("SDK construction should work");
+    let volume = directory.path().join("vms").join("transient_vm");
+    std::fs::create_dir_all(&volume).expect("VM volume should be created");
+    let rootfs_path = volume.join("rootfs.ext4");
+    std::fs::write(&rootfs_path, b"persistent root disk").expect("root disk should be written");
+    let socket_path = volume.join("firecracker.sock");
+    let connection = open_inventory(directory.path()).expect("inventory should open");
+    connection
+        .execute(
+            "INSERT INTO microvms (
+                name, distribution_id, image_id, kernel_id,
+                firecracker_package_id, firectl_package_id, disk_size_bytes,
+                memory_requested_bytes, memory_effective_mib, vcpu_count,
+                volume_path, rootfs_path, socket_path, expose_on_lan,
+                created_at, updated_at
+             ) VALUES (
+                'transient_vm', 'distribution', 'image', 'kernel',
+                'firecracker', 'firectl', 20, 134217728, 128, 1,
+                ?1, ?2, ?3, 0, 1, 1
+             )",
+            params![
+                volume.to_string_lossy(),
+                rootfs_path.to_string_lossy(),
+                socket_path.to_string_lossy()
+            ],
+        )
+        .expect("VM inventory row should insert");
+    let vm_id = connection.last_insert_rowid();
+    connection
+        .execute(
+            "INSERT INTO vm_runtime (
+                microvm_id, firecracker_path, firectl_path, socket_path,
+                process_id, process_state, updated_at
+             ) VALUES (?1, '/tools/firecracker', '/tools/firectl', ?2, NULL, 'stopped', 1)",
+            params![vm_id, socket_path.to_string_lossy()],
+        )
+        .expect("runtime row should insert");
+    drop(connection);
+    drop(sdk);
+
+    let reopened = MicroVmSdk::new(directory.path()).expect("SDK home should reopen");
+    drop(reopened);
+    let connection = open_inventory(directory.path()).expect("inventory should reopen");
+    let runtime_columns: Vec<String> = {
+        let mut statement = connection
+            .prepare("SELECT name FROM pragma_table_info('vm_runtime') ORDER BY cid")
+            .expect("runtime columns should be queryable");
+        statement
+            .query_map([], |row| row.get(0))
+            .expect("runtime columns should load")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("runtime column names should decode")
+    };
+    assert_eq!(
+        runtime_columns,
+        [
+            "microvm_id",
+            "firecracker_path",
+            "firectl_path",
+            "socket_path",
+            "process_id",
+            "process_state",
+            "updated_at",
+        ]
+    );
+    let persisted_rootfs: String = connection
+        .query_row(
+            "SELECT rootfs_path FROM microvms WHERE name = 'transient_vm'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("rootfs inventory path should survive reopening");
+    assert_eq!(persisted_rootfs, rootfs_path.to_string_lossy());
+    assert!(rootfs_path.is_file());
+    assert!(!runtime_columns.iter().any(|column| {
+        let column = column.to_ascii_lowercase();
+        column.contains("mapper") || column.contains("loop")
+    }));
+}
+
+#[test]
 fn constructor_rejects_migration_checksum_drift_without_dropping_the_database() {
     let directory = tempdir().expect("temporary directory should be created");
     std::fs::create_dir_all(directory.path().join("state"))

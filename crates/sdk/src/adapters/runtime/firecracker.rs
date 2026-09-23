@@ -71,9 +71,10 @@ impl RuntimeController for FirecrackerRuntime {
         &self,
         process_id: u32,
         socket_path: &Path,
+        firectl_path: &Path,
         firecracker_path: &Path,
     ) -> Result<bool, SdkError> {
-        process_references_vm(process_id, socket_path, firecracker_path)
+        process_references_vm(process_id, socket_path, firectl_path, firecracker_path)
     }
 
     fn socket_answers(&self, socket_path: &Path) -> Result<bool, SdkError> {
@@ -96,10 +97,17 @@ impl RuntimeController for FirecrackerRuntime {
         &self,
         socket_path: &Path,
         process_id: Option<u32>,
+        firectl_path: &Path,
         firecracker_path: &Path,
         deadline: std::time::Duration,
     ) -> Result<bool, SdkError> {
-        wait_for_stop(socket_path, process_id, firecracker_path, deadline)
+        wait_for_stop(
+            socket_path,
+            process_id,
+            firectl_path,
+            firecracker_path,
+            deadline,
+        )
     }
 
     fn terminate_spawned(&self, process_id: u32) -> Result<(), SdkError> {
@@ -109,7 +117,7 @@ impl RuntimeController for FirecrackerRuntime {
 
 /// Builds the `firectl` argument vector for one detached VM launch.
 pub(crate) fn start_arguments(request: &StartRequest) -> Vec<String> {
-    let root_drive = format!("{}:rw", request.rootfs_path.display());
+    let root_drive = format!("{}:rw", request.runtime_disk_path.display());
     vec![
         format!(
             "--firecracker-binary={}",
@@ -132,12 +140,33 @@ pub(crate) fn start_arguments(request: &StartRequest) -> Vec<String> {
 fn process_references_vm(
     process_id: u32,
     socket_path: &Path,
+    firectl_path: &Path,
     firecracker_path: &Path,
 ) -> Result<bool, SdkError> {
     if process_id == 0 {
         return Ok(false);
     }
-    let command_line_path = PathBuf::from(format!("/proc/{process_id}/cmdline"));
+    let process_directory = PathBuf::from(format!("/proc/{process_id}"));
+    let executable_path = process_directory.join("exe");
+    let executable = match fs::read_link(&executable_path) {
+        Ok(executable) => executable,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(SdkError::filesystem(
+                "inspect machine executable",
+                &executable_path,
+                error,
+            ));
+        }
+    };
+    let executable = strip_deleted_suffix(executable);
+    let expected_executable = canonicalize_process_path(firectl_path)?;
+    let actual_executable = canonicalize_process_path(&executable)?;
+    if actual_executable != expected_executable {
+        return Ok(false);
+    }
+
+    let command_line_path = process_directory.join("cmdline");
     let bytes = match fs::read(&command_line_path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
@@ -152,16 +181,43 @@ fn process_references_vm(
     if bytes.is_empty() {
         return Ok(false);
     }
-    let socket_text = socket_path.to_string_lossy();
-    let firecracker_text = firecracker_path.to_string_lossy();
-    let references_vm = bytes
+    Ok(command_line_references_vm(
+        &bytes,
+        socket_path,
+        firecracker_path,
+    ))
+}
+
+fn command_line_references_vm(bytes: &[u8], socket_path: &Path, firecracker_path: &Path) -> bool {
+    let socket_argument = format!("--socket-path={}", socket_path.display());
+    let firecracker_argument = format!("--firecracker-binary={}", firecracker_path.display());
+    let arguments: Vec<_> = bytes
         .split(|byte| *byte == 0)
-        .filter(|part| !part.is_empty())
-        .any(|part| {
-            let text = String::from_utf8_lossy(part);
-            text.contains(socket_text.as_ref()) || text.contains(firecracker_text.as_ref())
-        });
-    Ok(references_vm)
+        .filter(|argument| !argument.is_empty())
+        .collect();
+    let has_socket = arguments.contains(&socket_argument.as_bytes());
+    let has_firecracker = arguments.contains(&firecracker_argument.as_bytes());
+    has_socket && has_firecracker
+}
+
+fn canonicalize_process_path(path: &Path) -> Result<PathBuf, SdkError> {
+    match fs::canonicalize(path) {
+        Ok(path) => Ok(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(path.to_path_buf()),
+        Err(error) => Err(SdkError::filesystem(
+            "resolve machine executable identity",
+            path,
+            error,
+        )),
+    }
+}
+
+fn strip_deleted_suffix(executable: PathBuf) -> PathBuf {
+    let text = executable.to_string_lossy();
+    match text.strip_suffix(" (deleted)") {
+        Some(path) => PathBuf::from(path),
+        None => executable,
+    }
 }
 
 fn socket_answers(socket_path: &Path) -> Result<bool, SdkError> {
@@ -354,6 +410,7 @@ fn request_shutdown(socket_path: &Path) -> Result<bool, SdkError> {
 fn wait_for_stop(
     socket_path: &Path,
     process_id: Option<u32>,
+    firectl_path: &Path,
     firecracker_path: &Path,
     deadline: std::time::Duration,
 ) -> Result<bool, SdkError> {
@@ -361,7 +418,9 @@ fn wait_for_stop(
     loop {
         if !socket_answers(socket_path)? {
             let process_gone = match process_id {
-                Some(pid) => !process_references_vm(pid, socket_path, firecracker_path)?,
+                Some(pid) => {
+                    !process_references_vm(pid, socket_path, firectl_path, firecracker_path)?
+                }
                 None => true,
             };
             if process_gone {
@@ -445,5 +504,58 @@ fn path_entry_exists(path: &Path) -> Result<bool, SdkError> {
         Ok(_) => Ok(true),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(SdkError::filesystem("inspect runtime socket", path, error)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::start_arguments;
+    use crate::ports::runtime::StartRequest;
+    use std::path::PathBuf;
+
+    #[test]
+    fn process_command_line_must_match_the_vm_socket_and_firecracker_path() {
+        let socket = PathBuf::from("/vms/first/firecracker.sock");
+        let firecracker = PathBuf::from("/tools/firecracker");
+        let other_socket = PathBuf::from("/vms/second/firecracker.sock");
+        let arguments = b"firectl\0--socket-path=/vms/first/firecracker.sock\0--firecracker-binary=/tools/firecracker\0";
+
+        assert!(super::command_line_references_vm(
+            arguments,
+            &socket,
+            &firecracker
+        ));
+        assert!(!super::command_line_references_vm(
+            arguments,
+            &other_socket,
+            &firecracker
+        ));
+    }
+
+    #[test]
+    fn start_arguments_pass_the_internal_runtime_disk_path_as_writable() {
+        let request = StartRequest {
+            vm_name: "fixture_vm".to_owned(),
+            firectl_path: PathBuf::from("/tools/firectl"),
+            firecracker_path: PathBuf::from("/tools/firecracker"),
+            kernel_path: PathBuf::from("/artifacts/vmlinux"),
+            runtime_disk_path: PathBuf::from("/dev/mapper/tmvm-fixture"),
+            vcpu_count: 1,
+            memory_effective_mib: 128,
+            kernel_options: "console=ttyS0".to_owned(),
+            tap_name: "tap-fixture".to_owned(),
+            guest_mac: "02:00:00:00:00:01".to_owned(),
+            socket_path: PathBuf::from("/vms/fixture/firecracker.sock"),
+            log_path: PathBuf::from("/vms/fixture/firecracker.log"),
+        };
+
+        let arguments = start_arguments(&request);
+
+        assert!(arguments.contains(&"--root-drive=/dev/mapper/tmvm-fixture:rw".to_owned()));
+        assert!(
+            !arguments
+                .iter()
+                .any(|argument| argument.contains("rootfs.ext4"))
+        );
     }
 }

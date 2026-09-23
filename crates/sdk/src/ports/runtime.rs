@@ -9,15 +9,17 @@ pub(crate) trait RuntimeController: Send + Sync {
 
     fn verify_stopped(&self, socket_path: &Path) -> Result<(), SdkError>;
 
-    /// Returns `true` only when the recorded process is alive and its command
-    /// line still references this VM. Never signals the process.
+    /// Returns true only when the recorded process has the persisted firectl
+    /// executable and arguments for this VM's socket and Firecracker binary.
+    /// Never signals the process.
     fn process_references_vm(
         &self,
         process_id: u32,
         socket_path: &Path,
+        firectl_path: &Path,
         firecracker_path: &Path,
     ) -> Result<bool, SdkError> {
-        let _ = (process_id, socket_path, firecracker_path);
+        let _ = (process_id, socket_path, firectl_path, firecracker_path);
         Ok(false)
     }
 
@@ -69,10 +71,17 @@ pub(crate) trait RuntimeController: Send + Sync {
         &self,
         socket_path: &Path,
         process_id: Option<u32>,
+        firectl_path: &Path,
         firecracker_path: &Path,
         deadline: std::time::Duration,
     ) -> Result<bool, SdkError> {
-        let _ = (socket_path, process_id, firecracker_path, deadline);
+        let _ = (
+            socket_path,
+            process_id,
+            firectl_path,
+            firecracker_path,
+            deadline,
+        );
         Ok(false)
     }
 
@@ -96,8 +105,8 @@ pub(crate) struct StartRequest {
     pub firecracker_path: std::path::PathBuf,
     /// Verified kernel image path.
     pub kernel_path: std::path::PathBuf,
-    /// VM-local writable root disk.
-    pub rootfs_path: std::path::PathBuf,
+    /// Verified runtime block path passed internally to firectl.
+    pub runtime_disk_path: std::path::PathBuf,
     /// Requested vCPU count.
     pub vcpu_count: u32,
     /// Checked effective memory in MiB.

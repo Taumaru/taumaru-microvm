@@ -179,7 +179,7 @@ pub struct MicroVmStartResult {
     pub state: MicroVmState,
     /// VM-exclusive volume directory read from the inventory record.
     pub volume_path: PathBuf,
-    /// Writable VM-local root filesystem used for the launch.
+    /// Persistent VM-local rootfs.ext4 file. The runtime mapper path remains internal.
     pub rootfs_path: PathBuf,
     /// Volume-local control socket. It answers on return and is the
     /// preferred control channel for later operations.

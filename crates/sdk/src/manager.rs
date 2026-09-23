@@ -14,6 +14,7 @@ use crate::adapters::credentials::ed25519::Ed25519CredentialStore;
 use crate::adapters::network::linux::LinuxNetworkController;
 use crate::adapters::persistence::sqlite::SqliteRepository;
 use crate::adapters::registry::taumaru::TaumaruRegistryClient;
+use crate::adapters::runtime::device_mapper::{DeviceMapperRuntime, acquire_lifecycle_lock};
 use crate::adapters::runtime::firecracker::FirecrackerRuntime;
 use crate::adapters::storage::ext4::Ext4Storage;
 use crate::domain::artifact::{
@@ -42,6 +43,7 @@ use crate::ports::credentials::CredentialStore;
 use crate::ports::network::{NetworkController, NetworkRequest};
 use crate::ports::repository::{InventoryState, LocalRepository, StoredMicroVm};
 use crate::ports::runtime::{RuntimeController, StartRequest};
+use crate::ports::runtime_disk::RuntimeDiskController;
 use crate::ports::storage::GuestStorage;
 use semver::Version;
 
@@ -178,6 +180,7 @@ pub struct MicroVmSdk {
     credentials: Arc<dyn CredentialStore>,
     network: Arc<dyn NetworkController>,
     runtime: Arc<dyn RuntimeController>,
+    runtime_disk: Arc<dyn RuntimeDiskController>,
     target_locks: Arc<Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>>,
 }
 
@@ -324,6 +327,7 @@ impl MicroVmSdk {
             credentials: Arc::new(Ed25519CredentialStore),
             network: Arc::new(LinuxNetworkController),
             runtime: Arc::new(FirecrackerRuntime),
+            runtime_disk: Arc::new(DeviceMapperRuntime::default()),
             target_locks: Arc::new(Mutex::new(HashMap::new())),
         })
     }
@@ -1148,16 +1152,11 @@ impl MicroVmSdk {
 
     /// Starts one configured MicroVM and returns its running identity.
     ///
-    /// The caller passes only the VM name. The volume directory, full
-    /// configuration, and network identity are read from the inventory
-    /// record. Running is decided from live host evidence: both the recorded
-    /// machine process and the control socket must agree the VM is running.
-    /// Any mismatch is treated as stale and started fresh. Repeated calls
-    /// while genuinely running return the current identity without launching
-    /// another process. Host network items are repaired in place and stay
-    /// repaired when a later launch step fails.
+    /// The persistent rootfs remains in inventory and public results. A verified
+    /// per-VM Device Mapper path is prepared internally and passed to firectl.
     pub async fn start_microvm(&self, name: &str) -> Result<MicroVmStartResult, SdkError> {
         crate::domain::config::validate_vm_name(name)?;
+        let _runtime_lock = acquire_lifecycle_lock(&self.home, name).await?;
         let lookup_name = name.to_owned();
         let name_lock_path = self.home.join("vms").join(name);
         let name_lock = self.target_lock(&name_lock_path)?;
@@ -1182,7 +1181,8 @@ impl MicroVmSdk {
         validate_start_prerequisites(&stored)?;
         validate_persisted_network(&stored)?;
         let boot = verify_start_boot_artifacts(self, &stored).await?;
-        if self.socket_answers(&stored.record.socket_path)? {
+        let socket_ready = self.socket_answers(&stored.record.socket_path)?;
+        if socket_ready {
             let persisted_runtime =
                 stored
                     .runtime
@@ -1199,9 +1199,20 @@ impl MicroVmSdk {
                     stopped: false,
                 });
             };
+            if !matches!(
+                persisted_runtime.process_state.as_str(),
+                "starting" | "running"
+            ) {
+                return Err(SdkError::TemporaryRuntime {
+                    component: "firecracker".to_owned(),
+                    reason: "the live machine has no adoptable persisted process state".to_owned(),
+                    stopped: false,
+                });
+            }
             if !self.runtime.process_references_vm(
                 process_id,
                 &stored.record.socket_path,
+                &persisted_runtime.firectl_path,
                 &persisted_runtime.firecracker_path,
             )? {
                 return Err(SdkError::TemporaryRuntime {
@@ -1210,56 +1221,104 @@ impl MicroVmSdk {
                     stopped: false,
                 });
             }
+            if persisted_runtime.process_state == "starting" {
+                let mut adopted_runtime = persisted_runtime.clone();
+                adopted_runtime.process_state = "running".to_owned();
+                let vm_id = stored.record.id;
+                self.run_repository(move |repository| {
+                    repository.persist_runtime(vm_id, &adopted_runtime)
+                })
+                .await?;
+            }
             return build_start_result(&stored, process_id);
         }
-        self.clear_stale_runtime(&stored).await?;
+
+        if let Some(runtime) = stored.runtime.as_ref()
+            && let Some(process_id) = runtime.process_id
+            && self.runtime.process_references_vm(
+                process_id,
+                &stored.record.socket_path,
+                &runtime.firectl_path,
+                &runtime.firecracker_path,
+            )?
+        {
+            return Err(SdkError::TemporaryRuntime {
+                component: "firecracker".to_owned(),
+                reason:
+                    "the recorded machine process is still alive while its control socket is silent"
+                        .to_owned(),
+                stopped: false,
+            });
+        }
+
+        self.runtime_disk.release_mapping(
+            &self.home,
+            &stored.record.name,
+            &stored.record.rootfs_path,
+        )?;
+        self.remove_stale_socket(&stored)?;
+        self.reset_runtime_to_stopped(&stored).await?;
         self.runtime.validate_host()?;
         let stored = self.reconcile_start_network(stored).await?;
-        self.remove_stale_socket(&stored)?;
-        let request = self.start_launch_request(&stored, &boot).await?;
+        let mut request = self.start_launch_request(&stored, &boot).await?;
+        request.runtime_disk_path = self.runtime_disk.ensure_mapping(
+            &self.home,
+            &stored.record.name,
+            &stored.record.rootfs_path,
+        )?;
+
         let process_id = match self.runtime.launch_detached(&request) {
             Ok(process_id) => process_id,
-            Err(error) => {
-                self.reset_runtime_to_stopped(&stored).await?;
-                return Err(error);
-            }
+            Err(error) => return Err(self.cleanup_unstarted_launch(&stored, error).await),
         };
         if process_id == 0 {
-            self.reset_runtime_to_stopped(&stored).await?;
-            return Err(SdkError::TemporaryRuntime {
+            let primary = SdkError::TemporaryRuntime {
                 component: "firecracker".to_owned(),
                 reason: "the machine launch returned an invalid process identifier".to_owned(),
                 stopped: true,
-            });
+            };
+            return Err(self.cleanup_unstarted_launch(&stored, primary).await);
+        }
+        let starting_runtime = PersistedRuntime {
+            firecracker_path: boot.firecracker_path.clone(),
+            firectl_path: boot.firectl_path.clone(),
+            socket_path: stored.record.socket_path.clone(),
+            process_id: Some(process_id),
+            process_state: "starting".to_owned(),
+        };
+        let vm_id = stored.record.id;
+        let provisional = starting_runtime.clone();
+        if let Err(primary) = self
+            .run_repository(move |repository| repository.persist_runtime(vm_id, &provisional))
+            .await
+        {
+            return Err(self
+                .cleanup_failed_launch(&stored, process_id, starting_runtime, primary)
+                .await);
         }
         match self.runtime.wait_for_socket(&stored.record.socket_path) {
             Ok(true) => {}
             Ok(false) => {
-                self.cleanup_failed_launch(&stored, Some(process_id)).await;
-                return Err(SdkError::TemporaryRuntime {
+                let primary = SdkError::TemporaryRuntime {
                     component: "firecracker.sock".to_owned(),
                     reason: "the machine control socket did not answer after launch".to_owned(),
                     stopped: true,
-                });
+                };
+                return Err(self
+                    .cleanup_failed_launch(&stored, process_id, starting_runtime, primary)
+                    .await);
             }
-            Err(error) => {
-                self.cleanup_failed_launch(&stored, Some(process_id)).await;
-                return Err(error);
+            Err(primary) => {
+                return Err(self
+                    .cleanup_failed_launch(&stored, process_id, starting_runtime, primary)
+                    .await);
             }
         }
+        let mut running_runtime = starting_runtime;
+        running_runtime.process_state = "running".to_owned();
         let vm_id = stored.record.id;
-        let socket_path = stored.record.socket_path.clone();
-        let persisted_runtime = PersistedRuntime {
-            firecracker_path: boot.firecracker_path,
-            firectl_path: boot.firectl_path,
-            socket_path: socket_path.clone(),
-            process_id: Some(process_id),
-            process_state: "running".to_owned(),
-        };
-        self.run_repository(move |repository| {
-            repository.persist_runtime(vm_id, &persisted_runtime)
-        })
-        .await?;
+        self.run_repository(move |repository| repository.persist_runtime(vm_id, &running_runtime))
+            .await?;
         let lookup = stored.record.name.clone();
         let stored = self
             .run_repository(move |repository| {
@@ -1275,18 +1334,11 @@ impl MicroVmSdk {
     }
     /// Stops one running MicroVM and reports whether forcing was used.
     ///
-    /// The operation takes only the VM name: the volume directory and every
-    /// runtime reference are read from the inventory record, never from the
-    /// caller. Running means the volume-local control socket answers at call
-    /// time; a silent socket returns success with `forced: false` and no host
-    /// change. A running machine first receives one graceful shutdown request
-    /// (`SendCtrlAltDel`) through its control socket with a 60-second exit
-    /// wait, then immediate SIGKILL of the re-verified recorded process when
-    /// it stays running. An undeliverable graceful request while the socket
-    /// answers is a typed error with no forced attempt. The returned `forced`
-    /// flag is `true` only when SIGKILL was delivered.
+    /// Owned runtime disk resources are released only after the machine process
+    /// has exited. The persistent rootfs.ext4 file is never removed or replaced.
     pub async fn stop_microvm(&self, name: &str) -> Result<MicroVmStopResult, SdkError> {
         crate::domain::config::validate_vm_name(name)?;
+        let _runtime_lock = acquire_lifecycle_lock(&self.home, name).await?;
         let lookup_name = name.to_owned();
         let name_lock_path = self.home.join("vms").join(name);
         let name_lock = self.target_lock(&name_lock_path)?;
@@ -1309,16 +1361,15 @@ impl MicroVmSdk {
         };
         stored.require_complete("stop MicroVM")?;
         if !self.socket_answers(&stored.record.socket_path)? {
-            self.clear_stale_runtime(&stored).await?;
-            self.remove_stale_socket(&stored)?;
-            return build_stop_result(&stored, false);
+            self.verify_recorded_process_exited(&stored)?;
+            return self.finish_stopped_vm(&stored, false).await;
         }
+
         let delivered = self.runtime.request_shutdown(&stored.record.socket_path)?;
         if !delivered {
             if !self.socket_answers(&stored.record.socket_path)? {
-                self.clear_stale_runtime(&stored).await?;
-                self.remove_stale_socket(&stored)?;
-                return build_stop_result(&stored, false);
+                self.verify_recorded_process_exited(&stored)?;
+                return self.finish_stopped_vm(&stored, false).await;
             }
             return Err(SdkError::TemporaryRuntime {
                 component: "firecracker.sock".to_owned(),
@@ -1331,16 +1382,21 @@ impl MicroVmSdk {
             .as_ref()
             .map(|runtime| runtime.firecracker_path.clone())
             .unwrap_or_default();
-        let process_id = runtime_snapshot.and_then(|runtime| runtime.process_id);
+        let firectl_path = runtime_snapshot
+            .as_ref()
+            .map(|runtime| runtime.firectl_path.clone())
+            .unwrap_or_default();
+        let process_id = runtime_snapshot
+            .as_ref()
+            .and_then(|runtime| runtime.process_id);
         if self.runtime.wait_for_stop(
             &stored.record.socket_path,
             process_id,
+            &firectl_path,
             &firecracker_path,
             STOP_EXIT_DEADLINE,
         )? {
-            self.clear_stale_runtime(&stored).await?;
-            self.remove_stale_socket(&stored)?;
-            return build_stop_result(&stored, false);
+            return self.finish_stopped_vm(&stored, false).await;
         }
         let Some(pid) = process_id else {
             return Err(SdkError::TemporaryRuntime {
@@ -1353,12 +1409,11 @@ impl MicroVmSdk {
         if !self.runtime.process_references_vm(
             pid,
             &stored.record.socket_path,
+            &firectl_path,
             &firecracker_path,
         )? {
             if !self.socket_answers(&stored.record.socket_path)? {
-                self.clear_stale_runtime(&stored).await?;
-                self.remove_stale_socket(&stored)?;
-                return build_stop_result(&stored, false);
+                return self.finish_stopped_vm(&stored, false).await;
             }
             return Err(SdkError::TemporaryRuntime {
                 component: "firecracker".to_owned(),
@@ -1371,12 +1426,11 @@ impl MicroVmSdk {
         if self.runtime.wait_for_stop(
             &stored.record.socket_path,
             Some(pid),
+            &firectl_path,
             &firecracker_path,
             STOP_KILL_DEADLINE,
         )? {
-            self.clear_stale_runtime(&stored).await?;
-            self.remove_stale_socket(&stored)?;
-            return build_stop_result(&stored, true);
+            return self.finish_stopped_vm(&stored, true).await;
         }
         Err(SdkError::TemporaryRuntime {
             component: "firecracker".to_owned(),
@@ -1850,12 +1904,22 @@ impl MicroVmSdk {
                 .as_ref()
                 .map(|runtime| runtime.firecracker_path.clone())
                 .unwrap_or_default();
+            let firectl_path = vm
+                .runtime
+                .as_ref()
+                .map(|runtime| runtime.firectl_path.clone())
+                .unwrap_or_default();
             let process_id = vm.runtime.as_ref().and_then(|runtime| runtime.process_id);
             pending.spawn(async move {
                 let _guard = permit.acquire_owned().await;
                 let probe = tokio::task::spawn_blocking(move || {
                     if let Some(pid) = process_id {
-                        let _ = runtime.process_references_vm(pid, &socket_path, &firecracker_path);
+                        let _ = runtime.process_references_vm(
+                            pid,
+                            &socket_path,
+                            &firectl_path,
+                            &firecracker_path,
+                        );
                     }
                     runtime.socket_answers(&socket_path)
                 });
@@ -1883,16 +1947,139 @@ impl MicroVmSdk {
         states
     }
 
-    /// Resets stale runtime references to stopped without claiming `Running`.
-    /// A VM with no recorded process and an already stopped marker needs no write.
-    async fn clear_stale_runtime(&self, stored: &StoredMicroVm) -> Result<(), SdkError> {
-        let settled = stored.runtime.as_ref().is_none_or(|runtime| {
-            runtime.process_id.is_none() && runtime.process_state == "stopped"
-        });
-        if settled {
+    /// Confirms that a silent socket is not hiding a live recorded process.
+    fn verify_recorded_process_exited(&self, stored: &StoredMicroVm) -> Result<(), SdkError> {
+        let Some(runtime) = stored.runtime.as_ref() else {
             return Ok(());
+        };
+        let Some(process_id) = runtime.process_id else {
+            return Ok(());
+        };
+        if self.runtime.process_references_vm(
+            process_id,
+            &stored.record.socket_path,
+            &runtime.firectl_path,
+            &runtime.firecracker_path,
+        )? {
+            return Err(SdkError::TemporaryRuntime {
+                component: "firecracker".to_owned(),
+                reason:
+                    "the control socket is silent but the recorded machine process is still alive"
+                        .to_owned(),
+                stopped: false,
+            });
         }
-        self.reset_runtime_to_stopped(stored).await
+        Ok(())
+    }
+
+    /// Releases the mapper before changing durable stopped metadata.
+    async fn finish_stopped_vm(
+        &self,
+        stored: &StoredMicroVm,
+        forced: bool,
+    ) -> Result<MicroVmStopResult, SdkError> {
+        self.runtime_disk.release_mapping(
+            &self.home,
+            &stored.record.name,
+            &stored.record.rootfs_path,
+        )?;
+        self.remove_stale_socket(stored)?;
+        self.reset_runtime_to_stopped(stored).await?;
+        build_stop_result(stored, forced)
+    }
+
+    /// Rolls back an unstarted launch after releasing its verified disk mapping.
+    async fn cleanup_unstarted_launch(
+        &self,
+        stored: &StoredMicroVm,
+        primary: SdkError,
+    ) -> SdkError {
+        let mut failures = Vec::new();
+        if let Err(error) = self.runtime_disk.release_mapping(
+            &self.home,
+            &stored.record.name,
+            &stored.record.rootfs_path,
+        ) {
+            failures.push(error.to_string());
+        }
+        if failures.is_empty()
+            && let Err(error) = self.reset_runtime_to_stopped(stored).await
+        {
+            failures.push(error.to_string());
+        }
+        if failures.is_empty() {
+            primary
+        } else {
+            SdkError::Cleanup {
+                primary: primary.to_string(),
+                failures,
+            }
+        }
+    }
+
+    /// Terminates a failed launch and keeps its identity and mapper when exit is uncertain.
+    async fn cleanup_failed_launch(
+        &self,
+        stored: &StoredMicroVm,
+        process_id: u32,
+        starting_runtime: PersistedRuntime,
+        primary: SdkError,
+    ) -> SdkError {
+        let mut failures = Vec::new();
+        if let Err(error) = self.runtime.terminate_spawned(process_id) {
+            failures.push(error.to_string());
+        }
+        let stopped = self
+            .runtime
+            .wait_for_stop(
+                &stored.record.socket_path,
+                Some(process_id),
+                &starting_runtime.firectl_path,
+                &starting_runtime.firecracker_path,
+                STOP_KILL_DEADLINE,
+            )
+            .unwrap_or(false);
+        if !stopped {
+            let vm_id = stored.record.id;
+            if let Err(error) = self
+                .run_repository(move |repository| {
+                    repository.persist_runtime(vm_id, &starting_runtime)
+                })
+                .await
+            {
+                failures.push(format!("retain starting process identity: {error}"));
+            }
+            failures.push("the spawned machine process could not be confirmed stopped".to_owned());
+            return SdkError::Cleanup {
+                primary: primary.to_string(),
+                failures,
+            };
+        }
+        if let Err(error) = self.runtime_disk.release_mapping(
+            &self.home,
+            &stored.record.name,
+            &stored.record.rootfs_path,
+        ) {
+            failures.push(error.to_string());
+        }
+        if failures.is_empty()
+            && let Err(error) = self.remove_stale_socket(stored)
+        {
+            failures.push(error.to_string());
+        }
+        if failures.is_empty()
+            && let Err(error) = self.reset_runtime_to_stopped(stored).await
+        {
+            failures.push(error.to_string());
+        }
+        if failures.is_empty() {
+            primary
+        } else {
+            SdkError::Cleanup {
+                primary: primary.to_string(),
+                failures,
+            }
+        }
     }
 
     /// Reconciles the persisted network attachment in place and persists the
@@ -1999,7 +2186,7 @@ impl MicroVmSdk {
             firectl_path: boot.firectl_path.clone(),
             firecracker_path: boot.firecracker_path.clone(),
             kernel_path: boot.kernel_path.clone(),
-            rootfs_path: stored.record.rootfs_path.clone(),
+            runtime_disk_path: stored.record.rootfs_path.clone(),
             vcpu_count: stored.record.vcpu_count,
             memory_effective_mib: stored.record.memory_effective_mib,
             kernel_options: kernel_options.trim().to_owned(),
@@ -2037,24 +2224,6 @@ impl MicroVmSdk {
             )
         })
         .await
-    }
-
-    /// Cleans up a failed launch: terminates only the just-spawned child and
-    /// removes the owned socket only if this attempt created it. Repaired
-    /// network items stay persisted. Never touches a previously recorded PID.
-    async fn cleanup_failed_launch(&self, stored: &StoredMicroVm, spawned: Option<u32>) {
-        if let Some(process_id) = spawned {
-            let _ = self.runtime.terminate_spawned(process_id);
-        }
-        if path_entry_exists(&stored.record.socket_path).unwrap_or(false)
-            && !self
-                .runtime
-                .socket_answers(&stored.record.socket_path)
-                .unwrap_or(true)
-        {
-            let _ = fs::remove_file(&stored.record.socket_path);
-        }
-        let _ = self.reset_runtime_to_stopped(stored).await;
     }
 
     async fn return_or_reject_existing_creation<F>(
@@ -4977,6 +5146,9 @@ mod tests {
         process_answers: std::sync::Mutex<Option<std::collections::HashMap<u32, bool>>>,
         terminate_calls: std::sync::Mutex<Vec<u32>>,
         terminate_result: std::sync::Mutex<Result<(), String>>,
+        disk_events: std::sync::Mutex<Vec<String>>,
+        disk_ensure_result: std::sync::Mutex<Result<(), String>>,
+        disk_release_result: std::sync::Mutex<Result<(), String>>,
     }
 
     impl RuntimeController for TestRuntime {
@@ -5016,6 +5188,7 @@ mod tests {
             &self,
             process_id: u32,
             _socket_path: &Path,
+            _firectl_path: &Path,
             _firecracker_path: &Path,
         ) -> Result<bool, SdkError> {
             if let Some(answer) = self
@@ -5060,6 +5233,10 @@ mod tests {
             &self,
             request: &crate::ports::runtime::StartRequest,
         ) -> Result<u32, SdkError> {
+            self.disk_events
+                .lock()
+                .expect("disk event lock")
+                .push(format!("launch:{}", request.vm_name));
             self.launched
                 .lock()
                 .expect("test launch lock")
@@ -5138,6 +5315,7 @@ mod tests {
             &self,
             socket_path: &Path,
             process_id: Option<u32>,
+            firectl_path: &Path,
             firecracker_path: &Path,
             _deadline: std::time::Duration,
         ) -> Result<bool, SdkError> {
@@ -5154,12 +5332,66 @@ mod tests {
                         return Ok(false);
                     }
                     match process_id {
-                        Some(pid) => {
-                            Ok(!self.process_references_vm(pid, socket_path, firecracker_path)?)
-                        }
+                        Some(pid) => Ok(!self.process_references_vm(
+                            pid,
+                            socket_path,
+                            firectl_path,
+                            firecracker_path,
+                        )?),
                         None => Ok(true),
                     }
                 }
+            }
+        }
+    }
+
+    impl crate::ports::runtime_disk::RuntimeDiskController for TestRuntime {
+        fn ensure_mapping(
+            &self,
+            _sdk_home: &Path,
+            vm_name: &str,
+            _rootfs_path: &Path,
+        ) -> Result<PathBuf, SdkError> {
+            self.disk_events
+                .lock()
+                .expect("disk event lock")
+                .push(format!("map:{vm_name}"));
+            match self
+                .disk_ensure_result
+                .lock()
+                .expect("disk ensure result lock")
+                .clone()
+            {
+                Ok(()) => Ok(PathBuf::from(format!("/dev/mapper/taumaru-test-{vm_name}"))),
+                Err(reason) => Err(SdkError::HostCommand {
+                    program: "test-runtime-disk".to_owned(),
+                    reason,
+                }),
+            }
+        }
+
+        fn release_mapping(
+            &self,
+            _sdk_home: &Path,
+            vm_name: &str,
+            _rootfs_path: &Path,
+        ) -> Result<(), SdkError> {
+            self.disk_events
+                .lock()
+                .expect("disk event lock")
+                .push(format!("release:{vm_name}"));
+            match self
+                .disk_release_result
+                .lock()
+                .expect("disk release result lock")
+                .clone()
+            {
+                Ok(()) => Ok(()),
+                Err(reason) => Err(SdkError::TemporaryRuntime {
+                    component: "test-runtime-disk".to_owned(),
+                    reason,
+                    stopped: false,
+                }),
             }
         }
     }
@@ -5409,11 +5641,15 @@ mod tests {
             process_answers: std::sync::Mutex::new(None),
             terminate_calls: std::sync::Mutex::new(Vec::new()),
             terminate_result: std::sync::Mutex::new(Ok(())),
+            disk_events: std::sync::Mutex::new(Vec::new()),
+            disk_ensure_result: std::sync::Mutex::new(Ok(())),
+            disk_release_result: std::sync::Mutex::new(Ok(())),
         });
         sdk.storage = storage.clone();
         sdk.credentials = credentials.clone();
         sdk.network = network.clone();
         sdk.runtime = runtime.clone();
+        sdk.runtime_disk = runtime.clone();
         (sdk, directory, storage, credentials, network, runtime)
     }
 
@@ -6253,7 +6489,17 @@ mod tests {
             assert_eq!(launched[0].vcpu_count, 1);
             assert_eq!(launched[0].memory_effective_mib, 128);
             assert_eq!(launched[0].socket_path, started.socket_path);
+            assert_eq!(
+                launched[0].runtime_disk_path,
+                PathBuf::from("/dev/mapper/taumaru-test-boot_vm")
+            );
+            assert_ne!(launched[0].runtime_disk_path, started.rootfs_path);
         }
+        assert_eq!(
+            started.rootfs_path,
+            started.volume_path.join("rootfs.ext4"),
+            "the public start result continues to identify the persistent root disk"
+        );
         let stored = sdk
             .run_repository(|repository| {
                 repository
@@ -6308,20 +6554,214 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn start_recovers_a_referencing_process_with_a_silent_socket() {
+    async fn start_preserves_a_live_process_with_a_silent_socket_for_retry() {
         if std::env::consts::ARCH != "x86_64" {
             return;
         }
         let (sdk, _directory, _storage, _credentials, _network, runtime) = test_sdk(false);
-        start_fixture_vm(&sdk, "mismatch_vm", false, Some(4242));
-        *runtime.live_process.lock().expect("liveness lock") = true;
+        let stored = start_fixture_vm(&sdk, "mismatch_vm", false, Some(4242));
+        runtime
+            .process_answers
+            .lock()
+            .expect("process map lock")
+            .replace([(4242, true)].into_iter().collect());
         *runtime.live_socket.lock().expect("socket lock") = false;
-        let recovered = sdk
+        let error = sdk
             .start_microvm("mismatch_vm")
             .await
-            .expect("silent socket should start fresh");
-        assert_eq!(recovered.state, MicroVmState::Running);
-        assert_eq!(runtime.launched.lock().expect("launch lock").len(), 1);
+            .expect_err("a live process with a silent socket must not be replaced");
+        assert!(matches!(
+            error,
+            SdkError::TemporaryRuntime { stopped: false, .. }
+        ));
+        assert!(runtime.launched.lock().expect("launch lock").is_empty());
+        assert_eq!(
+            sdk.repository
+                .find_microvm("mismatch_vm")
+                .expect("runtime state should load")
+                .expect("VM should remain present")
+                .runtime
+                .expect("runtime metadata should remain")
+                .process_id,
+            stored.runtime.and_then(|runtime| runtime.process_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn start_prepares_independent_mappings_before_launch_and_preserves_rootfs_results() {
+        if std::env::consts::ARCH != "x86_64" {
+            return;
+        }
+        let (sdk, _directory, _storage, _credentials, _network, runtime) = test_sdk(false);
+        let first = start_fixture_vm(&sdk, "first_vm", false, None);
+        let second = start_fixture_vm(&sdk, "second_vm", false, None);
+
+        let first_result = sdk
+            .start_microvm("first_vm")
+            .await
+            .expect("first VM should start");
+        let second_result = sdk
+            .start_microvm("second_vm")
+            .await
+            .expect("second VM should start");
+        let launched = runtime.launched.lock().expect("launch lock");
+        assert_eq!(launched.len(), 2);
+        assert_ne!(launched[0].runtime_disk_path, launched[1].runtime_disk_path);
+        assert_eq!(first_result.rootfs_path, first.record.rootfs_path);
+        assert_eq!(second_result.rootfs_path, second.record.rootfs_path);
+        assert!(first_result.rootfs_path.is_file());
+        assert!(second_result.rootfs_path.is_file());
+        assert!(
+            launched
+                .iter()
+                .all(|request| request.runtime_disk_path.starts_with("/dev/mapper/"))
+        );
+        let events = runtime.disk_events.lock().expect("disk event lock");
+        for vm_name in ["first_vm", "second_vm"] {
+            let map = events
+                .iter()
+                .position(|event| event == &format!("map:{vm_name}"))
+                .expect("mapping should be prepared");
+            let launch = events
+                .iter()
+                .position(|event| event == &format!("launch:{vm_name}"))
+                .expect("VM should launch");
+            assert!(map < launch);
+        }
+    }
+
+    #[tokio::test]
+    async fn start_mapping_conflict_does_not_launch_firectl() {
+        if std::env::consts::ARCH != "x86_64" {
+            return;
+        }
+        let (sdk, _directory, _storage, _credentials, _network, runtime) = test_sdk(false);
+        start_fixture_vm(&sdk, "conflict_vm", false, None);
+        *runtime.disk_ensure_result.lock().expect("disk result lock") =
+            Err("injected mapping ownership conflict".to_owned());
+
+        let error = sdk
+            .start_microvm("conflict_vm")
+            .await
+            .expect_err("mapping conflict should prevent launch");
+
+        assert!(matches!(error, SdkError::HostCommand { .. }));
+        assert!(runtime.launched.lock().expect("launch lock").is_empty());
+        assert!(
+            runtime
+                .disk_events
+                .lock()
+                .expect("disk event lock")
+                .contains(&"map:conflict_vm".to_owned())
+        );
+    }
+
+    #[tokio::test]
+    async fn start_marks_a_ready_provisional_process_running_without_relaunching() {
+        if std::env::consts::ARCH != "x86_64" {
+            return;
+        }
+        let (sdk, _directory, _storage, _credentials, _network, runtime) = test_sdk(false);
+        let stored = start_fixture_vm(&sdk, "ready_starting_vm", false, Some(4242));
+        let mut provisional = stored.runtime.expect("runtime metadata should exist");
+        provisional.process_state = "starting".to_owned();
+        sdk.run_repository(move |repository| {
+            repository.persist_runtime(stored.record.id, &provisional)
+        })
+        .await
+        .expect("starting state should persist");
+        runtime
+            .process_answers
+            .lock()
+            .expect("process map lock")
+            .replace([(4242, true)].into_iter().collect());
+        *runtime.live_socket.lock().expect("socket lock") = true;
+
+        let started = sdk
+            .start_microvm("ready_starting_vm")
+            .await
+            .expect("ready provisional process should be adopted");
+
+        assert_eq!(started.process_id, 4242);
+        assert!(runtime.launched.lock().expect("launch lock").is_empty());
+        let persisted = sdk
+            .repository
+            .find_microvm("ready_starting_vm")
+            .expect("runtime state should load")
+            .expect("VM should remain present")
+            .runtime
+            .expect("runtime state should remain");
+        assert_eq!(persisted.process_state, "running");
+    }
+
+    #[tokio::test]
+    async fn start_adopts_only_a_ready_provisional_process() {
+        if std::env::consts::ARCH != "x86_64" {
+            return;
+        }
+        let (sdk, _directory, _storage, _credentials, _network, runtime) = test_sdk(false);
+        let stored = start_fixture_vm(&sdk, "starting_vm", false, Some(4242));
+        let mut provisional = stored.runtime.expect("runtime metadata should exist");
+        provisional.process_state = "starting".to_owned();
+        sdk.run_repository(move |repository| {
+            repository.persist_runtime(stored.record.id, &provisional)
+        })
+        .await
+        .expect("starting state should persist");
+        runtime
+            .process_answers
+            .lock()
+            .expect("process map lock")
+            .replace([(4242, true)].into_iter().collect());
+        *runtime.live_socket.lock().expect("socket lock") = false;
+
+        let error = sdk
+            .start_microvm("starting_vm")
+            .await
+            .expect_err("a live but unready process should be retained for retry");
+        assert!(matches!(error, SdkError::TemporaryRuntime { .. }));
+        assert!(runtime.launched.lock().expect("launch lock").is_empty());
+        let persisted = sdk
+            .repository
+            .find_microvm("starting_vm")
+            .expect("runtime state should load")
+            .expect("VM should remain present")
+            .runtime
+            .expect("starting runtime should remain");
+        assert_eq!(persisted.process_id, Some(4242));
+        assert_eq!(persisted.process_state, "starting");
+    }
+
+    #[tokio::test]
+    async fn start_recreates_transient_mapping_after_reopening_the_sdk_home() {
+        if std::env::consts::ARCH != "x86_64" {
+            return;
+        }
+        let (sdk, directory, _storage, _credentials, _network, runtime) = test_sdk(false);
+        let original = start_fixture_vm(&sdk, "reboot_vm", false, None);
+        let reopened_registry = sdk.registry.clone();
+        let reopened_network = sdk.network.clone();
+        let reopened_storage = sdk.storage.clone();
+        let reopened_credentials = sdk.credentials.clone();
+        drop(sdk);
+
+        let mut reopened =
+            MicroVmSdk::new(directory.path()).expect("SDK home should reopen after host restart");
+        reopened.registry = reopened_registry;
+        reopened.network = reopened_network;
+        reopened.storage = reopened_storage;
+        reopened.credentials = reopened_credentials;
+        reopened.runtime = runtime.clone();
+        reopened.runtime_disk = runtime.clone();
+
+        let started = reopened
+            .start_microvm("reboot_vm")
+            .await
+            .expect("missing kernel mapping should be recreated");
+        assert_eq!(started.rootfs_path, original.record.rootfs_path);
+        assert!(started.rootfs_path.is_file());
+        let events = runtime.disk_events.lock().expect("disk event lock");
+        assert!(events.contains(&"map:reboot_vm".to_owned()));
     }
 
     #[tokio::test]
@@ -6399,6 +6839,54 @@ mod tests {
         assert!(
             launched <= 2,
             "concurrent starts launched {launched} processes"
+        );
+    }
+
+    #[tokio::test]
+    async fn start_retains_the_mapping_and_starting_pid_when_exit_cannot_be_confirmed() {
+        if std::env::consts::ARCH != "x86_64" {
+            return;
+        }
+        let (sdk, _directory, _storage, _credentials, _network, runtime) = test_sdk(false);
+        start_fixture_vm(&sdk, "uncertain_exit_vm", false, None);
+        *runtime.ready_result.lock().expect("readiness lock") = Ok(false);
+        *runtime.live_process.lock().expect("process lock") = true;
+        runtime
+            .stop_results
+            .lock()
+            .expect("stop lock")
+            .push(Ok(false));
+
+        let error = sdk
+            .start_microvm("uncertain_exit_vm")
+            .await
+            .expect_err("unconfirmed process exit should report cleanup failure");
+
+        assert!(matches!(error, SdkError::Cleanup { .. }));
+        let persisted = sdk
+            .repository
+            .find_microvm("uncertain_exit_vm")
+            .expect("runtime should load")
+            .expect("VM should remain present")
+            .runtime
+            .expect("provisional process should remain recorded");
+        assert_eq!(persisted.process_id, Some(4242));
+        assert_eq!(persisted.process_state, "starting");
+        let events = runtime.disk_events.lock().expect("disk event lock");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| *event == "map:uncertain_exit_vm")
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| *event == "release:uncertain_exit_vm")
+                .count(),
+            1,
+            "only stale pre-start state is released; the live launch mapping stays attached"
         );
     }
 
@@ -6702,6 +7190,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn repeated_stop_releases_leftover_mapping_idempotently() {
+        if std::env::consts::ARCH != "x86_64" {
+            return;
+        }
+        let (sdk, _directory, _storage, _credentials, _network, runtime) = test_sdk(false);
+        let stored = start_fixture_vm(&sdk, "repeat_stop_vm", false, None);
+
+        sdk.stop_microvm("repeat_stop_vm")
+            .await
+            .expect("first stop should release leftover resources");
+        sdk.stop_microvm("repeat_stop_vm")
+            .await
+            .expect("repeated stop should remain idempotent");
+
+        assert!(stored.record.rootfs_path.is_file());
+        let releases = runtime
+            .disk_events
+            .lock()
+            .expect("disk event lock")
+            .iter()
+            .filter(|event| *event == "release:repeat_stop_vm")
+            .count();
+        assert_eq!(releases, 2);
+    }
+
+    #[tokio::test]
     async fn stop_returns_stopped_without_host_changes_for_silent_sockets() {
         if std::env::consts::ARCH != "x86_64" {
             return;
@@ -6747,6 +7261,110 @@ mod tests {
             assert_eq!(persisted.process_id, None);
             assert_eq!(persisted.process_state, "stopped");
         }
+    }
+
+    #[tokio::test]
+    async fn stop_keeps_starting_process_and_mapping_when_socket_is_silent_but_pid_is_live() {
+        if std::env::consts::ARCH != "x86_64" {
+            return;
+        }
+        let (sdk, _directory, _storage, _credentials, _network, runtime) = test_sdk(false);
+        let stored = start_fixture_vm(&sdk, "starting_stop_vm", false, Some(4242));
+        let mut provisional = stored.runtime.expect("runtime should exist");
+        provisional.process_state = "starting".to_owned();
+        sdk.run_repository(move |repository| {
+            repository.persist_runtime(stored.record.id, &provisional)
+        })
+        .await
+        .expect("starting state should persist");
+        runtime
+            .process_answers
+            .lock()
+            .expect("process map lock")
+            .replace([(4242, true)].into_iter().collect());
+        *runtime.live_socket.lock().expect("socket lock") = false;
+
+        let error = sdk
+            .stop_microvm("starting_stop_vm")
+            .await
+            .expect_err("a live process must retain its mapping for retry");
+        assert!(matches!(error, SdkError::TemporaryRuntime { .. }));
+        assert!(
+            runtime
+                .disk_events
+                .lock()
+                .expect("disk event lock")
+                .is_empty()
+        );
+        let persisted = sdk
+            .repository
+            .find_microvm("starting_stop_vm")
+            .expect("runtime should load")
+            .expect("VM should remain present")
+            .runtime
+            .expect("process identity should remain");
+        assert_eq!(persisted.process_id, Some(4242));
+        assert_eq!(persisted.process_state, "starting");
+    }
+
+    #[tokio::test]
+    async fn stop_retains_runtime_metadata_and_rootfs_when_mapper_release_fails() {
+        if std::env::consts::ARCH != "x86_64" {
+            return;
+        }
+        let (sdk, _directory, _storage, _credentials, _network, runtime) = test_sdk(false);
+        let stored = start_fixture_vm(&sdk, "busy_mapper_vm", false, Some(4242));
+        *runtime
+            .disk_release_result
+            .lock()
+            .expect("disk result lock") = Err("injected busy mapper".to_owned());
+
+        let error = sdk
+            .stop_microvm("busy_mapper_vm")
+            .await
+            .expect_err("busy mapper should make stop retryable");
+        assert!(matches!(error, SdkError::TemporaryRuntime { .. }));
+        assert!(stored.record.rootfs_path.is_file());
+        let persisted = sdk
+            .repository
+            .find_microvm("busy_mapper_vm")
+            .expect("runtime should load")
+            .expect("VM should remain present")
+            .runtime
+            .expect("runtime metadata should remain");
+        assert_eq!(persisted.process_id, Some(4242));
+        assert_eq!(persisted.process_state, "running");
+    }
+
+    #[tokio::test]
+    async fn stop_releases_only_the_target_vm_mapping_and_keeps_both_root_disks() {
+        if std::env::consts::ARCH != "x86_64" {
+            return;
+        }
+        let (sdk, _directory, _storage, _credentials, _network, runtime) = test_sdk(false);
+        let first = start_fixture_vm(&sdk, "stop_first_vm", false, None);
+        let second = start_fixture_vm(&sdk, "stop_second_vm", false, None);
+
+        sdk.stop_microvm("stop_first_vm")
+            .await
+            .expect("first VM should stop and release its mapping");
+
+        assert!(first.record.rootfs_path.is_file());
+        assert!(second.record.rootfs_path.is_file());
+        assert!(
+            runtime
+                .disk_events
+                .lock()
+                .expect("disk event lock")
+                .contains(&"release:stop_first_vm".to_owned())
+        );
+        assert!(
+            !runtime
+                .disk_events
+                .lock()
+                .expect("disk event lock")
+                .contains(&"release:stop_second_vm".to_owned())
+        );
     }
 
     #[tokio::test]

@@ -20,7 +20,7 @@ Every task uses the required checklist form: checkbox, sequential task ID, optio
 
 **Purpose**: Add the shared dependency needed by the selected runtime lock design.
 
-- [ ] T001 Add fs4 to the workspace dependency table in Cargo.toml and consume it from crates/sdk/Cargo.toml for cross-process advisory locking.
+- [X] T001 Add fs4 to the workspace dependency table in Cargo.toml and consume it from crates/sdk/Cargo.toml for cross-process advisory locking.
 
 ---
 
@@ -28,11 +28,11 @@ Every task uses the required checklist form: checkbox, sequential task ID, optio
 
 **Purpose**: Create the private SDK boundary and host primitives required by all lifecycle stories.
 
-- [ ] T002 [P] Define the private RuntimeDiskController port and mapping identity/result types in crates/sdk/src/ports/runtime_disk.rs, and declare the module in crates/sdk/src/ports/mod.rs.
-- [ ] T003 [P] Create DeviceMapperRuntime and declare its private runtime module in crates/sdk/src/adapters/runtime/device_mapper.rs and crates/sdk/src/adapters/runtime/mod.rs; apply the data-model rules: "Normalize and canonicalize the existing SDK home for runtime identity generation." and "Validate using the existing VM-name validator." Use a mapper UUID that is a "Stable owner UUID with a Taumaru prefix and the full digest." Ensure the mapper name follows the data-model rule: "It must fit Linux Device Mapper naming limits."
-- [ ] T004 Wire the production runtime-disk adapter into MicroVmSdk while preserving an injectable fake controller for SDK tests in crates/sdk/src/manager.rs.
-- [ ] T005 Implement the per-VM cross-process lock helper in crates/sdk/src/adapters/runtime/device_mapper.rs using nonblocking fs4 lock attempts with async waiting; hold the lock file for the full start/stop transition and never unlink it after use.
-- [ ] T006 Implement shell-free losetup and dmsetup command helpers with captured output and typed error mapping in crates/sdk/src/adapters/runtime/device_mapper.rs.
+- [X] T002 [P] Define the private RuntimeDiskController port and mapping identity/result types in crates/sdk/src/ports/runtime_disk.rs, and declare the module in crates/sdk/src/ports/mod.rs.
+- [X] T003 [P] Create DeviceMapperRuntime and declare its private runtime module in crates/sdk/src/adapters/runtime/device_mapper.rs and crates/sdk/src/adapters/runtime/mod.rs; apply the data-model rules: "Normalize and canonicalize the existing SDK home for runtime identity generation." and "Validate using the existing VM-name validator." Use a mapper UUID that is a "Stable owner UUID with a Taumaru prefix and the full digest." Ensure the mapper name follows the data-model rule: "It must fit Linux Device Mapper naming limits."
+- [X] T004 Wire the production runtime-disk adapter into MicroVmSdk while preserving an injectable fake controller for SDK tests in crates/sdk/src/manager.rs.
+- [X] T005 Implement the per-VM cross-process lock helper in crates/sdk/src/adapters/runtime/device_mapper.rs using nonblocking fs4 lock attempts with async waiting; hold the lock file for the full start/stop transition and never unlink it after use.
+- [X] T006 Implement shell-free losetup and dmsetup command helpers with captured output and typed error mapping in crates/sdk/src/adapters/runtime/device_mapper.rs.
 
 **Checkpoint**: The private runtime-disk port, Linux adapter, process command helpers, and cross-process lock are ready for story work.
 
@@ -46,16 +46,16 @@ Every task uses the required checklist form: checkbox, sequential task ID, optio
 
 ### Tests for User Story 1
 
-- [ ] T007 [P] [US1] Add adapter tests for deterministic identity, valid mapping reuse, foreign UUID/backing conflicts, and cleanup of verified unused partial resources in crates/sdk/src/adapters/runtime/device_mapper.rs.
-- [ ] T008 [P] [US1] Add manager tests proving mapping preparation precedes launch, two VMs receive independent paths, and a conflict never launches firectl in crates/sdk/src/manager.rs.
-- [ ] T009 [P] [US1] Add Firecracker adapter tests proving the internal mapped path is passed as the writable root drive in crates/sdk/src/adapters/runtime/firecracker.rs.
+- [X] T007 [P] [US1] Add adapter tests for deterministic identity, valid mapping reuse, foreign UUID/backing conflicts, and cleanup of verified unused partial resources in crates/sdk/src/adapters/runtime/device_mapper.rs.
+- [X] T008 [P] [US1] Add manager tests proving mapping preparation precedes launch, two VMs receive independent paths, and a conflict never launches firectl in crates/sdk/src/manager.rs.
+- [X] T009 [P] [US1] Add Firecracker adapter tests proving the internal mapped path is passed as the writable root drive in crates/sdk/src/adapters/runtime/firecracker.rs.
 
 ### Implementation for User Story 1
 
-- [ ] T010 [US1] Implement mapping preparation in crates/sdk/src/adapters/runtime/device_mapper.rs: attach the rootfs to a writable loop device with overlap protection; create "one snapshot-origin target covering the full rootfs block range" with a "Device Mapper sector count matching the loop device size"; verify the UUID, mapping table, dependency, and backing-file identity before reuse; and treat a name match without a UUID and table match as a conflict.
-- [ ] T011 [US1] Rename the internal StartRequest disk field to runtime_disk_path and pass that value to firectl as the writable root-drive path with the :rw suffix in crates/sdk/src/ports/runtime.rs and crates/sdk/src/adapters/runtime/firecracker.rs; preserve the data-model rule that rootfs_path "Must remain the VM volume's existing regular rootfs.ext4 file. It is never replaced by the Device Mapper path in public results."
-- [ ] T012 [US1] Integrate mapping preparation and the full-lifecycle lock into start_microvm in crates/sdk/src/manager.rs; persist process_id with process_state starting before readiness and mark it running only after readiness, following the data-model rules: "Record the spawned firectl identity before readiness completes; retain it if exit cannot be confirmed so stop can retry." and "Use starting while waiting for readiness, running after readiness, and stopped only after process and mapping cleanup complete. On retry, adopt a starting process only when PID, executable identity, and ready socket agree; do not clear it merely because the socket is silent. No new table or column is needed." If persisting the PID fails, terminate the child and verify exit before releasing mappings.
-- [ ] T013 [US1] Document in crates/sdk/src/domain/microvm.rs that MicroVmStartResult.rootfs_path continues to identify the persistent .ext4 file and that the mapper path remains internal.
+- [X] T010 [US1] Implement mapping preparation in crates/sdk/src/adapters/runtime/device_mapper.rs: attach the rootfs to a writable loop device with overlap protection; create "one snapshot-origin target covering the full rootfs block range" with a "Device Mapper sector count matching the loop device size"; verify the UUID, mapping table, dependency, and backing-file identity before reuse; and treat a name match without a UUID and table match as a conflict.
+- [X] T011 [US1] Rename the internal StartRequest disk field to runtime_disk_path and pass that value to firectl as the writable root-drive path with the :rw suffix in crates/sdk/src/ports/runtime.rs and crates/sdk/src/adapters/runtime/firecracker.rs; preserve the data-model rule that rootfs_path "Must remain the VM volume's existing regular rootfs.ext4 file. It is never replaced by the Device Mapper path in public results."
+- [X] T012 [US1] Integrate mapping preparation and the full-lifecycle lock into start_microvm in crates/sdk/src/manager.rs; persist process_id with process_state starting before readiness and mark it running only after readiness, following the data-model rules: "Record the spawned firectl identity before readiness completes; retain it if exit cannot be confirmed so stop can retry." and "Use starting while waiting for readiness, running after readiness, and stopped only after process and mapping cleanup complete. On retry, adopt a starting process only when PID, executable identity, and ready socket agree; do not clear it merely because the socket is silent. No new table or column is needed." If persisting the PID fails, terminate the child and verify exit before releasing mappings.
+- [X] T013 [US1] Document in crates/sdk/src/domain/microvm.rs that MicroVmStartResult.rootfs_path continues to identify the persistent .ext4 file and that the mapper path remains internal.
 
 **Checkpoint**: Start launches through the verified mapper path, returns the unchanged public rootfs path, and safely reuses or rejects existing runtime resources.
 
@@ -69,13 +69,13 @@ Every task uses the required checklist form: checkbox, sequential task ID, optio
 
 ### Tests for User Story 2
 
-- [ ] T014 [P] [US2] Add adapter tests proving normal Device Mapper removal precedes exact loop detachment, busy resources remain, and unrelated resources are untouched in crates/sdk/src/adapters/runtime/device_mapper.rs.
-- [ ] T015 [P] [US2] Add manager tests for graceful and forced stop cleanup, silent sockets with live recorded processes, busy mappings, idempotent leftover cleanup, and preservation of a second VM in crates/sdk/src/manager.rs.
+- [X] T014 [P] [US2] Add adapter tests proving normal Device Mapper removal precedes exact loop detachment, busy resources remain, and unrelated resources are untouched in crates/sdk/src/adapters/runtime/device_mapper.rs.
+- [X] T015 [P] [US2] Add manager tests for graceful and forced stop cleanup, silent sockets with live recorded processes, busy mappings, idempotent leftover cleanup, and preservation of a second VM in crates/sdk/src/manager.rs.
 
 ### Implementation for User Story 2
 
-- [ ] T016 [US2] Implement idempotent mapping release in crates/sdk/src/adapters/runtime/device_mapper.rs; verify ownership before removal, remove the mapper before detaching its loop, wait for both resources to disappear, and never delete or modify rootfs.ext4. Follow the data-model constraint for mapper open_count: "Current kernel references reported for the mapper; nonzero means cleanup must not proceed."
-- [ ] T017 [US2] Integrate release into every stop path in crates/sdk/src/manager.rs, including already-silent sockets; verify process exit and disk release before cleanup, retain process metadata on cleanup failure, and clear runtime metadata/remove the stale socket only after mapping cleanup succeeds.
+- [X] T016 [US2] Implement idempotent mapping release in crates/sdk/src/adapters/runtime/device_mapper.rs; verify ownership before removal, remove the mapper before detaching its loop, wait for both resources to disappear, and never delete or modify rootfs.ext4. Follow the data-model constraint for mapper open_count: "Current kernel references reported for the mapper; nonzero means cleanup must not proceed."
+- [X] T017 [US2] Integrate release into every stop path in crates/sdk/src/manager.rs, including already-silent sockets; verify process exit and disk release before cleanup, retain process metadata on cleanup failure, and clear runtime metadata/remove the stale socket only after mapping cleanup succeeds.
 
 **Checkpoint**: Stop is retryable and idempotent, removes only the target VM's verified resources, and leaves persistent disk contents intact.
 
@@ -89,8 +89,8 @@ Every task uses the required checklist form: checkbox, sequential task ID, optio
 
 **Implementation relationship**: The production create-on-missing path is implemented by User Story 1's mapping preparation. This phase adds separate reboot-recovery regression coverage and does not add a second mapping lifecycle.
 
-- [ ] T018 [P] [US3] Add a manager regression test that reopens the same SDK home with empty fake kernel mapping state, starts the persisted VM, and verifies its deterministic mapper identity is recreated with a newly allocated loop; preserve the data-model rule for device_node: "It may change after reboot and is never treated as stable identity." in crates/sdk/src/manager.rs.
-- [ ] T019 [P] [US3] Add a persistence regression test confirming transient mapper names and loop device numbers are not stored in vm_runtime and inventory/rootfs_path survive simulated host mapping loss in crates/sdk/tests/sqlite_persistence.rs.
+- [X] T018 [P] [US3] Add a manager regression test that reopens the same SDK home with empty fake kernel mapping state, starts the persisted VM, and verifies its deterministic mapper identity is recreated with a newly allocated loop; preserve the data-model rule for device_node: "It may change after reboot and is never treated as stable identity." in crates/sdk/src/manager.rs.
+- [X] T019 [P] [US3] Add a persistence regression test confirming transient mapper names and loop device numbers are not stored in vm_runtime and inventory/rootfs_path survive simulated host mapping loss in crates/sdk/tests/sqlite_persistence.rs.
 
 **Checkpoint**: Reboot recovery is independently covered for one VM and for multiple VMs with distinct stable identities.
 
@@ -100,8 +100,8 @@ Every task uses the required checklist form: checkbox, sequential task ID, optio
 
 **Purpose**: Verify the SDK, host integration, and documented runtime assumptions after all stories are implemented.
 
-- [ ] T020 Run cargo fmt --all -- --check, cargo check --all-targets --all-features, cargo clippy --all-targets --all-features -- -D warnings, and cargo test --all-targets --all-features from the repository root as listed in specs/019-vm-runtime-mapping/quickstart.md.
-- [ ] T021 Execute the privileged Linux lifecycle and reboot-equivalent mapping-loss scenario in specs/019-vm-runtime-mapping/quickstart.md using the project's exact firectl and Firecracker artifacts; verify two-VM isolation, block-device access, cleanup order, and preservation of both rootfs.ext4 files.
+- [ ] T020 Run cargo fmt --all -- --check, cargo check --all-targets --all-features, cargo clippy --all-targets --all-features -- -D warnings, and cargo test --all-targets --all-features from the repository root as listed in specs/019-vm-runtime-mapping/quickstart.md. Formatting, workspace check, tests, and SDK Clippy pass; workspace Clippy reports 82 result_large_err errors in crates/cli.
+- [ ] T021 Execute the privileged Linux lifecycle and reboot-equivalent mapping-loss scenario in specs/019-vm-runtime-mapping/quickstart.md using the project's exact firectl and Firecracker artifacts; verify two-VM isolation, block-device access, cleanup order, and preservation of both rootfs.ext4 files. Not run: firectl and Firecracker are unavailable and the current user cannot access /dev/mapper/control.
 
 ---
 
