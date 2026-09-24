@@ -18,8 +18,8 @@ use crate::domain::registry::{
 use crate::error::SdkError;
 use crate::ports::repository::{
     ArtifactRepository, InventoryState, LocalArtifact, MicroVmRepository, OrphanArtifactDownload,
-    OrphanIdentity, PrunableImage, PrunableKernel, PruneReferences, SnapshotStoredMetadata,
-    StoredMicroVm,
+    OrphanIdentity, PrunableImage, PrunableKernel, PruneReferences, RestoreJournal,
+    RestoredMicroVmCommit, SnapshotStoredMetadata, StoredMicroVm,
 };
 
 use super::migrations;
@@ -937,49 +937,368 @@ impl ArtifactRepository for SqliteRepository {
 impl MicroVmRepository for SqliteRepository {
     fn snapshot_metadata(&self, name: &str) -> Result<SnapshotStoredMetadata, SdkError> {
         let connection = self.connection()?;
-        let metadata = connection
+        let row = connection
             .query_row(
-                "SELECT d.display_name, d.version, d.root_device, di.sha256, k.architecture
+                "SELECT COALESCE(sm.distribution_name, d.display_name),
+                        COALESCE(sm.distribution_version, d.version),
+                        COALESCE(sm.root_device, d.root_device),
+                        COALESCE(sm.image_sha256, di.sha256),
+                        COALESCE(sm.guest_architecture, k.architecture),
+                        sm.kernel_args_json,
+                        k.registry_id, k.name, k.display_name, k.version, k.architecture,
+                        k.registry_path, k.registry_url, k.filename, k.size_bytes,
+                        k.sha256, k.format, k.mime_type, k.modified_at
                  FROM microvms m
-                 JOIN distributions d ON d.registry_id = m.distribution_id
-                 JOIN distribution_images di
+                 LEFT JOIN distributions d ON d.registry_id = m.distribution_id
+                 LEFT JOIN distribution_images di
                    ON di.distribution_id = d.id AND di.registry_id = m.image_id
-                 JOIN distribution_kernels dk ON dk.distribution_id = d.id
-                 JOIN kernels k ON k.id = dk.kernel_id AND k.registry_id = m.kernel_id
+                 LEFT JOIN vm_snapshot_metadata sm ON sm.microvm_id = m.id
+                 JOIN kernels k ON k.registry_id = m.kernel_id
                  WHERE m.name = ?1",
                 params![name],
                 |row| {
                     Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
                         row.get::<_, String>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, String>(7)?,
+                        row.get::<_, String>(8)?,
+                        row.get::<_, String>(9)?,
+                        row.get::<_, String>(10)?,
+                        row.get::<_, String>(11)?,
+                        row.get::<_, String>(12)?,
+                        row.get::<_, String>(13)?,
+                        row.get::<_, i64>(14)?,
+                        row.get::<_, String>(15)?,
+                        row.get::<_, String>(16)?,
+                        row.get::<_, String>(17)?,
+                        row.get::<_, String>(18)?,
                     ))
                 },
             )
             .optional()?
             .ok_or_else(|| SdkError::InvalidMetadata {
                 artifact: name.to_owned(),
-                reason: "stored distribution, image, or kernel provenance is incomplete".to_owned(),
+                reason: "stored VM provenance or embedded kernel inventory is incomplete"
+                    .to_owned(),
             })?;
-        let mut statement = connection.prepare(
-            "SELECT argument FROM distribution_boot_args
-             WHERE distribution_id = (SELECT id FROM distributions WHERE registry_id =
-                 (SELECT distribution_id FROM microvms WHERE name = ?1))
-             ORDER BY position",
-        )?;
-        let kernel_args = statement
-            .query_map(params![name], |row| row.get::<_, String>(0))?
-            .collect::<Result<Vec<_>, _>>()?;
+        let distribution_name = row.0.ok_or_else(|| incomplete_snapshot_metadata(name))?;
+        let distribution_version = row.1.ok_or_else(|| incomplete_snapshot_metadata(name))?;
+        let root_device = row.2.ok_or_else(|| incomplete_snapshot_metadata(name))?;
+        let image_sha256 = row.3.ok_or_else(|| incomplete_snapshot_metadata(name))?;
+        let kernel_args = if let Some(encoded) = row.5 {
+            serde_json::from_str(&encoded).map_err(|error| SdkError::InvalidMetadata {
+                artifact: name.to_owned(),
+                reason: format!("stored boot arguments are invalid: {error}"),
+            })?
+        } else {
+            let mut statement = connection.prepare(
+                "SELECT argument FROM distribution_boot_args
+                 WHERE distribution_id = (SELECT id FROM distributions WHERE registry_id =
+                     (SELECT distribution_id FROM microvms WHERE name = ?1))
+                 ORDER BY position",
+            )?;
+            statement
+                .query_map(params![name], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        let kernel_size = u64::try_from(row.14)
+            .map_err(|_| SdkError::Migration("negative kernel size in inventory".to_owned()))?;
+        let kernel = Kernel {
+            id: row.6,
+            name: row.7,
+            display_name: row.8,
+            version: row.9,
+            architecture: parse_architecture(&row.10)?,
+            path: row.11,
+            url: row.12,
+            filename: row.13,
+            size_bytes: kernel_size,
+            sha256: row.15,
+            format: row.16,
+            mime_type: row.17,
+            elf: None,
+            modified_at: row.18,
+        };
         Ok(SnapshotStoredMetadata {
-            distribution_name: metadata.0,
-            distribution_version: metadata.1,
-            root_device: metadata.2,
+            distribution_name,
+            distribution_version,
+            root_device,
             kernel_args,
-            image_sha256: metadata.3,
-            guest_architecture: metadata.4,
+            image_sha256,
+            guest_architecture: row.4,
+            kernel,
         })
+    }
+
+    fn record_restore_journal(&self, journal: &RestoreJournal) -> Result<(), SdkError> {
+        let connection = self.connection()?;
+        let network_json = journal
+            .network
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|error| {
+                SdkError::Migration(format!("encode restore journal network: {error}"))
+            })?;
+        connection.execute(
+            "INSERT INTO restore_journal (
+                operation_id, vm_name, staging_path, volume_path, volume_created, kernel_path,
+                kernel_created, network_json, progress_state, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+             ON CONFLICT(operation_id) DO UPDATE SET
+                vm_name = excluded.vm_name,
+                staging_path = excluded.staging_path,
+                volume_path = excluded.volume_path,
+                volume_created = excluded.volume_created,
+                kernel_path = excluded.kernel_path,
+                kernel_created = excluded.kernel_created,
+                network_json = excluded.network_json,
+                progress_state = excluded.progress_state,
+                updated_at = excluded.updated_at",
+            params![
+                journal.operation_id,
+                journal.vm_name,
+                journal.staging_path.to_string_lossy().into_owned(),
+                journal.volume_path.to_string_lossy().into_owned(),
+                bool_to_sqlite(journal.volume_created),
+                journal.kernel_path.to_string_lossy().into_owned(),
+                bool_to_sqlite(journal.kernel_created),
+                network_json,
+                journal.progress_state,
+                unix_timestamp()?,
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn list_restore_journals(&self, vm_name: &str) -> Result<Vec<RestoreJournal>, SdkError> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT operation_id, vm_name, staging_path, volume_path, volume_created, kernel_path,
+                    kernel_created, network_json, progress_state
+             FROM restore_journal WHERE vm_name = ?1 ORDER BY updated_at",
+        )?;
+        let rows = statement.query_map(params![vm_name], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                PathBuf::from(row.get::<_, String>(2)?),
+                PathBuf::from(row.get::<_, String>(3)?),
+                row.get::<_, i64>(4)?,
+                PathBuf::from(row.get::<_, String>(5)?),
+                row.get::<_, i64>(6)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, String>(8)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let (
+                operation_id,
+                vm_name,
+                staging_path,
+                volume_path,
+                volume_created,
+                kernel_path,
+                kernel_created,
+                network_json,
+                progress_state,
+            ) = row?;
+            let network = network_json
+                .map(|value| {
+                    serde_json::from_str(&value).map_err(|error| {
+                        SdkError::Migration(format!("decode restore journal network: {error}"))
+                    })
+                })
+                .transpose()?;
+            Ok(RestoreJournal {
+                operation_id,
+                vm_name,
+                staging_path,
+                volume_path,
+                volume_created: volume_created != 0,
+                kernel_path,
+                kernel_created: kernel_created != 0,
+                network,
+                progress_state,
+            })
+        })
+        .collect()
+    }
+
+    fn delete_restore_journal(&self, operation_id: &str) -> Result<(), SdkError> {
+        let connection = self.connection()?;
+        connection.execute(
+            "DELETE FROM restore_journal WHERE operation_id = ?1",
+            params![operation_id],
+        )?;
+        Ok(())
+    }
+
+    fn commit_restored_microvm(&self, commit: RestoredMicroVmCommit<'_>) -> Result<i64, SdkError> {
+        let RestoredMicroVmCommit {
+            record,
+            network,
+            credential,
+            runtime,
+            kernel,
+            kernel_spec,
+            kernel_integrity,
+            snapshot_metadata,
+            operation_id,
+        } = commit;
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let now = unix_timestamp()?;
+        transaction.execute(
+            "INSERT INTO microvms (
+                name, distribution_id, image_id, kernel_id,
+                firecracker_package_id, firectl_package_id, disk_size_bytes,
+                memory_requested_bytes, memory_effective_mib, vcpu_count,
+                volume_path, rootfs_path, socket_path, expose_on_lan, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?15)",
+            params![
+                record.name,
+                record.distribution_id,
+                record.image_id,
+                record.kernel_id,
+                record.firecracker_package_id,
+                record.firectl_package_id,
+                to_sqlite_integer(record.disk_size_bytes, "VM disk size")?,
+                to_sqlite_integer(record.memory_bytes, "VM memory")?,
+                to_sqlite_integer(record.memory_effective_mib, "VM effective memory")?,
+                i64::from(record.vcpu_count),
+                record.volume_path.to_string_lossy().into_owned(),
+                record.rootfs_path.to_string_lossy().into_owned(),
+                record.socket_path.to_string_lossy().into_owned(),
+                bool_to_sqlite(record.expose_on_lan),
+                record.created_at,
+            ],
+        )?;
+        let vm_id = transaction.last_insert_rowid();
+        persist_network_transaction(&transaction, vm_id, network)?;
+        transaction.execute(
+            "INSERT INTO vm_credentials (
+                microvm_id, private_key_path, public_key_path, guest_authorized_keys_path,
+                key_type, ssh_user, ssh_port, public_key_fingerprint, file_mode
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                vm_id,
+                credential.private_key_path.to_string_lossy().into_owned(),
+                credential.public_key_path.to_string_lossy().into_owned(),
+                credential.guest_authorized_keys_path,
+                credential.key_type,
+                credential.ssh_user,
+                i64::from(credential.ssh_port),
+                credential.public_key_fingerprint,
+                credential.file_mode,
+            ],
+        )?;
+        transaction.execute(
+            "INSERT INTO vm_runtime (
+                microvm_id, firecracker_path, firectl_path, socket_path,
+                process_id, process_state, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, NULL, 'stopped', ?5)",
+            params![
+                vm_id,
+                runtime.firecracker_path.to_string_lossy().into_owned(),
+                runtime.firectl_path.to_string_lossy().into_owned(),
+                runtime.socket_path.to_string_lossy().into_owned(),
+                now,
+            ],
+        )?;
+        let download_id = persist_download(&transaction, kernel_spec, kernel_integrity)?;
+        transaction.execute(
+            "INSERT INTO kernels (
+                registry_id, download_id, name, display_name, version, architecture,
+                registry_path, registry_url, filename, size_bytes, sha256, format,
+                mime_type, modified_at, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?15)
+             ON CONFLICT(registry_id) DO UPDATE SET
+                download_id = excluded.download_id,
+                name = excluded.name,
+                display_name = excluded.display_name,
+                version = excluded.version,
+                architecture = excluded.architecture,
+                registry_path = excluded.registry_path,
+                registry_url = excluded.registry_url,
+                filename = excluded.filename,
+                size_bytes = excluded.size_bytes,
+                sha256 = excluded.sha256,
+                format = excluded.format,
+                mime_type = excluded.mime_type,
+                modified_at = excluded.modified_at,
+                updated_at = excluded.updated_at",
+            params![
+                kernel.id,
+                download_id,
+                kernel.name,
+                kernel.display_name,
+                kernel.version,
+                architecture_name(&kernel.architecture),
+                kernel.path,
+                kernel.url,
+                kernel.filename,
+                to_sqlite_integer(kernel.size_bytes, &kernel_spec.artifact_key)?,
+                kernel.sha256,
+                kernel.format,
+                kernel.mime_type,
+                kernel.modified_at,
+                now,
+            ],
+        )?;
+        persist_elf(&transaction, download_id, kernel.elf.as_ref())?;
+        let kernel_row_id: i64 = transaction.query_row(
+            "SELECT id FROM kernels WHERE registry_id = ?1",
+            params![kernel.id],
+            |row| row.get(0),
+        )?;
+        if transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM distributions WHERE registry_id = ?1)",
+            params![record.distribution_id],
+            |row| row.get::<_, i64>(0),
+        )? != 0
+        {
+            let distribution_row_id: i64 = transaction.query_row(
+                "SELECT id FROM distributions WHERE registry_id = ?1",
+                params![record.distribution_id],
+                |row| row.get(0),
+            )?;
+            transaction.execute(
+                "INSERT OR IGNORE INTO distribution_kernels (distribution_id, kernel_id, is_default)
+                 VALUES (?1, ?2, 1)",
+                params![distribution_row_id, kernel_row_id],
+            )?;
+        }
+        let kernel_args_json =
+            serde_json::to_string(&snapshot_metadata.kernel_args).map_err(|error| {
+                SdkError::Migration(format!("encode restored boot arguments: {error}"))
+            })?;
+        transaction.execute(
+            "INSERT INTO vm_snapshot_metadata (
+                microvm_id, distribution_name, distribution_version, root_device,
+                kernel_args_json, image_sha256, guest_architecture
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                vm_id,
+                snapshot_metadata.distribution_name,
+                snapshot_metadata.distribution_version,
+                snapshot_metadata.root_device,
+                kernel_args_json,
+                snapshot_metadata.image_sha256,
+                snapshot_metadata.guest_architecture,
+            ],
+        )?;
+        transaction.execute(
+            "DELETE FROM restore_journal WHERE operation_id = ?1",
+            params![operation_id],
+        )?;
+        transaction.commit()?;
+        Ok(vm_id)
     }
 
     fn find_microvm(&self, name: &str) -> Result<Option<StoredMicroVm>, SdkError> {
@@ -2168,6 +2487,13 @@ fn replace_capabilities(
     Ok(())
 }
 
+fn incomplete_snapshot_metadata(name: &str) -> SdkError {
+    SdkError::InvalidMetadata {
+        artifact: name.to_owned(),
+        reason: "stored distribution, image, or boot provenance is incomplete".to_owned(),
+    }
+}
+
 fn unix_timestamp() -> Result<i64, SdkError> {
     let duration = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2278,7 +2604,7 @@ mod tests {
     }
 
     #[test]
-    fn reads_snapshot_boot_metadata_from_sqlite_without_registry_or_schema_changes() {
+    fn reads_snapshot_boot_metadata_from_sqlite_after_restore_migration() {
         let (directory, repository) = empty_repository();
         let database_path = directory.path().join("inventory.db");
         let connection = open_connection(&database_path).expect("inventory connection should open");
@@ -2397,8 +2723,8 @@ mod tests {
         assert_eq!(metadata.image_sha256, "b".repeat(64));
         assert_eq!(metadata.guest_architecture, "x86_64");
         assert_eq!(
-            schema_version, 4,
-            "snapshot metadata must not require a migration"
+            schema_version, 5,
+            "restore journal migration should be applied"
         );
     }
 

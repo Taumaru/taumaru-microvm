@@ -502,6 +502,59 @@ impl RuntimeDiskController for DeviceMapperRuntime {
         Ok(self.snapshot_mapper_path(&identity))
     }
 
+    fn create_private_snapshot_view(
+        &self,
+        sdk_home: &Path,
+        vm_name: &str,
+        rootfs_path: &Path,
+        stable_parent_path: &Path,
+        operation_id: &str,
+        on_progress: &mut dyn FnMut(SnapshotProgress),
+    ) -> Result<PathBuf, SdkError> {
+        self.create_private_snapshot(
+            sdk_home,
+            vm_name,
+            rootfs_path,
+            stable_parent_path,
+            operation_id,
+            on_progress,
+        )
+    }
+
+    fn check_private_snapshot_view(
+        &self,
+        sdk_home: &Path,
+        vm_name: &str,
+        rootfs_path: &Path,
+        stable_parent_path: &Path,
+        operation_id: &str,
+    ) -> Result<(), SdkError> {
+        self.verify_private_snapshot(
+            sdk_home,
+            vm_name,
+            rootfs_path,
+            stable_parent_path,
+            operation_id,
+        )
+    }
+
+    fn remove_private_snapshot_view(
+        &self,
+        sdk_home: &Path,
+        vm_name: &str,
+        rootfs_path: &Path,
+        stable_parent_path: &Path,
+        operation_id: &str,
+    ) -> Result<(), SdkError> {
+        self.remove_private_snapshot(
+            sdk_home,
+            vm_name,
+            rootfs_path,
+            stable_parent_path,
+            operation_id,
+        )
+    }
+
     fn check_snapshot_view(
         &self,
         sdk_home: &Path,
@@ -616,6 +669,561 @@ impl DeviceMapperRuntime {
                 output_text(&output.stderr).trim()
             ),
         ))
+    }
+
+    fn create_private_snapshot(
+        &self,
+        sdk_home: &Path,
+        vm_name: &str,
+        rootfs_path: &Path,
+        stable_parent_path: &Path,
+        operation_id: &str,
+        on_progress: &mut dyn FnMut(SnapshotProgress),
+    ) -> Result<PathBuf, SdkError> {
+        let identity = PrivateSnapshotIdentity::new(sdk_home, vm_name, operation_id)?;
+        let rootfs = RootfsIdentity::new(rootfs_path, vm_name)?;
+        self.verify_private_parent(sdk_home, vm_name, rootfs_path, stable_parent_path)?;
+        if self.find_private_mapper(&identity)?.is_some() || path_exists(&identity.cow_path)? {
+            return Err(storage_conflict(
+                vm_name,
+                &identity.cow_path,
+                "this operation-specific private snapshot identity is already in use",
+            ));
+        }
+
+        let cow_directory = identity.cow_path.parent().ok_or_else(|| {
+            private_snapshot_error(vm_name, "the COW backing path has no parent directory")
+        })?;
+        fs::create_dir_all(cow_directory).map_err(|error| {
+            SdkError::filesystem(
+                "create private snapshot COW directory",
+                cow_directory,
+                error,
+            )
+        })?;
+        let directory_metadata = fs::symlink_metadata(cow_directory).map_err(|error| {
+            SdkError::filesystem(
+                "inspect private snapshot COW directory",
+                cow_directory,
+                error,
+            )
+        })?;
+        if directory_metadata.file_type().is_symlink() || !directory_metadata.is_dir() {
+            return Err(private_snapshot_error(
+                vm_name,
+                "the COW directory is not a real directory",
+            ));
+        }
+        let canonical_directory = fs::canonicalize(cow_directory).map_err(|error| {
+            SdkError::filesystem(
+                "canonicalize private snapshot COW directory",
+                cow_directory,
+                error,
+            )
+        })?;
+        if !canonical_directory.starts_with(&identity.canonical_home) {
+            return Err(private_snapshot_error(
+                vm_name,
+                "the COW directory resolves outside the SDK home",
+            ));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(cow_directory, fs::Permissions::from_mode(0o700)).map_err(
+                |error| {
+                    SdkError::filesystem(
+                        "protect private snapshot COW directory",
+                        cow_directory,
+                        error,
+                    )
+                },
+            )?;
+        }
+
+        let cow_size =
+            snapshot_cow_size(rootfs.size_bytes).ok_or_else(|| SdkError::SnapshotCapacity {
+                vm_name: vm_name.to_owned(),
+                reason: "the private COW store exceeds the host file-size limit".to_owned(),
+            })?;
+        let cow_file = OpenOptions::new()
+            .write(true)
+            .read(true)
+            .create_new(true)
+            .open(&identity.cow_path)
+            .map_err(|error| {
+                SdkError::filesystem(
+                    "create private snapshot COW backing file",
+                    &identity.cow_path,
+                    error,
+                )
+            })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Err(error) = cow_file.set_permissions(fs::Permissions::from_mode(0o600)) {
+                drop(cow_file);
+                let primary = SdkError::filesystem(
+                    "protect private snapshot COW backing file",
+                    &identity.cow_path,
+                    error,
+                );
+                let cleanup = fs::remove_file(&identity.cow_path).err().map(|source| {
+                    SdkError::filesystem(
+                        "remove unprotected private COW file",
+                        &identity.cow_path,
+                        source,
+                    )
+                });
+                return Err(with_cleanup(primary, cleanup));
+            }
+        }
+        drop(cow_file);
+        let mut allocated = 0_u64;
+        on_progress(SnapshotProgress {
+            stage: SnapshotProgressStage::AllocatingCowStore,
+            completed_bytes: 0,
+            total_bytes: cow_size,
+        });
+        while allocated < cow_size {
+            let length = (cow_size - allocated).min(COW_ALLOCATION_CHUNK_BYTES);
+            if let Err(primary) = self.run_checked(
+                "fallocate",
+                vec![
+                    OsString::from("--offset"),
+                    OsString::from(allocated.to_string()),
+                    OsString::from("--length"),
+                    OsString::from(length.to_string()),
+                    identity.cow_path.as_os_str().to_owned(),
+                ],
+            ) {
+                let cleanup = fs::remove_file(&identity.cow_path).err().map(|source| {
+                    SdkError::filesystem(
+                        "remove incomplete private COW file",
+                        &identity.cow_path,
+                        source,
+                    )
+                });
+                return Err(with_cleanup(primary, cleanup));
+            }
+            allocated = allocated.saturating_add(length);
+            on_progress(SnapshotProgress {
+                stage: SnapshotProgressStage::AllocatingCowStore,
+                completed_bytes: allocated,
+                total_bytes: cow_size,
+            });
+        }
+
+        let cow = RootfsIdentity::new(&identity.cow_path, vm_name)?;
+        let loop_output = match self.run_checked(
+            "losetup",
+            vec![
+                OsString::from("--find"),
+                OsString::from("--show"),
+                OsString::from("--nooverlap"),
+                cow.canonical_path.as_os_str().to_owned(),
+            ],
+        ) {
+            Ok(output) => output_text(&output.stdout).trim().to_owned(),
+            Err(primary) => {
+                return Err(with_cleanup(
+                    primary,
+                    fs::remove_file(&identity.cow_path).err().map(|source| {
+                        SdkError::filesystem(
+                            "remove unused private COW file",
+                            &identity.cow_path,
+                            source,
+                        )
+                    }),
+                ));
+            }
+        };
+        let cow_loop = match self.find_loop(&cow) {
+            Ok(Some(device))
+                if !device.read_only && device.offset_bytes == 0 && device.name == loop_output =>
+            {
+                device
+            }
+            Ok(_) => {
+                let primary = private_snapshot_error(
+                    vm_name,
+                    "the private COW loop could not be verified against its backing file",
+                );
+                let cleanup = self.cleanup_private_backing(&identity, &cow).err();
+                return Err(with_cleanup(primary, cleanup));
+            }
+            Err(primary) => {
+                let cleanup = self.cleanup_private_backing(&identity, &cow).err();
+                return Err(with_cleanup(primary, cleanup));
+            }
+        };
+
+        on_progress(SnapshotProgress {
+            stage: SnapshotProgressStage::PreparingPrivateView,
+            completed_bytes: 0,
+            total_bytes: 0,
+        });
+        let parent_dependency = block_device_major_minor(stable_parent_path).map_err(|error| {
+            private_snapshot_error(
+                vm_name,
+                &format!("could not inspect stable parent block device: {error}"),
+            )
+        })?;
+        let table = format!(
+            "0 {} snapshot {} {} PO {}",
+            rootfs.size_bytes / SECTOR_SIZE_BYTES,
+            parent_dependency,
+            cow_loop.major_minor,
+            SNAPSHOT_CHUNK_SECTORS,
+        );
+        let create = self.create_private_snapshot_mapping(&identity, &table);
+        if let Err(primary) = create {
+            let unsupported = nested_snapshot_unsupported(&primary);
+            let cleanup = self.cleanup_private_backing(&identity, &cow).err();
+            let error = if unsupported {
+                SdkError::SnapshotCapability {
+                    capability: "nested_classic_snapshot_unsupported".to_owned(),
+                    reason: primary.to_string(),
+                }
+            } else {
+                primary
+            };
+            return Err(with_cleanup(error, cleanup));
+        }
+        if let Err(primary) = self
+            .verify_private_snapshot(
+                sdk_home,
+                vm_name,
+                rootfs_path,
+                stable_parent_path,
+                operation_id,
+            )
+            .and_then(|_| self.wait_for_private_node(&identity))
+        {
+            let cleanup = self
+                .remove_private_snapshot(
+                    sdk_home,
+                    vm_name,
+                    rootfs_path,
+                    stable_parent_path,
+                    operation_id,
+                )
+                .err();
+            return Err(with_cleanup(primary, cleanup));
+        }
+        Ok(self.private_snapshot_mapper_path(&identity))
+    }
+
+    fn verify_private_parent(
+        &self,
+        sdk_home: &Path,
+        vm_name: &str,
+        rootfs_path: &Path,
+        stable_parent_path: &Path,
+    ) -> Result<(), SdkError> {
+        let parent = SnapshotIdentity::new(sdk_home, vm_name)?;
+        if stable_parent_path != self.snapshot_mapper_path(&parent) {
+            return Err(private_snapshot_error(
+                vm_name,
+                "the parent path is not the owned read-only capture view",
+            ));
+        }
+        <Self as RuntimeDiskController>::check_snapshot_view(self, sdk_home, vm_name, rootfs_path)?;
+        let device = block_device_major_minor(stable_parent_path).map_err(|error| {
+            private_snapshot_error(
+                vm_name,
+                &format!("could not inspect parent block device: {error}"),
+            )
+        })?;
+        let read_only_path = Path::new("/sys/dev/block").join(&device).join("ro");
+        let value = fs::read_to_string(&read_only_path).map_err(|error| {
+            private_snapshot_error(
+                vm_name,
+                &format!("could not verify parent read-only state: {error}"),
+            )
+        })?;
+        if value.trim() != "1" {
+            return Err(private_snapshot_error(
+                vm_name,
+                "the capture parent is not read-only",
+            ));
+        }
+        Ok(())
+    }
+
+    fn create_private_snapshot_mapping(
+        &self,
+        identity: &PrivateSnapshotIdentity,
+        table: &str,
+    ) -> Result<(), SdkError> {
+        let run_create = |value: &str| {
+            self.run_checked(
+                "dmsetup",
+                vec![
+                    OsString::from("create"),
+                    OsString::from(&identity.mapper_name),
+                    OsString::from("--uuid"),
+                    OsString::from(&identity.mapper_uuid),
+                    OsString::from("--table"),
+                    OsString::from(value),
+                    OsString::from("--noudevrules"),
+                    OsString::from("--noudevsync"),
+                    OsString::from("--addnodeoncreate"),
+                ],
+            )
+        };
+        match run_create(table) {
+            Ok(_) => Ok(()),
+            Err(primary) if table.contains(" PO ") && supports_po_fallback(&primary) => {
+                run_create(&table.replace(" PO ", " P ")).map(|_| ())
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn verify_private_snapshot(
+        &self,
+        sdk_home: &Path,
+        vm_name: &str,
+        rootfs_path: &Path,
+        stable_parent_path: &Path,
+        operation_id: &str,
+    ) -> Result<(), SdkError> {
+        let identity = PrivateSnapshotIdentity::new(sdk_home, vm_name, operation_id)?;
+        let rootfs = RootfsIdentity::new(rootfs_path, vm_name)?;
+        self.verify_private_parent(sdk_home, vm_name, rootfs_path, stable_parent_path)?;
+        self.find_private_mapper(&identity)?.ok_or_else(|| {
+            private_snapshot_error(vm_name, "the private mapper disappeared during capture")
+        })?;
+        let cow = RootfsIdentity::new(&identity.cow_path, vm_name)?;
+        let loops = self.find_loops_for_rootfs(&cow)?;
+        let [cow_loop] = loops.as_slice() else {
+            return Err(private_snapshot_error(
+                vm_name,
+                "the private COW loop association is missing or ambiguous",
+            ));
+        };
+        let output = self.run_checked(
+            "dmsetup",
+            vec![
+                OsString::from("table"),
+                OsString::from(&identity.mapper_name),
+            ],
+        )?;
+        let table = parse_snapshot_dm_table(&output.stdout).ok_or_else(|| {
+            private_snapshot_error(vm_name, "the private mapper is not one snapshot target")
+        })?;
+        let parent_dependency = block_device_major_minor(stable_parent_path).map_err(|error| {
+            private_snapshot_error(
+                vm_name,
+                &format!("could not inspect parent block device: {error}"),
+            )
+        })?;
+        if table.start_sector != 0
+            || table.sector_count != rootfs.size_bytes / SECTOR_SIZE_BYTES
+            || table.target != "snapshot"
+            || table.origin_dependency != parent_dependency
+            || table.cow_dependency != cow_loop.major_minor
+            || table.chunk_sectors != SNAPSHOT_CHUNK_SECTORS
+            || !matches!(table.mode.as_str(), "P" | "PO")
+            || cow.canonical_path != identity.cow_path
+            || cow_loop.read_only
+            || cow_loop.offset_bytes != 0
+        {
+            return Err(private_snapshot_error(
+                vm_name,
+                "the private snapshot table or COW loop does not match the verified disk view",
+            ));
+        }
+        self.check_private_status(&identity, vm_name)
+    }
+
+    fn check_private_status(
+        &self,
+        identity: &PrivateSnapshotIdentity,
+        vm_name: &str,
+    ) -> Result<(), SdkError> {
+        let output = self.run_checked(
+            "dmsetup",
+            vec![
+                OsString::from("status"),
+                OsString::from(&identity.mapper_name),
+            ],
+        )?;
+        let status = output_text(&output.stdout);
+        if status.trim().is_empty() {
+            return Err(private_snapshot_error(
+                vm_name,
+                "Device Mapper returned an empty private snapshot status",
+            ));
+        }
+        let lowered = status.to_ascii_lowercase();
+        if lowered.contains("overflow") || lowered.contains("invalid") {
+            return Err(SdkError::SnapshotCowOverflow {
+                vm_name: vm_name.to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    fn remove_private_snapshot(
+        &self,
+        sdk_home: &Path,
+        vm_name: &str,
+        rootfs_path: &Path,
+        stable_parent_path: &Path,
+        operation_id: &str,
+    ) -> Result<(), SdkError> {
+        let identity = PrivateSnapshotIdentity::new(sdk_home, vm_name, operation_id)?;
+        let rootfs = RootfsIdentity::new(rootfs_path, vm_name)?;
+        let cow_exists = path_exists(&identity.cow_path)?;
+        let cow = if cow_exists {
+            Some(RootfsIdentity::new(&identity.cow_path, vm_name)?)
+        } else {
+            None
+        };
+        if let Some(mapper) = self.find_private_mapper(&identity)? {
+            if mapper.open_count != 0 {
+                return Err(temporary_runtime(format!(
+                    "the private snapshot has {} open references",
+                    mapper.open_count
+                )));
+            }
+            let cow = cow.as_ref().ok_or_else(|| {
+                private_snapshot_error(
+                    vm_name,
+                    "the active private mapping has no COW backing file",
+                )
+            })?;
+            let loops = self.find_loops_for_rootfs(cow)?;
+            let [cow_loop] = loops.as_slice() else {
+                return Err(private_snapshot_error(
+                    vm_name,
+                    "the private COW loop association is missing or ambiguous",
+                ));
+            };
+            let output = self.run_checked(
+                "dmsetup",
+                vec![
+                    OsString::from("table"),
+                    OsString::from(&identity.mapper_name),
+                ],
+            )?;
+            let table = parse_snapshot_dm_table(&output.stdout).ok_or_else(|| {
+                private_snapshot_error(vm_name, "the owned private mapper table cannot be verified")
+            })?;
+            let parent_dependency =
+                block_device_major_minor(stable_parent_path).map_err(|error| {
+                    private_snapshot_error(
+                        vm_name,
+                        &format!("could not inspect parent block device: {error}"),
+                    )
+                })?;
+            if table.target != "snapshot"
+                || table.origin_dependency != parent_dependency
+                || table.cow_dependency != cow_loop.major_minor
+                || table.sector_count != rootfs.size_bytes / SECTOR_SIZE_BYTES
+                || cow.canonical_path != identity.cow_path
+            {
+                return Err(private_snapshot_error(
+                    vm_name,
+                    "refusing to remove a private mapper with unexpected dependencies",
+                ));
+            }
+            self.run_checked(
+                "dmsetup",
+                vec![
+                    OsString::from("remove"),
+                    OsString::from(&identity.mapper_name),
+                ],
+            )
+            .map_err(|error| map_busy_error(error, "remove the private snapshot mapper"))?;
+            self.wait_until_private_gone(&identity)?;
+        }
+        if let Some(cow) = cow.as_ref() {
+            self.cleanup_private_backing(&identity, cow)?;
+        }
+        Ok(())
+    }
+
+    fn cleanup_private_backing(
+        &self,
+        identity: &PrivateSnapshotIdentity,
+        cow: &RootfsIdentity,
+    ) -> Result<(), SdkError> {
+        if self.find_private_mapper(identity)?.is_some() {
+            return Err(temporary_runtime(
+                "the private snapshot mapper is still active",
+            ));
+        }
+        if let Some(loop_device) = self.find_loop(cow)? {
+            self.detach_verified_loop(cow, &loop_device)?;
+        }
+        if path_exists(&identity.cow_path)? {
+            fs::remove_file(&identity.cow_path).map_err(|error| {
+                SdkError::filesystem(
+                    "remove private snapshot COW backing file",
+                    &identity.cow_path,
+                    error,
+                )
+            })?;
+        }
+        Ok(())
+    }
+
+    fn wait_until_private_gone(&self, identity: &PrivateSnapshotIdentity) -> Result<(), SdkError> {
+        let deadline = Instant::now() + RESOURCE_WAIT;
+        loop {
+            if self.find_private_mapper(identity)?.is_none() {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(temporary_runtime(
+                    "the private snapshot mapper did not disappear after removal",
+                ));
+            }
+            std::thread::sleep(RESOURCE_POLL);
+        }
+    }
+
+    fn wait_for_private_node(&self, identity: &PrivateSnapshotIdentity) -> Result<(), SdkError> {
+        self.run_checked(
+            "dmsetup",
+            vec![
+                OsString::from("mknodes"),
+                OsString::from(&identity.mapper_name),
+            ],
+        )?;
+        let path = self.private_snapshot_mapper_path(identity);
+        let deadline = Instant::now() + RESOURCE_WAIT;
+        loop {
+            if snapshot_mapper_node_ready(&path, &identity.vm_name)? {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(host_command_error(
+                    "dmsetup",
+                    "the private snapshot block device did not become available",
+                ));
+            }
+            std::thread::sleep(RESOURCE_POLL);
+        }
+    }
+
+    fn find_private_mapper(
+        &self,
+        identity: &PrivateSnapshotIdentity,
+    ) -> Result<Option<MapperInfo>, SdkError> {
+        self.find_named_mapper(
+            &identity.mapper_name,
+            &identity.mapper_uuid,
+            &identity.vm_name,
+            &identity.canonical_home,
+        )
+    }
+
+    fn private_snapshot_mapper_path(&self, identity: &PrivateSnapshotIdentity) -> PathBuf {
+        self.mapper_directory.join(&identity.mapper_name)
     }
 
     fn find_mapper(&self, identity: &MappingIdentity) -> Result<Option<MapperInfo>, SdkError> {
@@ -1227,6 +1835,50 @@ impl SnapshotIdentity {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+struct PrivateSnapshotIdentity {
+    canonical_home: PathBuf,
+    vm_name: String,
+    operation_digest: String,
+    mapper_name: String,
+    mapper_uuid: String,
+    cow_path: PathBuf,
+}
+
+impl PrivateSnapshotIdentity {
+    fn new(home: &Path, vm_name: &str, operation_id: &str) -> Result<Self, SdkError> {
+        if operation_id.is_empty()
+            || operation_id.len() > 128
+            || !operation_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        {
+            return Err(SdkError::InvalidRequest {
+                field: "snapshot_operation_id".to_owned(),
+                reason: "must be 1-128 ASCII letters, numbers, hyphens, or underscores".to_owned(),
+            });
+        }
+        let origin = MappingIdentity::new(home, vm_name)?;
+        let mut hash = Sha256::new();
+        hash.update(origin.digest.as_bytes());
+        hash.update([0]);
+        hash.update(operation_id.as_bytes());
+        let operation_digest = hex_digest(hash.finalize());
+        Ok(Self {
+            canonical_home: origin.canonical_home.clone(),
+            vm_name: vm_name.to_owned(),
+            mapper_name: format!("tmpriv-{}", &operation_digest[..24]),
+            mapper_uuid: format!("TAUMARU-MICROVM-PRIVATE-SNAPSHOT-{operation_digest}"),
+            cow_path: origin
+                .canonical_home
+                .join("tmp")
+                .join("snapshots")
+                .join(format!("private-{operation_digest}.cow")),
+            operation_digest,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct SnapshotDmTable {
     start_sector: u64,
     sector_count: u64,
@@ -1410,6 +2062,26 @@ fn snapshot_cow_size(rootfs_size: u64) -> Option<u64> {
     rootfs_size
         .checked_add(metadata_reserve)?
         .checked_add(SECTOR_SIZE_BYTES)
+}
+
+fn private_snapshot_error(vm_name: &str, reason: &str) -> SdkError {
+    SdkError::SnapshotViewInvalid {
+        vm_name: vm_name.to_owned(),
+        reason: reason.to_owned(),
+    }
+}
+
+fn nested_snapshot_unsupported(error: &SdkError) -> bool {
+    let SdkError::HostCommand { program, reason } = error else {
+        return false;
+    };
+    if program != "dmsetup" {
+        return false;
+    }
+    let reason = reason.to_ascii_lowercase();
+    reason.contains("operation not supported")
+        || reason.contains("not supported")
+        || reason.contains("unsupported")
 }
 
 fn supports_po_fallback(error: &SdkError) -> bool {

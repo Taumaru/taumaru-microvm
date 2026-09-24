@@ -2,6 +2,21 @@ use std::path::PathBuf;
 
 use tokio_util::sync::CancellationToken;
 
+/// Selects how IPv4 identity is stored in a snapshot and reconstructed on restore.
+///
+/// `PreserveIpv4` embeds the source guest address, prefix, optional gateway and LAN
+/// address, network mode, exposure setting, and guest MAC. Restore fails if the
+/// destination cannot reproduce those exact values. `RegenerateIpv4` stores only
+/// whether the source VM is exposed on the LAN; restore allocates destination-local
+/// addresses and writes them into the restored guest disk.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SnapshotAddressPolicy {
+    /// Preserve the source IPv4 addresses and guest MAC across restore.
+    PreserveIpv4,
+    /// Allocate destination-local IPv4 addresses during restore.
+    RegenerateIpv4,
+}
+
 /// The stage currently being performed by a snapshot operation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SnapshotProgressStage {
@@ -11,6 +26,12 @@ pub enum SnapshotProgressStage {
     AllocatingCowStore,
     /// Connecting the completed copy-on-write store to Device Mapper.
     InstallingDiskView,
+    /// Creating a writable private view for network sanitization.
+    PreparingPrivateView,
+    /// Removing the managed guest network file from a private view.
+    SanitizingNetwork,
+    /// Copying a stable disk view when nested snapshots are unavailable.
+    CopyingPrivateDisk,
     /// Preparing the encrypted archive before payload streaming begins.
     PreparingArchive,
     /// Reading payload bytes and writing them into the encrypted archive.

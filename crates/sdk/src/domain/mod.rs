@@ -3,6 +3,7 @@ pub mod config;
 pub mod lifecycle;
 pub mod microvm;
 pub mod registry;
+pub mod restore;
 pub mod snapshot;
 
 pub use artifact::{
@@ -23,4 +24,11 @@ pub use registry::{
     Kernel, Linkage,
 };
 
-pub use snapshot::{SnapshotCancellation, SnapshotProgress, SnapshotProgressStage, SnapshotResult};
+pub use snapshot::{
+    SnapshotAddressPolicy, SnapshotCancellation, SnapshotProgress, SnapshotProgressStage,
+    SnapshotResult,
+};
+
+pub use restore::{
+    RestoreCancellation, RestoreProgress, RestoreProgressStage, RestoreRequest, RestoreResult,
+};

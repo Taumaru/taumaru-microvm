@@ -251,8 +251,32 @@ impl StoredMicroVm {
 }
 
 /// Portable distribution and kernel boot metadata required to recreate a VM.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub(crate) struct SnapshotStoredMetadata {
+    pub distribution_name: String,
+    pub distribution_version: String,
+    pub root_device: String,
+    pub kernel_args: Vec<String>,
+    pub image_sha256: String,
+    pub guest_architecture: String,
+    pub kernel: Kernel,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct RestoreJournal {
+    pub operation_id: String,
+    pub vm_name: String,
+    pub staging_path: PathBuf,
+    pub volume_path: PathBuf,
+    pub volume_created: bool,
+    pub kernel_path: PathBuf,
+    pub kernel_created: bool,
+    pub network: Option<PersistedNetwork>,
+    pub progress_state: String,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct RestoredSnapshotMetadata {
     pub distribution_name: String,
     pub distribution_version: String,
     pub root_device: String,
@@ -261,11 +285,31 @@ pub(crate) struct SnapshotStoredMetadata {
     pub guest_architecture: String,
 }
 
+pub(crate) struct RestoredMicroVmCommit<'a> {
+    pub record: &'a MicroVmRecord,
+    pub network: &'a PersistedNetwork,
+    pub credential: &'a PersistedCredential,
+    pub runtime: &'a PersistedRuntime,
+    pub kernel: &'a Kernel,
+    pub kernel_spec: &'a DownloadSpec,
+    pub kernel_integrity: &'a FileIntegrity,
+    pub snapshot_metadata: &'a RestoredSnapshotMetadata,
+    pub operation_id: &'a str,
+}
+
 /// Local inventory and lifecycle persistence for MicroVM records.
 pub(crate) trait MicroVmRepository: Send + Sync {
     fn find_microvm(&self, name: &str) -> Result<Option<StoredMicroVm>, SdkError>;
 
     fn snapshot_metadata(&self, name: &str) -> Result<SnapshotStoredMetadata, SdkError>;
+
+    fn record_restore_journal(&self, journal: &RestoreJournal) -> Result<(), SdkError>;
+
+    fn list_restore_journals(&self, vm_name: &str) -> Result<Vec<RestoreJournal>, SdkError>;
+
+    fn delete_restore_journal(&self, operation_id: &str) -> Result<(), SdkError>;
+
+    fn commit_restored_microvm(&self, commit: RestoredMicroVmCommit<'_>) -> Result<i64, SdkError>;
 
     fn list_stored_microvms(&self) -> Result<Vec<StoredMicroVm>, SdkError>;
 

@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use taumaru_microvm::{MicroVmSdk, SdkError, SnapshotCancellation};
+use taumaru_microvm::{MicroVmSdk, SdkError, SnapshotAddressPolicy, SnapshotCancellation};
 
 #[tokio::test]
 async fn missing_vm_returns_a_typed_error_without_publishing_output() {
@@ -9,7 +9,12 @@ async fn missing_vm_returns_a_typed_error_without_publishing_output() {
     let output = home.path().join("missing.tmvmsnap");
 
     let error = sdk
-        .create_snapshot("missing_vm", &output, "passphrase")
+        .create_snapshot(
+            "missing_vm",
+            &output,
+            "passphrase",
+            SnapshotAddressPolicy::PreserveIpv4,
+        )
         .await
         .expect_err("unknown VM should be rejected");
 

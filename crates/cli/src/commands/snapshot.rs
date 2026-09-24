@@ -1,10 +1,12 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
 
-use inquire::{Password, PasswordDisplayMode, Select, Text};
-use taumaru_microvm::{MicroVmSummary, SdkError, SnapshotCancellation, SnapshotResult};
+use inquire::{Confirm, Password, PasswordDisplayMode, Select, Text};
+use taumaru_microvm::{
+    MicroVmSummary, SdkError, SnapshotAddressPolicy, SnapshotCancellation, SnapshotResult,
+};
 
-use crate::cli::SnapshotArgs;
+use crate::cli::{SnapshotAddressPolicyArg, SnapshotArgs};
 use crate::context::{CliContext, TerminalCapabilities};
 use crate::error::CliError;
 use crate::output::human::SnapshotProgressRenderer;
@@ -25,6 +27,7 @@ pub(crate) fn escalated_child_command(
     name: Option<&str>,
     output_path: Option<&std::path::Path>,
     password: Option<&str>,
+    address_policy: Option<SnapshotAddressPolicyArg>,
 ) -> Vec<OsString> {
     let mut command = vec![OsString::from("snapshot")];
     if let Some(name) = name {
@@ -36,6 +39,13 @@ pub(crate) fn escalated_child_command(
     if let Some(password) = password {
         command.push(OsString::from("--password"));
         command.push(OsString::from(password));
+    }
+    if let Some(policy) = address_policy {
+        command.push(OsString::from("--address-policy"));
+        command.push(OsString::from(match policy {
+            SnapshotAddressPolicyArg::Preserve => "preserve",
+            SnapshotAddressPolicyArg::Regenerate => "regenerate",
+        }));
     }
     command
 }
@@ -120,6 +130,37 @@ fn prompt_output_directory(
     Ok(canonical_directory.join(format!("{vm_name}.tmvmsnap")))
 }
 
+fn prompt_address_policy(
+    terminal: TerminalCapabilities,
+) -> Result<SnapshotAddressPolicyArg, CliError> {
+    Confirm::new("Include the source IPv4 assignments in this snapshot?")
+        .with_default(false)
+        .with_help_message(snapshot_policy_help())
+        .with_render_config(super::download::prompt_render_config(terminal.color))
+        .prompt()
+        .map(snapshot_address_policy)
+        .map_err(|error| prompt_error(error, "Snapshot IPv4 policy prompt"))
+}
+
+fn snapshot_policy_help() -> &'static str {
+    "Yes preserves the source IPv4 addresses and can conflict on restore if they are occupied. No allocates IPv4 addresses on the restore host."
+}
+
+fn snapshot_address_policy(include_source_addresses: bool) -> SnapshotAddressPolicyArg {
+    if include_source_addresses {
+        SnapshotAddressPolicyArg::Preserve
+    } else {
+        SnapshotAddressPolicyArg::Regenerate
+    }
+}
+
+fn sdk_address_policy(policy: SnapshotAddressPolicyArg) -> SnapshotAddressPolicy {
+    match policy {
+        SnapshotAddressPolicyArg::Preserve => SnapshotAddressPolicy::PreserveIpv4,
+        SnapshotAddressPolicyArg::Regenerate => SnapshotAddressPolicy::RegenerateIpv4,
+    }
+}
+
 fn prompt_password(terminal: TerminalCapabilities) -> Result<String, CliError> {
     Password::new("Snapshot password")
         .with_display_mode(PasswordDisplayMode::Masked)
@@ -160,8 +201,9 @@ async fn require_privileged(
     name: Option<&str>,
     output_path: Option<&std::path::Path>,
     password: Option<&str>,
+    address_policy: Option<SnapshotAddressPolicyArg>,
 ) -> Result<Option<u8>, CliError> {
-    let command = escalated_child_command(name, output_path, password);
+    let command = escalated_child_command(name, output_path, password, address_policy);
     crate::privilege::require_privileged(
         &crate::privilege::SystemPrivilege,
         context.terminal,
@@ -179,6 +221,7 @@ async fn run_sdk_snapshot(
     name: &str,
     output_path: &std::path::Path,
     password: &str,
+    address_policy: SnapshotAddressPolicy,
 ) -> Result<SnapshotResult, CliError> {
     let cancellation = SnapshotCancellation::new();
     let progress = SnapshotProgressRenderer::new(name, context.terminal);
@@ -187,6 +230,7 @@ async fn run_sdk_snapshot(
         name,
         output_path,
         password,
+        address_policy,
         cancellation.clone(),
         move |event| callback_progress.on_progress(event),
     );
@@ -216,8 +260,14 @@ pub(crate) async fn run(context: &CliContext, arguments: SnapshotArgs) -> Result
     }
 
     if name.is_none() {
-        if let Some(exit) =
-            require_privileged(context, None, None, arguments.password.as_deref()).await?
+        if let Some(exit) = require_privileged(
+            context,
+            None,
+            None,
+            arguments.password.as_deref(),
+            arguments.address_policy,
+        )
+        .await?
         {
             return Ok(exit);
         }
@@ -248,12 +298,24 @@ pub(crate) async fn run(context: &CliContext, arguments: SnapshotArgs) -> Result
             "Run `microvm snapshot <NAME> --password <PASSWORD>`",
         ));
     }
+    let address_policy = match arguments.address_policy {
+        Some(policy) => policy,
+        None if context.terminal.interactive => prompt_address_policy(context.terminal)?,
+        None => {
+            return Err(CliError::missing_value(
+                "snapshot IPv4 policy",
+                "--address-policy <preserve|regenerate>",
+                "Run `microvm snapshot <NAME> --address-policy regenerate --password <PASSWORD>`",
+            ));
+        }
+    };
 
     if let Some(exit) = require_privileged(
         context,
         Some(&name),
         arguments.output_path.as_deref(),
         arguments.password.as_deref(),
+        Some(address_policy),
     )
     .await?
     {
@@ -279,7 +341,14 @@ pub(crate) async fn run(context: &CliContext, arguments: SnapshotArgs) -> Result
     };
 
     eprintln!("·  Creating encrypted snapshot for {name}");
-    let result = run_sdk_snapshot(context, &name, &output_path, &password).await?;
+    let result = run_sdk_snapshot(
+        context,
+        &name,
+        &output_path,
+        &password,
+        sdk_address_policy(address_policy),
+    )
+    .await?;
     println!("{}", snapshot_success_message(&result));
     Ok(0)
 }
@@ -290,7 +359,8 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        escalated_child_command, map_snapshot_error, snapshot_success_message, validate_name,
+        SnapshotAddressPolicyArg, escalated_child_command, map_snapshot_error,
+        snapshot_address_policy, snapshot_policy_help, snapshot_success_message, validate_name,
     };
     use std::path::PathBuf;
     use taumaru_microvm::{SdkError, SnapshotResult};
@@ -301,6 +371,7 @@ mod tests {
             Some("web-01"),
             Some(Path::new("/tmp/export.tmvmsnap")),
             Some("private"),
+            Some(SnapshotAddressPolicyArg::Preserve),
         );
         assert_eq!(
             command,
@@ -310,13 +381,15 @@ mod tests {
                 OsString::from("/tmp/export.tmvmsnap"),
                 OsString::from("--password"),
                 OsString::from("private"),
+                OsString::from("--address-policy"),
+                OsString::from("preserve"),
             ]
         );
     }
 
     #[test]
     fn forwards_password_when_elevating_an_interactive_selection() {
-        let command = escalated_child_command(None, None, Some("private"));
+        let command = escalated_child_command(None, None, Some("private"), None);
         assert_eq!(
             command,
             [
@@ -353,6 +426,21 @@ mod tests {
         assert!(message.contains("will not be overwritten"));
         assert!(message.contains("/tmp/existing.tmvmsnap"));
         assert!(!message.contains("private-passphrase"));
+    }
+
+    #[test]
+    fn address_policy_prompt_warns_about_restore_conflicts_and_maps_both_answers() {
+        let help = snapshot_policy_help();
+        assert!(help.contains("can conflict on restore"));
+        assert!(help.contains("allocates IPv4 addresses on the restore host"));
+        assert_eq!(
+            snapshot_address_policy(true),
+            SnapshotAddressPolicyArg::Preserve
+        );
+        assert_eq!(
+            snapshot_address_policy(false),
+            SnapshotAddressPolicyArg::Regenerate
+        );
     }
 
     #[test]

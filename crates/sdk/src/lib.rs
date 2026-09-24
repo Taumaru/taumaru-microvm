@@ -15,7 +15,8 @@ pub use domain::{
     DownloadDisposition, DownloadPhase, DownloadProgress, DownloadedBinary, DownloadedDistribution,
     DownloadedDistributionImage, DownloadedFile, DownloadedKernel, ElfMetadata, Endianness,
     FilesystemMetadata, InstalledBinary, Kernel, Linkage, PruneFailure, PrunePreview, PruneSummary,
-    PrunedImageId, SnapshotCancellation, SnapshotProgress, SnapshotProgressStage, SnapshotResult,
+    PrunedImageId, SnapshotAddressPolicy, SnapshotCancellation, SnapshotProgress,
+    SnapshotProgressStage, SnapshotResult,
 };
 pub use domain::{
     CreateMicroVmRequest, CreationEventPhase, CreationOutcome, CreationProgress, CreationStage,
@@ -25,3 +26,7 @@ pub use domain::{
 };
 pub use error::SdkError;
 pub use manager::MicroVmSdk;
+
+pub use domain::{
+    RestoreCancellation, RestoreProgress, RestoreProgressStage, RestoreRequest, RestoreResult,
+};

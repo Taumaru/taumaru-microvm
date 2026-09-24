@@ -3,6 +3,7 @@ pub(crate) mod download;
 pub(crate) mod ls;
 pub(crate) mod new;
 pub(crate) mod prune;
+pub(crate) mod restore;
 pub(crate) mod snapshot;
 pub(crate) mod ssh;
 pub(crate) mod start;
@@ -27,6 +28,7 @@ pub(crate) async fn run(cli: Cli) -> Result<u8, crate::error::CliError> {
         crate::cli::Command::Ssh(arguments) => ssh::run(&context, arguments).await,
         crate::cli::Command::Stop(arguments) => stop::run(&context, arguments).await,
         crate::cli::Command::Snapshot(arguments) => snapshot::run(&context, arguments).await,
+        crate::cli::Command::Restore(arguments) => restore::run(&context, arguments).await,
         crate::cli::Command::Delete(arguments) => delete::run(&context, arguments).await,
         crate::cli::Command::Ls(arguments) => ls::run(&context, arguments).await,
     }

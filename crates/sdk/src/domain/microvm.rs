@@ -45,7 +45,7 @@ pub struct SshConnectionInfo {
 }
 
 /// Persisted network configuration exposed by creation and reconciliation.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct NetworkConfiguration {
     /// Selected network mode.
     pub mode: NetworkMode,
@@ -66,7 +66,8 @@ pub struct NetworkConfiguration {
 }
 
 /// A resource considered by network reconciliation.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum NetworkResource {
     /// VM-specific TAP interface.
     Tap,
@@ -428,7 +429,7 @@ pub(crate) struct MicroVmRecord {
 }
 
 /// Internal persisted network attachment including identity and ownership details.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
 pub(crate) struct PersistedNetwork {
     pub config: NetworkConfiguration,
     pub host_address: Option<IpAddr>,
@@ -460,7 +461,7 @@ pub(crate) struct PersistedNetwork {
 }
 
 /// Internal resource fingerprint used to reconcile and clean up network state safely.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
 pub(crate) struct PersistedNetworkResource {
     pub resource: NetworkResource,
     pub identity: String,

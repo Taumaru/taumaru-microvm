@@ -1,5 +1,6 @@
 use std::io::{self, Write};
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -11,7 +12,9 @@ use crate::commands::new::{
 use crate::context::TerminalCapabilities;
 use crate::output::ProgressSink;
 use indicatif::{ProgressBar, ProgressStyle};
-use taumaru_microvm::{DownloadPhase, SnapshotProgress, SnapshotProgressStage};
+use taumaru_microvm::{
+    DownloadPhase, RestoreProgress, RestoreProgressStage, SnapshotProgress, SnapshotProgressStage,
+};
 
 const ANSI_BOLD: &str = "\u{1b}[1m";
 const ANSI_DIM: &str = "\u{1b}[2m";
@@ -273,7 +276,9 @@ impl SnapshotProgressRenderer {
     pub(crate) fn on_progress(&self, progress: SnapshotProgress) {
         let has_byte_progress = matches!(
             progress.stage,
-            SnapshotProgressStage::AllocatingCowStore | SnapshotProgressStage::StreamingPayloads
+            SnapshotProgressStage::AllocatingCowStore
+                | SnapshotProgressStage::CopyingPrivateDisk
+                | SnapshotProgressStage::StreamingPayloads
         );
         if self.determinate.swap(has_byte_progress, Ordering::AcqRel) != has_byte_progress {
             self.bar
@@ -288,6 +293,9 @@ impl SnapshotProgressRenderer {
             SnapshotProgressStage::PreparingDiskView => "Preparing point-in-time disk view",
             SnapshotProgressStage::AllocatingCowStore => "Allocating snapshot COW store",
             SnapshotProgressStage::InstallingDiskView => "Installing snapshot block view",
+            SnapshotProgressStage::PreparingPrivateView => "Preparing private snapshot view",
+            SnapshotProgressStage::SanitizingNetwork => "Removing source network settings",
+            SnapshotProgressStage::CopyingPrivateDisk => "Copying private snapshot disk",
             SnapshotProgressStage::PreparingArchive => "Preparing encrypted archive",
             SnapshotProgressStage::StreamingPayloads => "Copying and encrypting snapshot",
             SnapshotProgressStage::FinalizingArchive => "Finalizing encrypted snapshot",
@@ -302,10 +310,117 @@ impl SnapshotProgressRenderer {
     }
 }
 
+#[derive(Clone)]
+pub(crate) struct RestoreProgressRenderer {
+    bar: ProgressBar,
+    interactive: bool,
+    color: bool,
+    last_non_interactive_update: Arc<Mutex<Option<(RestoreProgressStage, Option<u8>)>>>,
+}
+
+impl RestoreProgressRenderer {
+    pub(crate) fn new(capabilities: TerminalCapabilities) -> Self {
+        let bar = if capabilities.interactive {
+            ProgressBar::new_spinner()
+        } else {
+            ProgressBar::hidden()
+        };
+        bar.set_style(snapshot_progress_style(capabilities.color, false));
+        bar.set_message("Preparing snapshot restore");
+        if capabilities.interactive {
+            bar.enable_steady_tick(Duration::from_millis(90));
+        } else {
+            eprintln!("·  Preparing snapshot restore");
+        }
+        Self {
+            bar,
+            interactive: capabilities.interactive,
+            color: capabilities.color,
+            last_non_interactive_update: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    pub(crate) fn on_progress(&self, progress: RestoreProgress) {
+        let determinate = progress.total_bytes > 0;
+        self.bar
+            .set_style(snapshot_progress_style(self.color, determinate));
+        let position = progress.completed_bytes.min(progress.total_bytes);
+        let percent = determinate
+            .then(|| ((u128::from(position) * 100) / u128::from(progress.total_bytes)) as u8);
+        if determinate {
+            self.bar.set_length(progress.total_bytes);
+            self.bar.set_position(position);
+        }
+        let message = match progress.stage {
+            RestoreProgressStage::ValidatingInput => "Validating encrypted snapshot",
+            RestoreProgressStage::Staging => "Decrypting and staging snapshot",
+            RestoreProgressStage::Verifying => "Verifying snapshot and restored disk integrity",
+            RestoreProgressStage::PreparingDestination => "Preparing destination VM",
+            RestoreProgressStage::Installing => "Installing disk, kernel, and keys",
+            RestoreProgressStage::Committing => "Registering stopped MicroVM",
+            RestoreProgressStage::Completed => "Snapshot restore complete",
+        };
+        self.bar.set_message(message);
+        if !self.interactive && self.should_report_non_interactive(progress.stage, percent) {
+            if let Some(percent) = percent {
+                eprintln!("·  {percent}% {message}");
+            } else {
+                eprintln!("·  {message}");
+            }
+        }
+    }
+
+    fn should_report_non_interactive(
+        &self,
+        stage: RestoreProgressStage,
+        percent: Option<u8>,
+    ) -> bool {
+        let bucket = percent.map(|percent| (percent / 10) * 10);
+        let Ok(mut last_update) = self.last_non_interactive_update.lock() else {
+            return false;
+        };
+        let current = (stage, bucket);
+        if *last_update == Some(current) {
+            return false;
+        }
+        *last_update = Some(current);
+        true
+    }
+
+    pub(crate) fn finish(self) {
+        if self.interactive {
+            self.bar.finish_and_clear();
+        }
+    }
+}
+
+pub(crate) fn write_restore_result(
+    result: &taumaru_microvm::RestoreResult,
+    capabilities: TerminalCapabilities,
+) -> Result<(), io::Error> {
+    let mut stdout = io::stdout().lock();
+    write!(
+        stdout,
+        "{}",
+        format_microvm_result(
+            &result.vm_name,
+            "restored",
+            result.network.mode == taumaru_microvm::NetworkMode::Lan,
+            &result.network,
+            result.disk_size_bytes,
+            result.memory_bytes,
+            result.vcpu_count,
+            &result.volume_path,
+            &result.ssh,
+            capabilities,
+        )
+    )
+}
+
 fn snapshot_progress_style(color: bool, determinate: bool) -> ProgressStyle {
     let template = match (color, determinate) {
-        (true, true) => "{spinner:.dim} {bar:28} {bytes}/{total_bytes} {msg}",
-        (false, true) => "{spinner} {bar:28} {bytes}/{total_bytes} {msg}",
+        (true, true) => "{spinner:.dim} {bar:28} {percent}% {bytes}/{total_bytes} {msg}",
+        (false, true) => "{spinner} {bar:28} {percent}% {bytes}/{total_bytes} {msg}",
         (true, false) => "{spinner:.dim} {msg}",
         (false, false) => "{spinner} {msg}",
     };
@@ -940,35 +1055,41 @@ pub(crate) fn format_creation_progress_line(
     }
 }
 
-pub(crate) fn format_new_result(
-    result: &taumaru_microvm::MicroVmCreationResult,
-    request: &NewVmRequest,
-    interrupted: bool,
+fn format_microvm_result(
+    name: &str,
+    action: &str,
+    expose_on_lan: bool,
+    network: &taumaru_microvm::NetworkConfiguration,
+    disk_size_bytes: u64,
+    memory_bytes: u64,
+    vcpu_count: u32,
+    volume_path: &std::path::Path,
+    ssh: &taumaru_microvm::SshConnectionInfo,
     capabilities: TerminalCapabilities,
 ) -> String {
-    let network = if request.expose_on_lan {
-        format!("LAN exposed {}", result.network.guest_address)
+    let network_summary = if expose_on_lan {
+        format!("LAN exposed {}", network.guest_address)
     } else {
-        format!("host-only {}", result.network.guest_address)
+        format!("host-only {}", network.guest_address)
     };
     let capacity = format!(
         "{} · {} · {} vCPUs",
-        format_gb(result.disk_size_bytes),
-        format_mb_gb(result.memory_bytes),
-        result.vcpu_count
+        format_gb(disk_size_bytes),
+        format_mb_gb(memory_bytes),
+        vcpu_count
     );
-    let ssh = format!(
+    let ssh_summary = format!(
         "{}:{} · key {}",
-        result.ssh.user,
-        result.ssh.port,
-        result.ssh.private_key_path.display()
+        ssh.user,
+        ssh.port,
+        ssh.private_key_path.display()
     );
     let title = paint(
-        format!("MicroVM {} created", result.name),
+        format!("MicroVM {name} {action}"),
         ANSI_BOLD,
         capabilities.color,
     );
-    let check = paint("\u{2713}", ANSI_GREEN, capabilities.color);
+    let check = paint("✓", ANSI_GREEN, capabilities.color);
     let rule = divider(capabilities);
     let network_label = paint("Network:", ANSI_DIM, capabilities.color);
     let resources_label = paint("Resources:", ANSI_DIM, capabilities.color);
@@ -976,18 +1097,35 @@ pub(crate) fn format_new_result(
     let ssh_label = paint("SSH:", ANSI_DIM, capabilities.color);
     let mut output = String::from("\n");
     output.push_str(&format!("{check} {title}\n{rule}\n\n"));
-    output.push_str(&format!("  {network_label} {network}\n"));
+    output.push_str(&format!("  {network_label} {network_summary}\n"));
     output.push_str(&format!("  {resources_label} {capacity}\n"));
+    output.push_str(&format!("  {volume_label} {}\n", volume_path.display()));
+    output.push_str(&format!("  {ssh_label} {ssh_summary}\n"));
     output.push_str(&format!(
-        "  {volume_label} {}\n",
-        result.volume_path.display()
-    ));
-    output.push_str(&format!("  {ssh_label} {ssh}\n"));
-    output.push_str(&format!(
-        "  {} microvm start {}\n",
+        "  {} microvm start {name}\n",
         paint("Start:", ANSI_DIM, capabilities.color),
-        result.name
     ));
+    output
+}
+
+pub(crate) fn format_new_result(
+    result: &taumaru_microvm::MicroVmCreationResult,
+    request: &NewVmRequest,
+    interrupted: bool,
+    capabilities: TerminalCapabilities,
+) -> String {
+    let mut output = format_microvm_result(
+        &result.name,
+        "created",
+        request.expose_on_lan,
+        &result.network,
+        result.disk_size_bytes,
+        result.memory_bytes,
+        result.vcpu_count,
+        &result.volume_path,
+        &result.ssh,
+        capabilities,
+    );
     if interrupted {
         output.push_str(&format!(
             "\n  {}\n",

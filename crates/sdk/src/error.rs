@@ -218,6 +218,60 @@ pub enum SdkError {
     #[error("snapshot creation was cancelled")]
     SnapshotCancelled,
 
+    /// A snapshot archive version is newer or older than this SDK supports.
+    #[error("unsupported snapshot archive version {actual}; supported version is {supported}")]
+    UnsupportedSnapshotVersion { actual: u32, supported: u32 },
+
+    /// The snapshot declares an address policy this SDK does not support.
+    #[error("unsupported snapshot address policy {policy}")]
+    UnsupportedSnapshotPolicy { policy: String },
+
+    /// The authenticated snapshot manifest is malformed or internally inconsistent.
+    #[error("invalid snapshot manifest: {reason}")]
+    InvalidSnapshotManifest { reason: String },
+
+    /// An exact archived network value cannot be reproduced without a conflict.
+    #[error("restore network conflict for {field}={value}")]
+    SnapshotNetworkConflict { field: String, value: String },
+
+    /// A fixed guest-network-file transformation failed on the private snapshot view.
+    #[error("snapshot sanitization failed for {path}: {reason}")]
+    SnapshotSanitization { path: PathBuf, reason: String },
+
+    /// The host lacks a verified capability required for a safe snapshot view.
+    #[error("snapshot capability {capability} is unavailable: {reason}")]
+    SnapshotCapability { capability: String, reason: String },
+
+    /// The copy-on-write store filled before snapshot archival completed.
+    #[error("snapshot copy-on-write store overflowed for VM {vm_name}")]
+    SnapshotCowOverflow { vm_name: String },
+
+    /// A destination VM identity or managed path is already occupied.
+    #[error("restore conflict for VM {name} at {resource}: {value}")]
+    RestoreConflict {
+        name: String,
+        resource: String,
+        value: String,
+    },
+
+    /// A snapshot could not be decrypted, parsed, or verified.
+    #[error("snapshot restore {operation} failed: {reason}")]
+    RestoreArchive {
+        operation: &'static str,
+        reason: String,
+    },
+
+    /// A prior interrupted restore could not be reconciled safely.
+    #[error("restore recovery for operation {operation_id} failed: {reason}")]
+    RestoreRecovery {
+        operation_id: String,
+        reason: String,
+    },
+
+    /// Restore was cooperatively cancelled.
+    #[error("snapshot restore was cancelled")]
+    RestoreCancelled,
+
     /// A registry artifact is valid JSON but cannot be used by the requested operation.
     #[error("artifact {artifact} is incompatible: {reason}")]
     IncompatibleArtifact { artifact: String, reason: String },

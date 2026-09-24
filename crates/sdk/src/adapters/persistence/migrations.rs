@@ -33,6 +33,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "0004_drop_microvm_state.sql",
         sql: include_str!("../../../migrations/0004_drop_microvm_state.sql"),
     },
+    Migration {
+        version: 5,
+        name: "0005_snapshot_restore.sql",
+        sql: include_str!("../../../migrations/0005_snapshot_restore.sql"),
+    },
 ];
 
 pub(crate) fn apply_pending(connection: &mut Connection) -> Result<(), SdkError> {
@@ -139,6 +144,33 @@ fn verify_required_schema(connection: &Connection) -> Result<(), SdkError> {
             ],
         ),
         ("kernels", &["id", "registry_id", "download_id"]),
+        (
+            "vm_snapshot_metadata",
+            &[
+                "microvm_id",
+                "distribution_name",
+                "distribution_version",
+                "root_device",
+                "kernel_args_json",
+                "image_sha256",
+                "guest_architecture",
+            ],
+        ),
+        (
+            "restore_journal",
+            &[
+                "operation_id",
+                "vm_name",
+                "staging_path",
+                "volume_path",
+                "volume_created",
+                "kernel_path",
+                "kernel_created",
+                "network_json",
+                "progress_state",
+                "updated_at",
+            ],
+        ),
         ("binary_packages", &["id", "registry_id"]),
         (
             "binary_files",

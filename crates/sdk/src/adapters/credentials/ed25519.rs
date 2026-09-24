@@ -138,6 +138,138 @@ fn encode_private_key(
     Ok(pem.into_bytes())
 }
 
+pub(crate) fn validate_ed25519_key_pair(
+    private_key: &[u8],
+    public_key: &[u8],
+    expected_fingerprint: &str,
+) -> Result<(), SdkError> {
+    let invalid = || SdkError::RestoreArchive {
+        operation: "verify SSH credentials",
+        reason: "the archived Ed25519 key pair or fingerprint is inconsistent".to_owned(),
+    };
+    let public_text = std::str::from_utf8(public_key).map_err(|_| invalid())?;
+    let public_fields = public_text
+        .trim()
+        .split_ascii_whitespace()
+        .collect::<Vec<_>>();
+    if !(2..=3).contains(&public_fields.len()) || public_fields[0] != "ssh-ed25519" {
+        return Err(invalid());
+    }
+    let public_blob = base64::engine::general_purpose::STANDARD
+        .decode(public_fields[1])
+        .map_err(|_| invalid())?;
+    let mut public_cursor = 0;
+    if read_ssh_string(&public_blob, &mut public_cursor).ok() != Some(b"ssh-ed25519".as_slice()) {
+        return Err(invalid());
+    }
+    let public_bytes = read_ssh_string(&public_blob, &mut public_cursor).map_err(|_| invalid())?;
+    if public_bytes.len() != 32 || public_cursor != public_blob.len() {
+        return Err(invalid());
+    }
+
+    let private_text = std::str::from_utf8(private_key).map_err(|_| invalid())?;
+    let mut encoded = String::new();
+    let mut in_body = false;
+    for line in private_text.lines() {
+        if line == "-----BEGIN OPENSSH PRIVATE KEY-----" {
+            if in_body {
+                return Err(invalid());
+            }
+            in_body = true;
+        } else if line == "-----END OPENSSH PRIVATE KEY-----" {
+            if !in_body {
+                return Err(invalid());
+            }
+            in_body = false;
+            break;
+        } else if in_body {
+            encoded.push_str(line);
+        } else if !line.trim().is_empty() {
+            return Err(invalid());
+        }
+    }
+    if in_body || encoded.is_empty() {
+        return Err(invalid());
+    }
+    let private_blob = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|_| invalid())?;
+    const MAGIC: &[u8] = b"openssh-key-v1\0";
+    if !private_blob.starts_with(MAGIC) {
+        return Err(invalid());
+    }
+    let mut cursor = MAGIC.len();
+    if read_ssh_string(&private_blob, &mut cursor).map_err(|_| invalid())? != b"none"
+        || read_ssh_string(&private_blob, &mut cursor).map_err(|_| invalid())? != b"none"
+        || !read_ssh_string(&private_blob, &mut cursor)
+            .map_err(|_| invalid())?
+            .is_empty()
+        || read_u32(&private_blob, &mut cursor).map_err(|_| invalid())? != 1
+    {
+        return Err(invalid());
+    }
+    let embedded_public_blob =
+        read_ssh_string(&private_blob, &mut cursor).map_err(|_| invalid())?;
+    if embedded_public_blob != public_blob {
+        return Err(invalid());
+    }
+    let private_block = read_ssh_string(&private_blob, &mut cursor).map_err(|_| invalid())?;
+    if cursor != private_blob.len() {
+        return Err(invalid());
+    }
+    let mut cursor = 0;
+    let first_check = read_u32(private_block, &mut cursor).map_err(|_| invalid())?;
+    if first_check != read_u32(private_block, &mut cursor).map_err(|_| invalid())?
+        || read_ssh_string(private_block, &mut cursor).map_err(|_| invalid())? != b"ssh-ed25519"
+    {
+        return Err(invalid());
+    }
+    let inner_public = read_ssh_string(private_block, &mut cursor).map_err(|_| invalid())?;
+    let private_and_public = read_ssh_string(private_block, &mut cursor).map_err(|_| invalid())?;
+    if inner_public != public_bytes
+        || private_and_public.len() != 64
+        || &private_and_public[32..] != public_bytes
+    {
+        return Err(invalid());
+    }
+    let comment = read_ssh_string(private_block, &mut cursor).map_err(|_| invalid())?;
+    if comment.contains(&0) || cursor >= private_block.len() {
+        return Err(invalid());
+    }
+    let padding = &private_block[cursor..];
+    if padding.is_empty()
+        || padding
+            .iter()
+            .enumerate()
+            .any(|(index, byte)| *byte != (index + 1) as u8)
+    {
+        return Err(invalid());
+    }
+    let key_pair =
+        Ed25519KeyPair::from_seed_unchecked(&private_and_public[..32]).map_err(|_| invalid())?;
+    if key_pair.public_key().as_ref() != public_bytes
+        || public_key_fingerprint(&public_blob) != expected_fingerprint
+    {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
+fn read_u32(bytes: &[u8], cursor: &mut usize) -> Result<u32, ()> {
+    let end = cursor.checked_add(4).ok_or(())?;
+    let value = bytes.get(*cursor..end).ok_or(())?;
+    *cursor = end;
+    Ok(u32::from_be_bytes(value.try_into().map_err(|_| ())?))
+}
+
+fn read_ssh_string<'a>(bytes: &'a [u8], cursor: &mut usize) -> Result<&'a [u8], ()> {
+    let length = usize::try_from(read_u32(bytes, cursor)?).map_err(|_| ())?;
+    let end = cursor.checked_add(length).ok_or(())?;
+    let value = bytes.get(*cursor..end).ok_or(())?;
+    *cursor = end;
+    Ok(value)
+}
+
 fn public_key_fingerprint(public_blob: &[u8]) -> String {
     let digest = Sha256::digest(public_blob);
     format!(

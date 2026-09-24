@@ -5,15 +5,18 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use age::secrecy::SecretString;
-use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
-use crate::domain::snapshot::{SnapshotProgress, SnapshotProgressStage};
+use crate::domain::registry::{Architecture, Kernel};
+use crate::domain::snapshot::{SnapshotAddressPolicy, SnapshotProgress, SnapshotProgressStage};
 use crate::error::SdkError;
 
-const FORMAT_ID: &str = "taumaru.microvm.snapshot";
-const FORMAT_VERSION: u32 = 1;
+use super::manifest::{
+    BootManifest, CompatibilityManifest, ConsistencyManifest, FORMAT_ID, FORMAT_VERSION,
+    KernelManifest, NetworkManifest, PayloadRecord, ROOTFS_MEMBER, SnapshotManifest, SshManifest,
+    VmManifest,
+};
 const COPY_BUFFER_SIZE: usize = 128 * 1024;
 const STATUS_CHECK_INTERVAL: u64 = 64 * 1024 * 1024;
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -35,15 +38,20 @@ pub(crate) struct SnapshotPortableMetadata {
     pub distribution_version: String,
     pub image_id: String,
     pub image_sha256: String,
-    pub kernel_id: String,
+    pub kernel: Kernel,
     pub disk_size_bytes: u64,
     pub memory_bytes: u64,
     pub memory_effective_mib: u64,
     pub vcpu_count: u32,
     pub root_device: String,
     pub kernel_args: Vec<String>,
+    pub address_policy: SnapshotAddressPolicy,
     pub network_mode: String,
     pub expose_on_lan: bool,
+    pub guest_ipv4: Option<std::net::Ipv4Addr>,
+    pub prefix_length: Option<u8>,
+    pub guest_gateway_ipv4: Option<std::net::Ipv4Addr>,
+    pub lan_ipv4: Option<std::net::Ipv4Addr>,
     pub guest_mac: String,
     pub ssh_user: String,
     pub ssh_port: u16,
@@ -66,80 +74,73 @@ pub(crate) struct SnapshotArchiveResult {
     pub encrypted_size_bytes: u64,
 }
 
-#[derive(Serialize)]
-struct SnapshotManifest<'a> {
-    format: &'static str,
-    format_version: u32,
-    created_at_unix_seconds: u64,
-    vm: VmManifest<'a>,
-    compatibility: CompatibilityManifest<'a>,
-    boot: BootManifest<'a>,
-    network: NetworkManifest<'a>,
-    ssh: SshManifest<'a>,
-    consistency: ConsistencyManifest,
-    payloads: Vec<PayloadRecord>,
-}
-
-#[derive(Serialize)]
-struct VmManifest<'a> {
-    name: &'a str,
-    disk_size_bytes: u64,
-    memory_bytes: u64,
-    memory_effective_mib: u64,
-    vcpu_count: u32,
-}
-
-#[derive(Serialize)]
-struct CompatibilityManifest<'a> {
-    host_os: &'static str,
-    guest_architecture: &'a str,
-    requires_kvm: bool,
-    runtime: &'static str,
-}
-
-#[derive(Serialize)]
-struct BootManifest<'a> {
-    distribution_id: &'a str,
-    distribution_name: &'a str,
-    distribution_version: &'a str,
-    image_id: &'a str,
-    image_sha256: &'a str,
-    kernel_id: &'a str,
-    kernel_member: &'static str,
-    root_device: &'a str,
-    kernel_args: &'a [String],
-}
-
-#[derive(Serialize)]
-struct NetworkManifest<'a> {
-    mode: &'a str,
-    expose_on_lan: bool,
-    guest_mac: &'a str,
-}
-
-#[derive(Serialize)]
-struct SshManifest<'a> {
-    user: &'a str,
-    port: u16,
-    key_type: &'a str,
-    public_key_fingerprint: &'a str,
-    private_key_member: &'static str,
-    public_key_member: &'static str,
-}
-
-#[derive(Serialize)]
-struct ConsistencyManifest {
-    kind: &'static str,
-    includes_guest_memory: bool,
-    includes_process_state: bool,
-}
-
-#[derive(Serialize)]
-struct PayloadRecord {
-    path: String,
-    size_bytes: u64,
-    sha256: String,
-    mode: u32,
+pub(crate) fn publish_staged_archive(
+    staged: SnapshotArchiveResult,
+    requested_output_path: &Path,
+) -> Result<SnapshotArchiveResult, SdkError> {
+    let output_path = normalize_output_path(requested_output_path)?;
+    if path_entry_exists(&output_path)? {
+        let primary = SdkError::SnapshotOutputExists { path: output_path };
+        let cleanup = fs::remove_file(&staged.output_path).err().map(|error| {
+            SdkError::filesystem(
+                "remove unpublished staged snapshot",
+                &staged.output_path,
+                error,
+            )
+        });
+        return Err(with_cleanup(primary, cleanup));
+    }
+    let parent = output_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    if let Err(error) = fs::hard_link(&staged.output_path, &output_path) {
+        let primary = if error.kind() == io::ErrorKind::AlreadyExists {
+            SdkError::SnapshotOutputExists {
+                path: output_path.clone(),
+            }
+        } else {
+            SdkError::filesystem("publish encrypted snapshot", &output_path, error)
+        };
+        let cleanup = fs::remove_file(&staged.output_path).err().map(|source| {
+            SdkError::filesystem(
+                "remove unpublished staged snapshot",
+                &staged.output_path,
+                source,
+            )
+        });
+        return Err(with_cleanup(primary, cleanup));
+    }
+    if let Err(error) = fs::remove_file(&staged.output_path) {
+        let primary = SdkError::filesystem(
+            "remove staged encrypted snapshot",
+            &staged.output_path,
+            error,
+        );
+        let output_cleanup = fs::remove_file(&output_path).err().map(|source| {
+            SdkError::filesystem(
+                "remove unpublished encrypted snapshot",
+                &output_path,
+                source,
+            )
+        });
+        return Err(with_cleanup(primary, output_cleanup));
+    }
+    if let Err(error) = File::open(parent).and_then(|directory| directory.sync_all()) {
+        let primary = SdkError::filesystem("sync snapshot output directory", parent, error);
+        let output_cleanup = fs::remove_file(&output_path).err().map(|source| {
+            SdkError::filesystem(
+                "remove unpublished encrypted snapshot",
+                &output_path,
+                source,
+            )
+        });
+        return Err(with_cleanup(primary, output_cleanup));
+    }
+    Ok(SnapshotArchiveResult {
+        output_path,
+        encrypted_size_bytes: staged.encrypted_size_bytes,
+    })
 }
 
 #[cfg(test)]
@@ -318,7 +319,7 @@ where
         let metadata = fs::symlink_metadata(&payload.source_path).map_err(|error| {
             SdkError::filesystem("inspect snapshot payload", &payload.source_path, error)
         })?;
-        let source_is_block_device = if payload.archive_path == "payload/rootfs.ext4" {
+        let source_is_block_device = if payload.archive_path == ROOTFS_MEMBER {
             if metadata.file_type().is_symlink() {
                 let target_metadata = fs::metadata(&payload.source_path).map_err(|error| {
                     SdkError::filesystem(
@@ -434,54 +435,82 @@ where
             reason: format!("system clock predates the Unix epoch: {error}"),
         })?
         .as_secs();
+    let network = match input.metadata.address_policy {
+        SnapshotAddressPolicy::PreserveIpv4 => NetworkManifest::PreserveIpv4 {
+            guest_ipv4: input.metadata.guest_ipv4.ok_or_else(|| {
+                SdkError::InvalidSnapshotManifest {
+                    reason: "preserve_ipv4 policy requires a guest IPv4 address".to_owned(),
+                }
+            })?,
+            prefix_length: input.metadata.prefix_length.ok_or_else(|| {
+                SdkError::InvalidSnapshotManifest {
+                    reason: "preserve_ipv4 policy requires an IPv4 prefix length".to_owned(),
+                }
+            })?,
+            guest_gateway_ipv4: input.metadata.guest_gateway_ipv4,
+            lan_ipv4: input.metadata.lan_ipv4,
+            mode: input.metadata.network_mode.clone(),
+            expose_on_lan: input.metadata.expose_on_lan,
+            guest_mac: input.metadata.guest_mac.clone(),
+        },
+        SnapshotAddressPolicy::RegenerateIpv4 => NetworkManifest::RegenerateIpv4 {
+            expose_on_lan: input.metadata.expose_on_lan,
+        },
+    };
     let manifest = SnapshotManifest {
-        format: FORMAT_ID,
+        format: FORMAT_ID.to_owned(),
         format_version: FORMAT_VERSION,
         created_at_unix_seconds,
         vm: VmManifest {
-            name: &input.vm_name,
+            name: input.vm_name.clone(),
             disk_size_bytes: input.metadata.disk_size_bytes,
             memory_bytes: input.metadata.memory_bytes,
             memory_effective_mib: input.metadata.memory_effective_mib,
             vcpu_count: input.metadata.vcpu_count,
         },
         compatibility: CompatibilityManifest {
-            host_os: "linux",
-            guest_architecture: &input.metadata.guest_architecture,
+            host_os: "linux".to_owned(),
+            guest_architecture: input.metadata.guest_architecture.clone(),
             requires_kvm: true,
-            runtime: "firecracker",
+            runtime: "firecracker".to_owned(),
         },
         boot: BootManifest {
-            distribution_id: &input.metadata.distribution_id,
-            distribution_name: &input.metadata.distribution_name,
-            distribution_version: &input.metadata.distribution_version,
-            image_id: &input.metadata.image_id,
-            image_sha256: &input.metadata.image_sha256,
-            kernel_id: &input.metadata.kernel_id,
-            kernel_member: "payload/kernel/vmlinux",
-            root_device: &input.metadata.root_device,
-            kernel_args: &input.metadata.kernel_args,
+            distribution_id: input.metadata.distribution_id.clone(),
+            distribution_name: input.metadata.distribution_name.clone(),
+            distribution_version: input.metadata.distribution_version.clone(),
+            image_id: input.metadata.image_id.clone(),
+            image_sha256: input.metadata.image_sha256.clone(),
+            kernel: KernelManifest {
+                id: input.metadata.kernel.id.clone(),
+                name: input.metadata.kernel.name.clone(),
+                display_name: input.metadata.kernel.display_name.clone(),
+                version: input.metadata.kernel.version.clone(),
+                architecture: architecture_name(&input.metadata.kernel.architecture).to_owned(),
+                registry_path: input.metadata.kernel.path.clone(),
+                registry_url: input.metadata.kernel.url.clone(),
+                filename: input.metadata.kernel.filename.clone(),
+                format: input.metadata.kernel.format.clone(),
+                mime_type: input.metadata.kernel.mime_type.clone(),
+                modified_at: input.metadata.kernel.modified_at.clone(),
+            },
+            root_device: input.metadata.root_device.clone(),
+            kernel_args: input.metadata.kernel_args.clone(),
         },
-        network: NetworkManifest {
-            mode: &input.metadata.network_mode,
-            expose_on_lan: input.metadata.expose_on_lan,
-            guest_mac: &input.metadata.guest_mac,
-        },
+        network,
         ssh: SshManifest {
-            user: &input.metadata.ssh_user,
+            user: input.metadata.ssh_user.clone(),
             port: input.metadata.ssh_port,
-            key_type: &input.metadata.ssh_key_type,
-            public_key_fingerprint: &input.metadata.ssh_public_key_fingerprint,
-            private_key_member: "payload/ssh/id_ed25519",
-            public_key_member: "payload/ssh/id_ed25519.pub",
+            key_type: input.metadata.ssh_key_type.clone(),
+            public_key_fingerprint: input.metadata.ssh_public_key_fingerprint.clone(),
         },
         consistency: ConsistencyManifest {
-            kind: "disk_only_crash_consistent",
+            kind: "disk_only_crash_consistent".to_owned(),
             includes_guest_memory: false,
             includes_process_state: false,
         },
         payloads: records,
     };
+    manifest.validate()?;
     let manifest_bytes =
         serde_json::to_vec(&manifest).map_err(|error| SdkError::SnapshotArchive {
             operation: "serialize snapshot manifest",
@@ -507,6 +536,16 @@ where
     age_writer
         .finish()
         .map_err(|error| archive_error("finish age encryption", error))
+}
+
+fn architecture_name(architecture: &Architecture) -> &'static str {
+    match architecture {
+        Architecture::X86_64 => "x86_64",
+        Architecture::Aarch64 => "aarch64",
+        Architecture::Arm => "arm",
+        Architecture::Riscv64 => "riscv64",
+        Architecture::X86 => "x86",
+    }
 }
 
 struct GuardedDigestReader<'a, F, P>
@@ -795,6 +834,11 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::{SnapshotArchiveInput, SnapshotPayload, SnapshotPortableMetadata, create_archive};
+    use crate::adapters::archive::manifest::{
+        KERNEL_MEMBER, PRIVATE_KEY_MEMBER, PUBLIC_KEY_MEMBER, ROOTFS_MEMBER,
+    };
+    use crate::domain::registry::Architecture;
+    use crate::domain::snapshot::SnapshotAddressPolicy;
 
     fn metadata() -> SnapshotPortableMetadata {
         SnapshotPortableMetadata {
@@ -804,15 +848,35 @@ mod tests {
             distribution_version: "1.0".to_owned(),
             image_id: "image-1".to_owned(),
             image_sha256: "a".repeat(64),
-            kernel_id: "kernel-1".to_owned(),
+            kernel: crate::domain::registry::Kernel {
+                id: "kernel-1".to_owned(),
+                name: "kernel".to_owned(),
+                display_name: "Kernel".to_owned(),
+                version: "6.0".to_owned(),
+                architecture: Architecture::X86_64,
+                path: "kernels/kernel/vmlinux".to_owned(),
+                url: "https://example.test/kernel".to_owned(),
+                filename: "vmlinux".to_owned(),
+                size_bytes: 6,
+                sha256: hex_sha256(b"kernel"),
+                format: "elf".to_owned(),
+                mime_type: "application/octet-stream".to_owned(),
+                elf: None,
+                modified_at: "2026-01-01T00:00:00Z".to_owned(),
+            },
             disk_size_bytes: 4,
             memory_bytes: 128 * 1024 * 1024,
             memory_effective_mib: 128,
             vcpu_count: 1,
             root_device: "/dev/vda".to_owned(),
             kernel_args: vec!["console=ttyS0".to_owned()],
+            address_policy: SnapshotAddressPolicy::PreserveIpv4,
             network_mode: "host_only".to_owned(),
             expose_on_lan: false,
+            guest_ipv4: Some("192.0.2.2".parse().expect("valid IPv4")),
+            prefix_length: Some(30),
+            guest_gateway_ipv4: Some("192.0.2.1".parse().expect("valid IPv4")),
+            lan_ipv4: None,
             guest_mac: "02:00:00:00:00:01".to_owned(),
             ssh_user: "root".to_owned(),
             ssh_port: 22,
@@ -821,22 +885,57 @@ mod tests {
         }
     }
 
-    fn create_test_archive(directory: &Path, output_name: &str) -> (PathBuf, PathBuf) {
+    fn create_test_archive(
+        directory: &Path,
+        output_name: &str,
+        policy: SnapshotAddressPolicy,
+    ) -> (PathBuf, PathBuf) {
         let disk = directory.join("rootfs.ext4");
         fs::write(&disk, b"disk").expect("fixture disk should be written");
+        let kernel = directory.join("vmlinux");
+        let private_key = directory.join("id_ed25519");
+        let public_key = directory.join("id_ed25519.pub");
+        fs::write(&kernel, b"kernel").expect("kernel fixture should be written");
+        fs::write(&private_key, b"private").expect("private key fixture should be written");
+        fs::write(&public_key, b"public").expect("public key fixture should be written");
         let output = directory.join(output_name);
+        let mut portable_metadata = metadata();
+        portable_metadata.address_policy = policy;
         let input = SnapshotArchiveInput {
             vm_name: "fixture-vm".to_owned(),
             output_path: output.clone(),
             password: "correct horse battery staple".to_owned(),
-            metadata: metadata(),
-            payloads: vec![SnapshotPayload {
-                archive_path: "payload/rootfs.ext4",
-                source_path: disk.clone(),
-                mode: 0o600,
-                expected_size_bytes: Some(4),
-                expected_sha256: None,
-            }],
+            metadata: portable_metadata,
+            payloads: vec![
+                SnapshotPayload {
+                    archive_path: ROOTFS_MEMBER,
+                    source_path: disk.clone(),
+                    mode: 0o600,
+                    expected_size_bytes: Some(4),
+                    expected_sha256: None,
+                },
+                SnapshotPayload {
+                    archive_path: KERNEL_MEMBER,
+                    source_path: kernel,
+                    mode: 0o644,
+                    expected_size_bytes: Some(6),
+                    expected_sha256: Some(hex_sha256(b"kernel")),
+                },
+                SnapshotPayload {
+                    archive_path: PRIVATE_KEY_MEMBER,
+                    source_path: private_key,
+                    mode: 0o600,
+                    expected_size_bytes: Some(7),
+                    expected_sha256: None,
+                },
+                SnapshotPayload {
+                    archive_path: PUBLIC_KEY_MEMBER,
+                    source_path: public_key,
+                    mode: 0o644,
+                    expected_size_bytes: Some(6),
+                    expected_sha256: None,
+                },
+            ],
         };
         let result = create_archive(input, CancellationToken::new(), || Ok(()))
             .expect("encrypted archive should be created");
@@ -858,7 +957,11 @@ mod tests {
     #[test]
     fn encrypted_tar_places_integrity_manifest_last_and_keeps_temp_private() {
         let directory = tempfile::tempdir().expect("test directory should be created");
-        let (archive_path, _) = create_test_archive(directory.path(), "snapshot.tmvmsnap");
+        let (archive_path, _) = create_test_archive(
+            directory.path(),
+            "snapshot.tmvmsnap",
+            SnapshotAddressPolicy::PreserveIpv4,
+        );
         let plaintext = decrypt(&archive_path, "correct horse battery staple")
             .expect("correct passphrase should decrypt the archive");
         let mut archive = tar::Archive::new(plaintext.as_slice());
@@ -886,7 +989,10 @@ mod tests {
         let manifest: serde_json::Value = serde_json::from_slice(&members.last().unwrap().2)
             .expect("manifest should be valid JSON");
         assert_eq!(manifest["format"], "taumaru.microvm.snapshot");
-        assert_eq!(manifest["format_version"], 1);
+        assert_eq!(manifest["format_version"], 2);
+        assert_eq!(manifest["boot"]["kernel"]["id"], "kernel-1");
+        assert_eq!(manifest["network"]["address_policy"], "preserve_ipv4");
+        assert_eq!(manifest["network"]["guest_ipv4"], "192.0.2.2");
         assert_eq!(manifest["payloads"][0]["path"], "payload/rootfs.ext4");
         assert_eq!(manifest["payloads"][0]["size_bytes"], 4);
         assert_eq!(manifest["payloads"][0]["sha256"], hex_sha256(b"disk"));
@@ -896,16 +1002,67 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             files.len(),
-            2,
-            "only the source fixture and encrypted archive remain"
+            5,
+            "only the four source fixtures and encrypted archive remain"
         );
         assert!(archive_path.exists());
     }
 
     #[test]
+    fn regenerate_manifest_omits_all_source_ipv4_assignments() {
+        let directory = tempfile::tempdir().expect("test directory should be created");
+        let (archive_path, _) = create_test_archive(
+            directory.path(),
+            "regenerate.tmvmsnap",
+            SnapshotAddressPolicy::RegenerateIpv4,
+        );
+        let plaintext = decrypt(&archive_path, "correct horse battery staple")
+            .expect("correct passphrase should decrypt the archive");
+        let mut archive = tar::Archive::new(plaintext.as_slice());
+        let mut bytes = Vec::new();
+        let mut found_manifest = false;
+        for entry in archive.entries().expect("TAR entries should parse") {
+            let mut entry = entry.expect("TAR member should parse");
+            let path = entry
+                .path()
+                .expect("member path should parse")
+                .to_string_lossy()
+                .into_owned();
+            if path == "manifest.json" {
+                entry.read_to_end(&mut bytes).expect("manifest should read");
+                found_manifest = true;
+                break;
+            }
+        }
+        assert!(found_manifest, "manifest should be present in the archive");
+        let manifest: serde_json::Value = serde_json::from_slice(&bytes).expect("manifest JSON");
+        let network = manifest["network"].as_object().expect("network object");
+        assert_eq!(network.len(), 2);
+        assert_eq!(network["address_policy"], "regenerate_ipv4");
+        assert_eq!(network["expose_on_lan"], false);
+        for field in [
+            "guest_ipv4",
+            "prefix_length",
+            "guest_gateway_ipv4",
+            "lan_ipv4",
+            "mode",
+            "guest_mac",
+        ] {
+            assert!(
+                !network.contains_key(field),
+                "regenerate policy must omit {field}"
+            );
+        }
+    }
+
+    #[test]
     fn wrong_password_tampering_and_truncation_are_rejected() {
         let directory = tempfile::tempdir().expect("test directory should be created");
-        let (archive_path, _) = create_test_archive(directory.path(), "snapshot.tmvmsnap");
+        let (archive_path, _) = create_test_archive(
+            directory.path(),
+            "snapshot.tmvmsnap",
+            SnapshotAddressPolicy::PreserveIpv4,
+        );
         assert!(decrypt(&archive_path, "wrong password").is_err());
 
         let original = fs::read(&archive_path).expect("archive should read");

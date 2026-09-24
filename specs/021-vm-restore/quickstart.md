@@ -1,43 +1,56 @@
 # Snapshot and Restore Quickstart
 
-This guide describes the expected workflow after feature 021 is implemented. It is a planning artifact; no implementation or command execution is part of this plan.
+Snapshots contain an encrypted, crash-consistent copy of a MicroVM disk, its embedded kernel, SSH credentials, portable configuration, and a versioned manifest. They do not contain guest RAM or process state. The guest keeps running while its disk is captured; applications that need transaction-level consistency must quiesce themselves before snapshot creation.
 
-## Create an interactive snapshot
+## Create a snapshot interactively
 
 Run:
 
-`microvm snapshot`
+```sh
+microvm snapshot
+```
 
-The snapshot is block-level and crash-consistent; it does not coordinate guest applications or database transactions. Guest software relies on its normal recovery behavior. The CLI asks whether to include source IPv4 settings. Choosing preserve keeps exact guest/LAN values and may conflict with addresses already used on another host. Choosing regenerate stores only LAN exposure, sanitizes the Taumaru-managed network file in the private archive copy, and lets restore allocate destination-local addresses. The SDK does not prompt for the choice.
+The CLI selects a MicroVM, asks where to save the archive, asks whether to preserve its IPv4 assignments, and requests a password twice. The output file is named `<vm-name>.tmvmsnap` in the selected existing folder.
 
-## Restore from an archive
+To choose each value explicitly:
 
-Interactive restore asks for a path and a single hidden password prompt:
+```sh
+microvm snapshot web-01 ./web-01.tmvmsnap \
+  --address-policy regenerate \
+  --password 'use-a-strong-password'
+```
 
-`microvm restore`
+The supported policies are:
 
-Restore an explicit file:
+- `preserve`: records the guest IPv4 address, prefix, applicable gateway and LAN address, network mode, exposure, and MAC. Restore fails if those exact values conflict on the destination.
+- `regenerate`: records only whether the VM is exposed on the LAN. The snapshot's private disk view removes `/etc/systemd/network/10-taumaru.network`; restore allocates destination-local addresses and writes the new network configuration into the restored disk.
 
-`microvm restore /path/to/test.tmvmsnap`
+The interactive policy prompt warns about address conflicts when choosing `preserve`. Non-interactive snapshot creation requires `--address-policy`. The SDK never prompts. Avoid putting passwords in shell history or process arguments; omit `--password` in an interactive terminal to use the masked prompt.
 
-Non-interactive restore:
+## Restore an archive
 
-`microvm restore /path/to/test.tmvmsnap --password 'your-password'`
+Interactive restore asks for the archive path and one masked password prompt (without confirmation):
 
-Success reports the archived VM name and stopped state. The VM is stored under the destination SDK home and can later be started when compatible local runtime artifacts are available.
+```sh
+microvm restore
+```
 
-## Address policy outcomes
+Or provide them explicitly:
 
-- A preserve-policy archive restores the recorded guest IPv4, prefix, gateway, optional LAN IPv4, mode, exposure, and MAC. If any exact value is unavailable or conflicts on the destination, restore fails without publishing the VM.
-- A regenerate-policy archive contains no source address assignments. Restore derives network mode from LAN exposure, allocates local IPv4/network identity, writes the destination settings into the recovered disk, and leaves the VM stopped.
-- Regenerate sanitization removes only the Taumaru-managed network file from a private copy. Arbitrary guest files are neither scanned nor rewritten, and may still contain IP text.
+```sh
+microvm restore ./web-01.tmvmsnap --password 'the-snapshot-password'
+```
 
-## Expected rejection cases
+Restore uses the VM name and settings from the authenticated archive. It rejects an existing VM name or occupied managed paths, verifies archive authentication and payload hashes, and installs files under the destination SDK home. On success, the VM appears in local inventory in the stopped state. Restore does not launch Firecracker.
 
-- Version 1, unknown version, inconsistent policy fields, unsupported IPv6, incorrect password, modified payload, incomplete archive, or invalid manifest publishes no VM.
-- Existing VM name, occupied managed path, exact-address/MAC conflict, incompatible runtime, unavailable network capability, insufficient storage, child CoW overflow, or failed sanitization stops the operation and cleans only owned state.
-- Cancellation or abrupt host shutdown leaves enough journal data for cleanup before a later restore retry; the source archive and source VM disk remain unchanged.
+The destination must be Linux, use a compatible guest architecture, have available local Firecracker and `firectl` binaries, and provide enough disk space and network resources. The embedded kernel is registered locally from the exact archived bytes, so later start resolves the restored kernel without contacting the source host or registry.
 
-## Implementation validation scenarios
+## Consistency and host requirements
 
-Verify both snapshot policy manifests and disk contents; online parent/child CoW isolation from guest writes; stopped-disk source immutability; journal recovery and managed-file sanitization; parent and child overflow checks; archive authentication and payload hashes; preserve and regenerate restore allocation; exact guest config after restore; kernel cache resolution by the existing start path; duplicate-name races; private key mode; network rollback; cancellation cleanup; and durable journal reconciliation after interruption.
+The disk image is captured as a point-in-time block view and is crash-consistent, not application-consistent. The capture does not pause the VM, and guest writes after capture do not change the snapshot view. Snapshot operations require the host privileges and Linux loop/Device Mapper and ext4 tools used by the SDK. When the host cannot provide a nested classic Device Mapper snapshot for the private regenerate view, the SDK uses an exact-size private copy; if neither method is available, snapshot creation fails without publishing an archive. CoW overflow also aborts publication.
+
+## Failure and recovery behavior
+
+Version 1, unknown versions, unsupported IPv6, inconsistent policy fields, incorrect passwords, modified or truncated payloads, incompatible runtimes, occupied names/paths, network conflicts, and insufficient storage fail before the VM is published. Failure and cancellation remove resources recorded as owned by that restore operation and preserve existing VMs and the input archive. An interrupted restore is reconciled from its durable journal before a retry for the archived VM name.
+
+Regenerate sanitization changes only the private snapshot view. It removes only the Taumaru-managed network file and does not scan arbitrary guest files, which may still contain source IP text. The source disk and running VM remain unchanged.

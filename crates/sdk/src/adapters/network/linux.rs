@@ -172,20 +172,18 @@ impl LinuxNetworkController {
     ) -> Result<NetworkOutcome, SdkError> {
         let mut occupied = used_addresses.to_vec();
         occupied.extend(live_ipv4_addresses()?);
-        let (private_network, gateway, guest) =
-            allocate_subnet(&occupied).ok_or_else(|| SdkError::Network {
-                mode: NetworkMode::HostOnly.to_string(),
-                operation: "allocate private /30".to_owned(),
-                resource: "172.30.0.0/16".to_owned(),
-                reason: "the private address pool is exhausted or overlaps persisted state"
-                    .to_owned(),
-            })?;
+        let (private_network, gateway, guest) = select_private_subnet(&occupied, request)?;
         let tap_name = tap_name(&request.vm_name);
+        let guest_gateway = if request.exact_network_values {
+            request.gateway_override
+        } else {
+            Some(gateway)
+        };
         let config = NetworkConfiguration {
             mode: NetworkMode::HostOnly,
             guest_address: IpAddr::V4(guest),
-            prefix_length: 30,
-            gateway: Some(IpAddr::V4(gateway)),
+            prefix_length: request.prefix_length_override.unwrap_or(30),
+            gateway: guest_gateway.map(IpAddr::V4),
             tap_name: tap_name.clone(),
             bridge_name: None,
             uplink_name: None,
@@ -193,9 +191,10 @@ impl LinuxNetworkController {
         };
         // The device field of `ip=` is resolved inside the guest, where the host TAP
         // name is unknown.
-        let desired_boot_parameters = format!(
-            "ip={}::{}:{}::{GUEST_INTERFACE}:off",
-            guest, gateway, "255.255.255.252"
+        let desired_boot_parameters = guest_boot_parameters(
+            guest,
+            guest_gateway,
+            request.prefix_length_override.unwrap_or(30),
         );
         let mut applied = Vec::new();
         let forwarding_was_enabled = forwarding_enabled()?;
@@ -288,14 +287,7 @@ impl LinuxNetworkController {
         let uplink = self.detect_uplink()?;
         let mut occupied = Vec::new();
         occupied.extend(live_ipv4_addresses()?);
-        let (_network_base, gateway, guest) =
-            allocate_subnet(&occupied).ok_or_else(|| SdkError::Network {
-                mode: NetworkMode::Lan.to_string(),
-                operation: "allocate private /30".to_owned(),
-                resource: "172.30.0.0/16".to_owned(),
-                reason: "the private address pool is exhausted or overlaps persisted state"
-                    .to_owned(),
-            })?;
+        let (_network_base, gateway, guest) = select_private_subnet(&occupied, request)?;
         let tap = tap_name(&request.vm_name);
         let offer = self.select_lan_offer(
             &uplink,
@@ -303,19 +295,25 @@ impl LinuxNetworkController {
             None,
             used_lan_addresses,
         )?;
+        let guest_gateway = if request.exact_network_values {
+            request.gateway_override
+        } else {
+            Some(gateway)
+        };
         let config = NetworkConfiguration {
             mode: NetworkMode::Lan,
             guest_address: IpAddr::V4(guest),
-            prefix_length: 30,
-            gateway: Some(IpAddr::V4(gateway)),
+            prefix_length: request.prefix_length_override.unwrap_or(30),
+            gateway: guest_gateway.map(IpAddr::V4),
             tap_name: tap.clone(),
             bridge_name: None,
             uplink_name: Some(uplink.interface.clone()),
             lan_address: Some(IpAddr::V4(offer.address)),
         };
-        let desired_boot_parameters = format!(
-            "ip={}::{}:{}::{GUEST_INTERFACE}:off",
-            guest, gateway, "255.255.255.252"
+        let desired_boot_parameters = guest_boot_parameters(
+            guest,
+            guest_gateway,
+            request.prefix_length_override.unwrap_or(30),
         );
         let mut applied = Vec::new();
         let forwarding_was_enabled = forwarding_enabled()?;
@@ -741,6 +739,59 @@ fn reconcile_iptables_routed(
     Ok(())
 }
 
+fn select_private_subnet(
+    used_addresses: &[(String, IpAddr, String)],
+    request: &NetworkRequest,
+) -> Result<(Ipv4Addr, Ipv4Addr, Ipv4Addr), SdkError> {
+    if !request.exact_network_values {
+        return allocate_subnet(used_addresses).ok_or_else(|| SdkError::Network {
+            mode: request.mode.to_string(),
+            operation: "allocate private /30".to_owned(),
+            resource: "172.30.0.0/16".to_owned(),
+            reason: "the private address pool is exhausted or overlaps persisted state".to_owned(),
+        });
+    }
+    let (Some(guest), Some(30)) = (
+        request.guest_address_override,
+        request.prefix_length_override,
+    ) else {
+        return Err(SdkError::InvalidRequest {
+            field: "network_override".to_owned(),
+            reason: "exact IPv4 restore requires a guest address and /30 prefix".to_owned(),
+        });
+    };
+    let guest_number = u32::from(guest);
+    let network_base = guest_number & !3;
+    let expected_gateway = Ipv4Addr::from(network_base.saturating_add(1));
+    let expected_guest = Ipv4Addr::from(network_base.saturating_add(2));
+    let gateway = request.gateway_override.unwrap_or(expected_gateway);
+    let conflicts = private_subnet_conflicts(network_base, used_addresses);
+    if guest != expected_guest || gateway != expected_gateway || conflicts {
+        return Err(SdkError::SnapshotNetworkConflict {
+            field: "guest/gateway IPv4 subnet".to_owned(),
+            value: format!(
+                "{guest}/30 via {}",
+                request
+                    .gateway_override
+                    .map_or_else(|| "(none)".to_owned(), |value| value.to_string())
+            ),
+        });
+    }
+    Ok((Ipv4Addr::from(network_base), expected_gateway, guest))
+}
+
+fn guest_boot_parameters(guest: Ipv4Addr, gateway: Option<Ipv4Addr>, prefix_length: u8) -> String {
+    let netmask = Ipv4Addr::from(
+        u32::MAX
+            .checked_shl(u32::from(32 - prefix_length))
+            .unwrap_or(0),
+    );
+    format!(
+        "ip={guest}::{}:{netmask}::{GUEST_INTERFACE}:off",
+        gateway.map_or_else(String::new, |value| value.to_string())
+    )
+}
+
 fn allocate_subnet(
     used_addresses: &[(String, IpAddr, String)],
 ) -> Option<(Ipv4Addr, Ipv4Addr, Ipv4Addr)> {
@@ -748,29 +799,36 @@ fn allocate_subnet(
     while base <= PRIVATE_POOL_END {
         let gateway = Ipv4Addr::from(base + 1);
         let guest = Ipv4Addr::from(base + 2);
-        let conflict = used_addresses.iter().any(|(_, address, prefix)| {
-            let IpAddr::V4(value) = address else {
-                return false;
-            };
-            let prefix = prefix.parse::<u8>().unwrap_or(32);
-            let value = u32::from(*value);
-            if prefix <= 30 {
-                let mask = if prefix == 0 {
-                    0
-                } else {
-                    u32::MAX << (32 - prefix)
-                };
-                (value & mask) == (base & mask)
-            } else {
-                (value & !3) == base
-            }
-        });
+        let conflict = private_subnet_conflicts(base, used_addresses);
         if !conflict {
             return Some((Ipv4Addr::from(base), gateway, guest));
         }
         base = base.saturating_add(4);
     }
     None
+}
+
+fn private_subnet_conflicts(
+    network_base: u32,
+    used_addresses: &[(String, IpAddr, String)],
+) -> bool {
+    used_addresses.iter().any(|(_, address, prefix)| {
+        let IpAddr::V4(address) = address else {
+            return false;
+        };
+        let prefix = prefix.parse::<u8>().unwrap_or(32).min(32);
+        let address = u32::from(*address);
+        if prefix <= 30 {
+            let mask = if prefix == 0 {
+                0
+            } else {
+                u32::MAX << (32 - prefix)
+            };
+            (address & mask) == (network_base & mask)
+        } else {
+            (address & !3) == network_base
+        }
+    })
 }
 
 fn private_guest_network(guest: Ipv4Addr) -> Ipv4Addr {
@@ -2136,9 +2194,11 @@ mod tests {
 
     use super::{
         GUEST_INTERFACE, allocate_subnet, automatic_lan_candidates, guest_mac, is_device_missing,
-        is_privilege_denied, parse_uplink_cidr, primary_device_is_missing, tap_name,
-        validate_lan_candidate,
+        is_privilege_denied, parse_uplink_cidr, primary_device_is_missing, select_lan_offer,
+        select_private_subnet, tap_name, validate_lan_candidate,
     };
+    use crate::domain::lifecycle::NetworkMode;
+    use crate::ports::network::{NetworkRequest, UplinkIdentity};
 
     #[test]
     fn allocates_the_next_private_subnet_after_a_persisted_collision() {
@@ -2156,6 +2216,60 @@ mod tests {
                 Ipv4Addr::new(172, 30, 0, 6),
             ))
         );
+    }
+
+    #[test]
+    fn exact_private_restore_rejects_a_used_guest_subnet() {
+        let request = NetworkRequest {
+            vm_name: "restored_vm".to_owned(),
+            mode: NetworkMode::HostOnly,
+            guest_mac: "02:fc:00:00:00:02".to_owned(),
+            lan_address_override: None,
+            guest_address_override: Some(Ipv4Addr::new(172, 30, 0, 2)),
+            prefix_length_override: Some(30),
+            gateway_override: Some(Ipv4Addr::new(172, 30, 0, 1)),
+            exact_network_values: true,
+        };
+        let used = vec![(
+            "existing_vm".to_owned(),
+            IpAddr::V4(Ipv4Addr::new(172, 30, 0, 2)),
+            "tap-existing_vm".to_owned(),
+        )];
+
+        let error = select_private_subnet(&used, &request)
+            .expect_err("preserve policy must reject a subnet already used by another VM");
+
+        assert!(matches!(
+            error,
+            crate::error::SdkError::SnapshotNetworkConflict { ref field, .. }
+                if field == "guest/gateway IPv4 subnet"
+        ));
+    }
+
+    #[test]
+    fn exact_lan_restore_rejects_a_used_address_before_host_probing() {
+        let uplink = UplinkIdentity {
+            interface: "test0".to_owned(),
+            address: Ipv4Addr::new(192, 168, 3, 12),
+            prefix_length: 24,
+            gateway: Some(Ipv4Addr::new(192, 168, 3, 1)),
+            cidr: "192.168.3.12/24".to_owned(),
+        };
+        let archived_lan_address = Ipv4Addr::new(192, 168, 3, 50);
+        let used = vec![(
+            "existing_vm".to_owned(),
+            IpAddr::V4(archived_lan_address),
+            "tap-existing_vm".to_owned(),
+        )];
+
+        let error = select_lan_offer(&uplink, Some(archived_lan_address), None, &used)
+            .expect_err("preserve policy must reject a LAN address already used by another VM");
+
+        assert!(matches!(
+            error,
+            crate::error::SdkError::Network { ref operation, ref resource, .. }
+                if operation == "allocate LAN address" && resource == "192.168.3.50"
+        ));
     }
 
     #[test]

@@ -38,6 +38,14 @@ pub(crate) struct NetworkRequest {
     pub guest_mac: String,
     /// Explicit LAN override. `None` selects automatically for LAN mode.
     pub lan_address_override: Option<Ipv4Addr>,
+    /// Exact archived private guest address for preserve-policy restore.
+    pub guest_address_override: Option<Ipv4Addr>,
+    /// Exact archived private prefix for preserve-policy restore.
+    pub prefix_length_override: Option<u8>,
+    /// Exact archived private gateway for preserve-policy restore.
+    pub gateway_override: Option<Ipv4Addr>,
+    /// Preserved-policy marker that distinguishes an archived absent gateway from default allocation.
+    pub exact_network_values: bool,
 }
 
 /// Network result with internal ownership and boot metadata.

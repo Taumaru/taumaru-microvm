@@ -208,7 +208,7 @@ pub(crate) fn write_guest_network_config(
     guest_address: std::net::Ipv4Addr,
     gateway: std::net::Ipv4Addr,
 ) -> Result<(), SdkError> {
-    write_guest_network_unit(rootfs_path, guest_address, gateway, None)
+    write_guest_ipv4_config(rootfs_path, guest_address, 30, Some(gateway), None)
 }
 
 /// Writes the static network unit for routed LAN mode.
@@ -224,15 +224,29 @@ pub(crate) fn write_guest_lan_config(
     gateway: std::net::Ipv4Addr,
     lan_address: std::net::Ipv4Addr,
 ) -> Result<(), SdkError> {
-    write_guest_network_unit(rootfs_path, guest_address, gateway, Some(lan_address))
+    write_guest_ipv4_config(
+        rootfs_path,
+        guest_address,
+        30,
+        Some(gateway),
+        Some(lan_address),
+    )
 }
 
-fn write_guest_network_unit(
+pub(crate) fn write_guest_ipv4_config(
     rootfs_path: &Path,
     guest_address: std::net::Ipv4Addr,
-    gateway: std::net::Ipv4Addr,
+    prefix_length: u8,
+    gateway: Option<std::net::Ipv4Addr>,
     lan_address: Option<std::net::Ipv4Addr>,
 ) -> Result<(), SdkError> {
+    if !(1..=32).contains(&prefix_length) {
+        return Err(SdkError::GuestFilesystem {
+            operation: "validate guest IPv4 prefix".to_owned(),
+            path: rootfs_path.to_path_buf(),
+            reason: "prefix length must be between 1 and 32".to_owned(),
+        });
+    }
     for parent in ["etc", "etc/systemd"] {
         ensure_guest_directory(
             rootfs_path,
@@ -252,12 +266,18 @@ fn write_guest_network_unit(
         "the expected /etc/systemd/network directory is unavailable",
     )?;
     let mut contents = format!(
-        "[Match]\nName=eth0\n\n[Network]\nAddress={guest_address}/30\nGateway={gateway}\nDNS=1.1.1.1\nDNS=8.8.8.8\nDHCP=no\n"
+        "[Match]\nName=eth0\n\n[Network]\nAddress={guest_address}/{prefix_length}\nDNS=1.1.1.1\nDNS=8.8.8.8\nDHCP=no\n"
     );
+    if let Some(gateway) = gateway {
+        contents.push_str(&format!("Gateway={gateway}\n"));
+    }
     if let Some(lan) = lan_address {
-        contents.push_str(&format!(
-            "Address={lan}/32\n\n[Route]\nGateway={gateway}\nGatewayOnLink=yes\nPreferredSource={guest_address}\n"
-        ));
+        contents.push_str(&format!("Address={lan}/32\n"));
+        if let Some(gateway) = gateway {
+            contents.push_str(&format!(
+                "\n[Route]\nGateway={gateway}\nGatewayOnLink=yes\nPreferredSource={guest_address}\n"
+            ));
+        }
     }
     match stat_guest(
         rootfs_path,
@@ -293,6 +313,81 @@ fn write_guest_network_unit(
         "0100644",
     )?;
     write_guest_resolv_conf(rootfs_path)
+}
+
+pub(crate) fn sanitize_private_snapshot_network_file(rootfs_path: &Path) -> Result<(), SdkError> {
+    let guest_path = "etc/systemd/network/10-taumaru.network";
+    match stat_guest(
+        rootfs_path,
+        guest_path,
+        "inspect Taumaru guest network unit",
+    )? {
+        Some(stat) if stat.is_regular && !stat.is_symlink => {}
+        _ => {
+            return Err(SdkError::SnapshotSanitization {
+                path: rootfs_path.to_path_buf(),
+                reason: "the managed guest network unit is missing or is not a regular file"
+                    .to_owned(),
+            });
+        }
+    }
+    let output = Command::new("e2fsck")
+        .args(["-p", "-E", "journal_only"])
+        .arg(rootfs_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|error| SdkError::SnapshotSanitization {
+            path: rootfs_path.to_path_buf(),
+            reason: format!("could not replay committed ext4 journal transactions: {error}"),
+        })?;
+    if !matches!(output.status.code(), Some(0 | 1)) {
+        return Err(SdkError::SnapshotSanitization {
+            path: rootfs_path.to_path_buf(),
+            reason: format!(
+                "ext4 journal replay failed with {}: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+        });
+    }
+    match stat_guest(
+        rootfs_path,
+        guest_path,
+        "recheck Taumaru guest network unit",
+    )? {
+        Some(stat) if stat.is_regular && !stat.is_symlink => {}
+        _ => {
+            return Err(SdkError::SnapshotSanitization {
+                path: rootfs_path.to_path_buf(),
+                reason: "the managed guest network unit changed during journal replay".to_owned(),
+            });
+        }
+    }
+    let output = run_debugfs(rootfs_path, &format!("rm {guest_path}"), true)?;
+    if !output.status.success() {
+        return Err(SdkError::SnapshotSanitization {
+            path: rootfs_path.to_path_buf(),
+            reason: format!(
+                "could not remove the managed guest network unit: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+        });
+    }
+    if stat_guest(
+        rootfs_path,
+        guest_path,
+        "verify sanitized guest network unit",
+    )?
+    .is_some()
+    {
+        return Err(SdkError::SnapshotSanitization {
+            path: rootfs_path.to_path_buf(),
+            reason: "the managed guest network unit remains after removal".to_owned(),
+        });
+    }
+    Ok(())
 }
 
 /// Replaces the `systemd-resolved` stub symlink with a static resolver file.
@@ -678,7 +773,9 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use super::{inject_public_key, quote_host_path};
+    use super::{
+        inject_public_key, quote_host_path, sanitize_private_snapshot_network_file, stat_guest,
+    };
     use crate::error::SdkError;
 
     const FIRST_KEY: &str = "ssh-ed25519 AAAAC3NzaC1taumaru-first taumaru-test";
@@ -695,7 +792,9 @@ mod tests {
     }
 
     fn e2fsprogs_available() -> bool {
-        host_tool_available("debugfs") && host_tool_available("mkfs.ext4")
+        host_tool_available("debugfs")
+            && host_tool_available("mkfs.ext4")
+            && host_tool_available("e2fsck")
     }
 
     fn create_ext4_image(path: &Path) {
@@ -938,6 +1037,58 @@ mod tests {
     }
 
     #[test]
+    fn sanitizes_only_the_taumaru_network_file_on_a_private_ext4_copy() {
+        if !e2fsprogs_available() {
+            return;
+        }
+        let directory = tempdir().expect("temporary directory should exist");
+        let source = directory.path().join("source.ext4");
+        let private_copy = directory.path().join("private.ext4");
+        create_ext4_image(&source);
+        debugfs_exec(&source, "mkdir etc");
+        debugfs_exec(&source, "mkdir etc/systemd");
+        debugfs_exec(&source, "mkdir etc/systemd/network");
+        let managed_network = directory.path().join("taumaru.network");
+        let hostname = directory.path().join("hostname");
+        fs::write(&managed_network, b"Address=192.0.2.10/30\n").expect("network fixture");
+        fs::write(&hostname, b"snapshot-guest\n").expect("hostname fixture");
+        debugfs_exec(
+            &source,
+            &format!(
+                "write {} etc/systemd/network/10-taumaru.network",
+                quote_host_path(&managed_network)
+            ),
+        );
+        debugfs_exec(
+            &source,
+            &format!("write {} etc/hostname", quote_host_path(&hostname)),
+        );
+        let source_before = fs::read(&source).expect("source image bytes");
+        fs::copy(&source, &private_copy).expect("private image copy");
+
+        sanitize_private_snapshot_network_file(&private_copy)
+            .expect("private network settings should be removed");
+
+        assert_eq!(
+            fs::read(&source).expect("source after sanitization"),
+            source_before
+        );
+        assert_eq!(
+            guest_file_content(&private_copy, "etc/hostname"),
+            "snapshot-guest\n"
+        );
+        assert!(
+            stat_guest(
+                &private_copy,
+                "etc/systemd/network/10-taumaru.network",
+                "inspect sanitized fixture",
+            )
+            .expect("sanitized path should be inspected")
+            .is_none()
+        );
+    }
+
+    #[test]
     fn writes_a_static_network_unit_with_allocated_addresses() {
         use std::net::Ipv4Addr;
 
@@ -957,7 +1108,7 @@ mod tests {
 
         assert_eq!(
             guest_file_content(&image, "etc/systemd/network/10-taumaru.network"),
-            "[Match]\nName=eth0\n\n[Network]\nAddress=172.30.0.6/30\nGateway=172.30.0.5\nDNS=1.1.1.1\nDNS=8.8.8.8\nDHCP=no\n"
+            "[Match]\nName=eth0\n\n[Network]\nAddress=172.30.0.6/30\nDNS=1.1.1.1\nDNS=8.8.8.8\nDHCP=no\nGateway=172.30.0.5\n"
         );
         assert!(
             guest_stat(&image, "etc/systemd/network/10-taumaru.network").contains("0644"),
@@ -1052,7 +1203,7 @@ mod tests {
 
         assert_eq!(
             guest_file_content(&image, "etc/systemd/network/10-taumaru.network"),
-            "[Match]\nName=eth0\n\n[Network]\nAddress=10.200.4.2/30\nGateway=10.200.4.1\nDNS=1.1.1.1\nDNS=8.8.8.8\nDHCP=no\nAddress=192.168.3.50/32\n\n[Route]\nGateway=10.200.4.1\nGatewayOnLink=yes\nPreferredSource=10.200.4.2\n"
+            "[Match]\nName=eth0\n\n[Network]\nAddress=10.200.4.2/30\nDNS=1.1.1.1\nDNS=8.8.8.8\nDHCP=no\nGateway=10.200.4.1\nAddress=192.168.3.50/32\n\n[Route]\nGateway=10.200.4.1\nGatewayOnLink=yes\nPreferredSource=10.200.4.2\n"
         );
     }
 }

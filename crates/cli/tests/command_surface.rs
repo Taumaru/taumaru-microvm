@@ -34,6 +34,87 @@ fn snapshot_help_exposes_name_output_path_and_password() {
     assert!(stdout.contains("[NAME]"));
     assert!(stdout.contains("[OUTPUT_PATH]"));
     assert!(stdout.contains("--password <PASSWORD>"));
+    assert!(stdout.contains("--address-policy <POLICY>"));
+}
+
+#[test]
+fn restore_help_exposes_archive_password_and_non_interactive_options() {
+    let output = run_microvm(&["restore", "--help"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(output.status.success());
+    assert!(stdout.contains("Usage: microvm restore"));
+    assert!(stdout.contains("[ARCHIVE_PATH]"));
+    assert!(stdout.contains("--password <PASSWORD>"));
+    assert!(stdout.contains("--non-interactive"));
+}
+
+#[test]
+fn non_interactive_snapshot_requires_an_explicit_address_policy() {
+    let home = tempfile::tempdir().expect("temporary home should be created");
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_microvm"))
+        .args(["snapshot", "web-01", "--password", "secret"])
+        .env("TAUMARU_HOME", home.path())
+        .output()
+        .expect("failed to execute microvm");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(!output.status.success());
+    assert!(stderr.contains("Missing snapshot IPv4 policy"));
+    assert!(!stderr.contains("Choose a MicroVM"));
+}
+
+#[test]
+fn non_interactive_restore_rejects_a_missing_archive_without_prompting() {
+    let home = tempfile::tempdir().expect("temporary home should be created");
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_microvm"))
+        .args(["restore", "--non-interactive", "--password", "secret"])
+        .env("TAUMARU_HOME", home.path())
+        .output()
+        .expect("failed to execute microvm");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(!output.status.success());
+    assert!(stderr.contains("Missing snapshot archive path"));
+    assert!(!stderr.contains("Snapshot archive path"));
+}
+
+#[test]
+fn non_interactive_restore_rejects_a_missing_password_without_prompting() {
+    let home = tempfile::tempdir().expect("temporary home should be created");
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_microvm"))
+        .args(["restore", "./backup.tmvmsnap", "--non-interactive"])
+        .env("TAUMARU_HOME", home.path())
+        .output()
+        .expect("failed to execute microvm");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(!output.status.success());
+    assert!(stderr.contains("Missing snapshot password"));
+    assert!(!stderr.contains("Snapshot password"));
+}
+
+#[test]
+fn supplied_restore_password_is_not_echoed_on_failure() {
+    let home = tempfile::tempdir().expect("temporary home should be created");
+    let password = "restore-password-must-not-echo";
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_microvm"))
+        .args([
+            "restore",
+            "./missing.tmvmsnap",
+            "--password",
+            password,
+            "--non-interactive",
+        ])
+        .env("TAUMARU_HOME", home.path())
+        .output()
+        .expect("failed to execute microvm");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(!output.status.success());
+    assert!(!stdout.contains(password));
+    assert!(!stderr.contains(password));
 }
 
 #[test]

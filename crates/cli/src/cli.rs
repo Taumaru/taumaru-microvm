@@ -1,4 +1,4 @@
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 /// Command-line interface for host-local MicroVM operations.
 #[derive(Debug, Parser)]
@@ -24,6 +24,8 @@ pub(crate) enum Command {
     Stop(StopArgs),
     /// Create a password-encrypted snapshot archive for a MicroVM.
     Snapshot(SnapshotArgs),
+    /// Restore a stopped MicroVM from a password-encrypted snapshot archive.
+    Restore(RestoreArgs),
     /// Delete a MicroVM by name or interactive selection.
     Delete(DeleteArgs),
     /// List all MicroVMs with state and configured capacities.
@@ -143,6 +145,32 @@ pub(crate) struct SnapshotArgs {
     /// Snapshot encryption password. Omit to enter it through a hidden prompt.
     #[arg(long = "password", value_name = "PASSWORD")]
     pub(crate) password: Option<String>,
+
+    /// Whether to preserve source IPv4 assignments or allocate destination addresses later.
+    #[arg(long = "address-policy", value_enum, value_name = "POLICY")]
+    pub(crate) address_policy: Option<SnapshotAddressPolicyArg>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub(crate) enum SnapshotAddressPolicyArg {
+    /// Include source guest/LAN IPv4 assignments; restore can conflict with occupied addresses.
+    Preserve,
+    /// Store only LAN exposure and allocate IPv4 assignments at restore time.
+    Regenerate,
+}
+
+#[derive(Debug, Args, Clone)]
+pub(crate) struct RestoreArgs {
+    /// Snapshot archive path; interactive mode prompts when omitted.
+    pub(crate) archive_path: Option<std::path::PathBuf>,
+
+    /// Snapshot decryption password. Omit to enter it through a hidden prompt.
+    #[arg(long = "password", value_name = "PASSWORD")]
+    pub(crate) password: Option<String>,
+
+    /// Disable prompts and require an archive path and password.
+    #[arg(long = "non-interactive")]
+    pub(crate) non_interactive: bool,
 }
 
 #[derive(Debug, Args, Clone)]
@@ -193,7 +221,7 @@ pub(crate) struct SshArgs {
 mod tests {
     use clap::Parser;
 
-    use super::{ArtifactsCommand, Cli, Command};
+    use super::{ArtifactsCommand, Cli, Command, SnapshotAddressPolicyArg};
 
     #[test]
     fn download_parser_accepts_repeatable_explicit_options() {
@@ -246,6 +274,8 @@ mod tests {
                     "./copy.tmvmsnap",
                     "--password",
                     "secret",
+                    "--address-policy",
+                    "preserve",
                 ],
                 Some("web-01"),
                 Some("./copy.tmvmsnap"),
@@ -265,6 +295,52 @@ mod tests {
                 expected_output.map(std::borrow::Cow::Borrowed)
             );
             assert_eq!(snapshot.password.as_deref(), expected_password);
+            if expected_password.is_some() {
+                assert_eq!(
+                    snapshot.address_policy,
+                    Some(SnapshotAddressPolicyArg::Preserve)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn restore_parser_accepts_interactive_and_explicit_archive_forms() {
+        for (arguments, expected_path, expected_password, expected_non_interactive) in [
+            (vec!["microvm", "restore"], None, None, false),
+            (
+                vec!["microvm", "restore", "./backup.tmvmsnap"],
+                Some("./backup.tmvmsnap"),
+                None,
+                false,
+            ),
+            (
+                vec![
+                    "microvm",
+                    "restore",
+                    "./backup.tmvmsnap",
+                    "--password",
+                    "secret",
+                    "--non-interactive",
+                ],
+                Some("./backup.tmvmsnap"),
+                Some("secret"),
+                true,
+            ),
+        ] {
+            let cli = Cli::try_parse_from(arguments).expect("restore command should parse");
+            let Some(Command::Restore(restore)) = cli.command else {
+                panic!("restore command should be selected");
+            };
+            assert_eq!(
+                restore
+                    .archive_path
+                    .as_deref()
+                    .map(|path| path.to_string_lossy()),
+                expected_path.map(std::borrow::Cow::Borrowed)
+            );
+            assert_eq!(restore.password.as_deref(), expected_password);
+            assert_eq!(restore.non_interactive, expected_non_interactive);
         }
     }
 

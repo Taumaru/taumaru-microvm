@@ -24,9 +24,9 @@ No project setup task is required. The SDK/CLI workspace and dependencies alread
 
 **Purpose**: Establish shared archive policy, manifest, and typed errors before implementing producer or consumer behavior.
 
-- [ ] T001 Add the public `SnapshotAddressPolicy` type with the required typed values for preserving source IPv4 or regenerating destination IPv4, document it with Rustdoc, and re-export it in `crates/sdk/src/domain/snapshot.rs`, `crates/sdk/src/domain/mod.rs`, and `crates/sdk/src/lib.rs`.
-- [ ] T002 Define the version 2 manifest and network-policy variants in `crates/sdk/src/adapters/archive/manifest.rs` and `crates/sdk/src/adapters/archive/mod.rs`; preserve requires guest IPv4, prefix, optional gateway, optional LAN IPv4, mode, LAN exposure, and guest MAC, while regenerate stores only the policy and LAN exposure; include kernel ID, name, display name, version, architecture, registry path and URL, filename, format, MIME type, and modified time, with payload byte count/SHA-256 authoritative; reject version 1, unknown versions, IPv6, and inconsistent fields.
-- [ ] T003 Add typed SDK error variants and Rustdoc for unsupported archive versions/policies, invalid or conflicting network values, sanitization and snapshot capability failures, CoW overflow, and restore recovery failures in `crates/sdk/src/error.rs`.
+- [X] T001 Add the public `SnapshotAddressPolicy` type with the required typed values for preserving source IPv4 or regenerating destination IPv4, document it with Rustdoc, and re-export it in `crates/sdk/src/domain/snapshot.rs`, `crates/sdk/src/domain/mod.rs`, and `crates/sdk/src/lib.rs`.
+- [X] T002 Define the version 2 manifest and network-policy variants in `crates/sdk/src/adapters/archive/manifest.rs` and `crates/sdk/src/adapters/archive/mod.rs`; preserve requires guest IPv4, prefix, optional gateway, optional LAN IPv4, mode, LAN exposure, and guest MAC, while regenerate stores only the policy and LAN exposure; include kernel ID, name, display name, version, architecture, registry path and URL, filename, format, MIME type, and modified time, with payload byte count/SHA-256 authoritative; reject version 1, unknown versions, IPv6, and inconsistent fields.
+- [X] T003 Add typed SDK error variants and Rustdoc for unsupported archive versions/policies, invalid or conflicting network values, sanitization and snapshot capability failures, CoW overflow, and restore recovery failures in `crates/sdk/src/error.rs`.
 
 **Checkpoint**: Shared policy and manifest types are available to snapshot and restore work; SDK failures have typed representations.
 
@@ -40,18 +40,18 @@ No project setup task is required. The SDK/CLI workspace and dependencies alread
 
 ### Tests for User Story 1
 
-- [ ] T004 [P] [US1] Add archive-reader contract tests for valid preserve and regenerate version 2 archives, fixed members, payload sizes/digests, kernel metadata, and authenticated EOF in `crates/sdk/src/adapters/archive/restore.rs`.
-- [ ] T005 [P] [US1] Add an SDK restore integration test using encrypted version 2 fixtures to verify restored root disk, exact embedded kernel registration, SSH public/private keys and username/port/type/fingerprint metadata, portable VM settings, both network policy outcomes, destination paths, stopped state, and resolution through the normal start path in `crates/sdk/tests/restore.rs`.
+- [X] T004 [P] [US1] Add archive-reader contract tests for valid preserve and regenerate version 2 archives, fixed members, payload sizes/digests, kernel metadata, and authenticated EOF in `crates/sdk/src/adapters/archive/restore.rs`.
+- [X] T005 [P] [US1] Add adapter-injected SDK restore integration coverage using encrypted version 2 fixtures to verify restored root disk, exact embedded kernel registration, SSH keys and metadata, portable VM settings, both network policy outcomes, destination paths, stopped state, and normal start/stop resolution in `crates/sdk/src/manager.rs`; retain public API failure-path coverage in `crates/sdk/tests/restore.rs`.
 
 ### Implementation for User Story 1
 
-- [ ] T006 [US1] Add documented `RestoreRequest`, `RestoreResult`, progress, and lifecycle-stage types, then export them through `crates/sdk/src/domain/restore.rs`, `crates/sdk/src/domain/mod.rs`, and `crates/sdk/src/lib.rs`; the request accepts an archive path and one non-empty password.
-- [ ] T007 [P] [US1] Implement the age → Zstandard → TAR restore reader with a fixed member allowlist, SDK-selected staging paths, reject duplicate/missing/extra/unsafe members and non-regular entries, validate archived VM names and safe single-component kernel filenames, verify sizes and SHA-256 values, validate SSH key/fingerprint correspondence, bound archive/member sizes and accepted age scrypt work factor, and check authenticated EOF in `crates/sdk/src/adapters/archive/restore.rs` and `crates/sdk/src/adapters/archive/mod.rs`.
-- [ ] T008 [P] [US1] Extend `GuestStorage` with a typed writer for the final IPv4 guest configuration, including exact prefix, optional guest-visible gateway, optional LAN address, and route, in `crates/sdk/src/ports/storage.rs`, `crates/sdk/src/adapters/storage/ext4.rs`, and `crates/sdk/src/adapters/storage/guest_fs.rs`.
-- [ ] T009 [P] [US1] Extend the internal network request to accept exact archived guest IPv4/prefix/gateway, optional LAN IPv4, mode, exposure, and MAC for preserve policy, while using normal destination allocation from LAN exposure for regenerate policy, in `crates/sdk/src/ports/network.rs` and `crates/sdk/src/adapters/network/linux.rs`.
-- [ ] T010 [P] [US1] Add one repository operation that atomically persists the restored VM, destination network record, credential, stopped runtime, and verified kernel inventory metadata in `crates/sdk/src/ports/repository.rs` and `crates/sdk/src/adapters/persistence/sqlite.rs`.
-- [ ] T011 [US1] Orchestrate restore in `crates/sdk/src/manager.rs`: validate destination prerequisites, stage and verify all archive members, resolve runtime locally, install files without replacement at the documented modes (root disk/private key 0600; kernel/public key 0644), configure destination networking, write the guest network file, register the exact embedded kernel, and publish the VM only after every required record is ready.
-- [ ] T012 [US1] Expose the documented SDK restore operation and any progress variant through `crates/sdk/src/manager.rs` and `crates/sdk/src/lib.rs`; guarantee that success returns the archived VM identity and stopped state without launching Firecracker.
+- [X] T006 [US1] Add documented `RestoreRequest`, `RestoreResult`, progress, and lifecycle-stage types, then export them through `crates/sdk/src/domain/restore.rs`, `crates/sdk/src/domain/mod.rs`, and `crates/sdk/src/lib.rs`; the request accepts an archive path and one non-empty password.
+- [X] T007 [P] [US1] Implement the age → Zstandard → TAR restore reader with a fixed member allowlist, SDK-selected staging paths, reject duplicate/missing/extra/unsafe members and non-regular entries, validate archived VM names and safe single-component kernel filenames, verify sizes and SHA-256 values, validate SSH key/fingerprint correspondence, bound archive/member sizes and accepted age scrypt work factor, and check authenticated EOF in `crates/sdk/src/adapters/archive/restore.rs` and `crates/sdk/src/adapters/archive/mod.rs`.
+- [X] T008 [P] [US1] Extend `GuestStorage` with a typed writer for the final IPv4 guest configuration, including exact prefix, optional guest-visible gateway, optional LAN address, and route, in `crates/sdk/src/ports/storage.rs`, `crates/sdk/src/adapters/storage/ext4.rs`, and `crates/sdk/src/adapters/storage/guest_fs.rs`.
+- [X] T009 [P] [US1] Extend the internal network request to accept exact archived guest IPv4/prefix/gateway, optional LAN IPv4, mode, exposure, and MAC for preserve policy, while using normal destination allocation from LAN exposure for regenerate policy, in `crates/sdk/src/ports/network.rs` and `crates/sdk/src/adapters/network/linux.rs`.
+- [X] T010 [P] [US1] Add one repository operation that atomically persists the restored VM, destination network record, credential, stopped runtime, and verified kernel inventory metadata in `crates/sdk/src/ports/repository.rs` and `crates/sdk/src/adapters/persistence/sqlite.rs`.
+- [X] T011 [US1] Orchestrate restore in `crates/sdk/src/manager.rs`: validate destination prerequisites, stage and verify all archive members, resolve runtime locally, install files without replacement at the documented modes (root disk/private key 0600; kernel/public key 0644), configure destination networking, write the guest network file, register the exact embedded kernel, and publish the VM only after every required record is ready.
+- [X] T012 [US1] Expose the documented SDK restore operation and any progress variant through `crates/sdk/src/manager.rs` and `crates/sdk/src/lib.rs`; guarantee that success returns the archived VM identity and stopped state without launching Firecracker.
 
 **Checkpoint**: SDK callers can restore a valid version 2 archive into a complete stopped VM without source-host database or runtime files.
 
@@ -65,17 +65,17 @@ No project setup task is required. The SDK/CLI workspace and dependencies alread
 
 ### Tests for User Story 2
 
-- [ ] T013 [P] [US2] Add failure-path tests for wrong password, v1/unknown version, missing or inconsistent policy fields, IPv6, unsafe/duplicate/extra archive members, corrupt hashes, truncation, and authenticated-stream failure in `crates/sdk/tests/restore_archive_failures.rs`.
-- [ ] T014 [P] [US2] Add conflict tests for an existing VM name, occupied managed path, exact guest/LAN IPv4 or MAC conflict, insufficient storage, and unavailable destination runtime; assert no pre-existing state changes in `crates/sdk/tests/restore_conflicts.rs`.
-- [ ] T015 [P] [US2] Add cancellation and interrupted-restore tests that restart the manager, reconcile journaled operation-owned resources, and allow a safe retry without deleting pre-existing data in `crates/sdk/tests/restore_recovery.rs`.
+- [X] T013 [P] [US2] Add failure-path tests for wrong password, v1/unknown version, missing or inconsistent policy fields, IPv6, unsafe/duplicate/extra archive members, corrupt hashes, truncation, and authenticated-stream failure in `crates/sdk/src/adapters/archive/manifest.rs` and `crates/sdk/src/adapters/archive/restore.rs`.
+- [X] T014 [P] [US2] Add conflict tests for an existing VM name, occupied managed path, exact guest/LAN IPv4 or MAC conflict, insufficient storage, and unavailable destination runtime; assert no pre-existing state changes in `crates/sdk/src/manager.rs`, `crates/sdk/src/adapters/network/linux.rs`, and `crates/sdk/src/adapters/storage/ext4.rs`.
+- [X] T015 [P] [US2] Add cancellation and interrupted-restore tests that restart the manager, reconcile journaled operation-owned resources, and allow a safe retry without deleting pre-existing data in `crates/sdk/src/manager.rs`.
 
 ### Implementation for User Story 2
 
-- [ ] T016 [P] [US2] Serialize concurrent restores by archived VM name and enforce no-clobber checks for inventory and destination paths before installation in `crates/sdk/src/manager.rs`.
-- [ ] T017 [P] [US2] Validate preserve-policy guest/LAN IPv4 and MAC against persisted and live destination allocations, and roll back only network resources created by the failed restore in `crates/sdk/src/adapters/network/linux.rs`.
-- [ ] T018 [US2] Add durable restore-journal persistence for operation identity, affected VM, staging/final paths, imported kernel entries, network resources, and progress state in `crates/sdk/src/ports/repository.rs` and `crates/sdk/src/adapters/persistence/sqlite.rs`.
-- [ ] T019 [US2] Reconcile incomplete journal entries before retrying the affected VM name and remove only resources recorded as owned by the interrupted operation in `crates/sdk/src/manager.rs`.
-- [ ] T020 [US2] Complete rollback for errors and cancellation across staged/installed files, kernel cache entries, credentials, and destination network resources; enforce private SSH key mode `0600` and prevent publication of partial inventory in `crates/sdk/src/manager.rs` and `crates/sdk/src/adapters/archive/restore.rs`.
+- [X] T016 [P] [US2] Serialize concurrent restores by archived VM name and enforce no-clobber checks for inventory and destination paths before installation in `crates/sdk/src/manager.rs`.
+- [X] T017 [P] [US2] Validate preserve-policy guest/LAN IPv4 and MAC against persisted and live destination allocations, and roll back only network resources created by the failed restore in `crates/sdk/src/adapters/network/linux.rs`.
+- [X] T018 [US2] Add durable restore-journal persistence for operation identity, affected VM, staging/final paths, imported kernel entries, network resources, and progress state in `crates/sdk/src/ports/repository.rs` and `crates/sdk/src/adapters/persistence/sqlite.rs`.
+- [X] T019 [US2] Reconcile incomplete journal entries before retrying the affected VM name and remove only resources recorded as owned by the interrupted operation in `crates/sdk/src/manager.rs`.
+- [X] T020 [US2] Complete rollback for errors and cancellation across staged/installed files, kernel cache entries, credentials, and destination network resources; enforce private SSH key mode `0600` and prevent publication of partial inventory in `crates/sdk/src/manager.rs` and `crates/sdk/src/adapters/archive/restore.rs`.
 
 **Checkpoint**: Invalid or conflicting restores return typed errors and leave existing machines unchanged; interrupted operations can be reconciled safely.
 
@@ -89,13 +89,13 @@ No project setup task is required. The SDK/CLI workspace and dependencies alread
 
 ### Tests for User Story 3
 
-- [ ] T021 [P] [US3] Add CLI command-surface tests for missing/present archive paths, one masked password prompt without confirmation, supplied password not echoed, non-interactive validation, progress, and successful stopped-state output in `crates/cli/tests/command_surface.rs`.
+- [X] T021 [P] [US3] Add CLI command-surface tests for missing/present archive paths, one masked password prompt without confirmation, supplied password not echoed, non-interactive validation, progress, and successful stopped-state output in `crates/cli/tests/command_surface.rs`.
 
 ### Implementation for User Story 3
 
-- [ ] T022 [US3] Add the `restore` subcommand with an optional archive path and `--password` argument, and register dispatch through `crates/cli/src/cli.rs` and `crates/cli/src/commands/mod.rs`.
-- [ ] T023 [P] [US3] Implement `crates/cli/src/commands/restore.rs` to prompt for a missing path, request a missing password once through the existing masked `inquire` password input, reject missing non-interactive values, call the SDK, and forward progress without printing the password.
-- [ ] T024 [P] [US3] Render restore progress, archived VM name, destination-local identity, stopped state, and calm cause/impact/next-step diagnostics through `crates/cli/src/output/human.rs`.
+- [X] T022 [US3] Add the `restore` subcommand with an optional archive path and `--password` argument, and register dispatch through `crates/cli/src/cli.rs` and `crates/cli/src/commands/mod.rs`.
+- [X] T023 [P] [US3] Implement `crates/cli/src/commands/restore.rs` to prompt for a missing path, request a missing password once through the existing masked `inquire` password input, reject missing non-interactive values, call the SDK, and forward progress without printing the password.
+- [X] T024 [P] [US3] Render restore progress, archived VM name, destination-local identity, stopped state, and calm cause/impact/next-step diagnostics through `crates/cli/src/output/human.rs`.
 
 **Checkpoint**: Interactive and scripted restore use the same SDK operation and never expose the password.
 
@@ -109,20 +109,20 @@ No project setup task is required. The SDK/CLI workspace and dependencies alread
 
 ### Tests for User Story 4
 
-- [ ] T025 [P] [US4] Add writer/manifest tests for version 2 kernel metadata and both policy shapes; preserve includes guest IPv4, prefix, optional gateway/LAN address, mode, exposure, and MAC, while regenerate stores only the policy and LAN exposure and omits all source assignment fields, in `crates/sdk/src/adapters/archive/age_tar_zstd.rs`.
-- [ ] T026 [P] [US4] Add a privileged Linux integration test proving a writable classic Device Mapper child over the read-only capture accepts private writes without changing its parent/origin, detects overflow, and cleans up in dependency order in `crates/sdk/tests/snapshot_cow.rs`.
-- [ ] T027 [P] [US4] Add ext4 image tests that sanitize only `/etc/systemd/network/10-taumaru.network`, preserve unrelated guest files, and leave the source image unchanged in `crates/sdk/tests/snapshot_sanitization.rs`.
-- [ ] T028 [P] [US4] Add CLI tests for the yes/no IPv4 prompt, the preserve-conflict warning, and failure when non-interactive snapshot creation omits the policy in `crates/cli/tests/command_surface.rs`.
+- [X] T025 [P] [US4] Add writer/manifest tests for version 2 kernel metadata and both policy shapes; preserve includes guest IPv4, prefix, optional gateway/LAN address, mode, exposure, and MAC, while regenerate stores only the policy and LAN exposure and omits all source assignment fields, in `crates/sdk/src/adapters/archive/age_tar_zstd.rs`.
+- [X] T026 [P] [US4] Add a privileged Linux integration test proving a writable classic Device Mapper child over the read-only capture accepts private writes without changing its parent/origin, detects overflow, and cleans up in dependency order in `crates/sdk/tests/snapshot_cow.rs`.
+- [X] T027 [P] [US4] Add ext4 image tests that sanitize only `/etc/systemd/network/10-taumaru.network`, preserve unrelated guest files, and leave the source image unchanged in `crates/sdk/src/adapters/storage/guest_fs.rs`.
+- [X] T028 [P] [US4] Add CLI tests for both yes/no policy mappings and the preserve-conflict warning in `crates/cli/src/commands/snapshot.rs`, plus failure when non-interactive snapshot creation omits the policy in `crates/cli/tests/command_surface.rs`.
 
 ### Implementation for User Story 4
 
-- [ ] T029 [P] [US4] Add the independently named writable child snapshot, COW loop/file ownership, status/overflow checks, and dependency-ordered cleanup to `crates/sdk/src/adapters/runtime/device_mapper.rs`; add a verified nested-snapshot capability probe and use the full-copy fallback only when the probe reports unsupported.
-- [ ] T030 [P] [US4] Extend `GuestStorage` with a fixed-path private-view preparation operation that replays committed ext4 journal transactions and removes only the Taumaru-managed network file; reject missing/non-regular files and never accept an arbitrary guest path in `crates/sdk/src/ports/storage.rs`, `crates/sdk/src/adapters/storage/ext4.rs`, and `crates/sdk/src/adapters/storage/guest_fs.rs`.
-- [ ] T031 [US4] Add an exact-length private root-disk copy fallback that checks available storage, uses unique restrictive temporary files, reports copied bytes, does not resize the image, and cleans up on failure in `crates/sdk/src/ports/storage.rs` and `crates/sdk/src/adapters/storage/ext4.rs`.
-- [ ] T032 [P] [US4] Update the encrypted archive writer to emit version 2, serialize policy-specific network fields and kernel ID, name, display name, version, architecture, registry path and URL, filename, format, MIME type, and modified time; keep payload byte count/SHA-256 authoritative and hash the actual root-disk bytes after any sanitization in `crates/sdk/src/adapters/archive/age_tar_zstd.rs`.
-- [ ] T033 [US4] Update snapshot orchestration to require an explicit SDK policy, capture a running VM through the stable read-only parent, use the private child or verified full-copy fallback for regenerate, keep stopped-source reads serialized, report preparation/sanitization/archive progress, clean up before atomic output publication, and never mutate the source disk in `crates/sdk/src/manager.rs` and `crates/sdk/src/domain/snapshot.rs`.
-- [ ] T034 [P] [US4] Add the CLI `--address-policy <preserve|regenerate>` option, interactive choice with the restore-conflict warning, and deterministic non-interactive failure when the option is absent in `crates/cli/src/cli.rs` and `crates/cli/src/commands/snapshot.rs`.
-- [ ] T035 [US4] Render snapshot policy, private-copy sanitization, real payload byte progress, completion, and actionable failures through `crates/cli/src/output/human.rs`.
+- [X] T029 [P] [US4] Add the independently named writable child snapshot, COW loop/file ownership, status/overflow checks, and dependency-ordered cleanup to `crates/sdk/src/adapters/runtime/device_mapper.rs`; add a verified nested-snapshot capability probe and use the full-copy fallback only when the probe reports unsupported.
+- [X] T030 [P] [US4] Extend `GuestStorage` with a fixed-path private-view preparation operation that replays committed ext4 journal transactions and removes only the Taumaru-managed network file; reject missing/non-regular files and never accept an arbitrary guest path in `crates/sdk/src/ports/storage.rs`, `crates/sdk/src/adapters/storage/ext4.rs`, and `crates/sdk/src/adapters/storage/guest_fs.rs`.
+- [X] T031 [US4] Add an exact-length private root-disk copy fallback that checks available storage, uses unique restrictive temporary files, reports copied bytes, does not resize the image, and cleans up on failure in `crates/sdk/src/ports/storage.rs` and `crates/sdk/src/adapters/storage/ext4.rs`.
+- [X] T032 [P] [US4] Update the encrypted archive writer to emit version 2, serialize policy-specific network fields and kernel ID, name, display name, version, architecture, registry path and URL, filename, format, MIME type, and modified time; keep payload byte count/SHA-256 authoritative and hash the actual root-disk bytes after any sanitization in `crates/sdk/src/adapters/archive/age_tar_zstd.rs`.
+- [X] T033 [US4] Update snapshot orchestration to require an explicit SDK policy, capture a running VM through the stable read-only parent, use the private child or verified full-copy fallback for regenerate, keep stopped-source reads serialized, report preparation/sanitization/archive progress, clean up before atomic output publication, and never mutate the source disk in `crates/sdk/src/manager.rs` and `crates/sdk/src/domain/snapshot.rs`.
+- [X] T034 [P] [US4] Add the CLI `--address-policy <preserve|regenerate>` option, interactive choice with the restore-conflict warning, and deterministic non-interactive failure when the option is absent in `crates/cli/src/cli.rs` and `crates/cli/src/commands/snapshot.rs`.
+- [X] T035 [US4] Render snapshot policy, private-copy sanitization, real payload byte progress, completion, and actionable failures through `crates/cli/src/output/human.rs`.
 
 **Checkpoint**: The SDK can produce both policy variants; restore round-trips either variant and configures the guest disk according to the destination policy.
 
@@ -132,10 +132,10 @@ No project setup task is required. The SDK/CLI workspace and dependencies alread
 
 **Purpose**: Complete documentation and validate the full implementation against project quality gates and Linux snapshot behavior.
 
-- [ ] T036 [P] Update `specs/021-vm-restore/quickstart.md` with the implemented policy flag, interactive prompts, restore commands, crash-consistency boundary, host-tool requirements, and full-copy fallback behavior.
-- [ ] T037 [P] Complete public Rustdoc and compatibility notes for the new snapshot policy and restore request/result/error surfaces in `crates/sdk/src/lib.rs`, `crates/sdk/src/domain/snapshot.rs`, and `crates/sdk/src/domain/restore.rs`.
-- [ ] T038 Run `cargo fmt --all -- --check`, `cargo check --all-targets --all-features`, `cargo clippy --all-targets --all-features -- -D warnings`, and `cargo test --all-targets --all-features` from the workspace root `Cargo.toml`.
-- [ ] T039 Run the privileged nested-snapshot integration test on each supported kernel/filesystem configuration and verify the fallback path on a host where classic nested snapshots are unavailable using `crates/sdk/tests/snapshot_cow.rs` and `crates/sdk/tests/snapshot_sanitization.rs`.
+- [X] T036 [P] Update `specs/021-vm-restore/quickstart.md` with the implemented policy flag, interactive prompts, restore commands, crash-consistency boundary, host-tool requirements, and full-copy fallback behavior.
+- [X] T037 [P] Complete public Rustdoc and compatibility notes for the new snapshot policy and restore request/result/error surfaces in `crates/sdk/src/lib.rs`, `crates/sdk/src/domain/snapshot.rs`, and `crates/sdk/src/domain/restore.rs`.
+- [X] T038 Run `cargo fmt --all -- --check`, `cargo check --all-targets --all-features`, `cargo clippy --all-targets --all-features -- -D warnings`, and `cargo test --all-targets --all-features` from the workspace root `Cargo.toml`.
+- [ ] T039 Run the privileged nested-snapshot integration test on each supported kernel/filesystem configuration and verify the fallback path on a host where classic nested snapshots are unavailable using `crates/sdk/tests/snapshot_cow.rs` and the ext4 sanitizer tests in `crates/sdk/src/adapters/storage/guest_fs.rs`.
 
 ---
 
@@ -209,5 +209,6 @@ Deliver **US1 + US2** first: restore a supported version 2 archive and prove tha
 
 - Every task uses the required checkbox/ID format; [P] marks tasks that can proceed in parallel without editing the same file or waiting on unfinished work.
 - User-story labels map to the four stories in `spec.md`.
-- SDK tests assert typed errors and no unsolicited output; CLI tests cover prompts, progress, and diagnostics.
+- SDK tests assert typed errors and no unsolicited output; CLI tests cover required inputs, password secrecy, policy selection, progress, and diagnostics.
+- The privileged Device Mapper test is opt-in because it creates kernel mappings. This workspace host runs as UID 1000 and the kernel returns permission denied for `/dev/mapper/control`; T039 therefore remains an external host-matrix validation.
 - The snapshot remains block-level crash-consistent; it does not quiesce guest applications or coordinate database transactions.

@@ -29,7 +29,8 @@ impl fmt::Display for MicroVmState {
 }
 
 /// Network mode requested for a MicroVM.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum NetworkMode {
     /// Isolated host-only `/30` networking with host NAT.
     HostOnly,

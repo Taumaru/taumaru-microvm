@@ -41,7 +41,8 @@ use crate::domain::registry::{
     TaumaruRegistry,
 };
 use crate::domain::snapshot::{
-    SnapshotCancellation, SnapshotProgress, SnapshotProgressStage, SnapshotResult,
+    SnapshotAddressPolicy, SnapshotCancellation, SnapshotProgress, SnapshotProgressStage,
+    SnapshotResult,
 };
 use crate::error::SdkError;
 use crate::ports::artifacts::ArtifactSource;
@@ -52,6 +53,8 @@ use crate::ports::runtime::{RuntimeController, StartRequest};
 use crate::ports::runtime_disk::RuntimeDiskController;
 use crate::ports::storage::GuestStorage;
 use semver::Version;
+
+mod restore;
 
 const DEFAULT_REGISTRY_BASE_URL: &str = "https://artifacts.taumaru.com/v1/";
 const PROBE_TIMEOUT_SECS: u64 = 12;
@@ -298,6 +301,63 @@ fn creation_terminal_event(
         bytes_completed: None,
         expected_bytes: None,
         outcome: Some(outcome),
+    }
+}
+
+fn snapshot_ipv4(address: IpAddr, field: &str) -> Result<std::net::Ipv4Addr, SdkError> {
+    match address {
+        IpAddr::V4(address) => Ok(address),
+        IpAddr::V6(_) => Err(SdkError::InvalidSnapshotManifest {
+            reason: format!("{field} uses IPv6, but snapshots support IPv4 only"),
+        }),
+    }
+}
+
+fn private_snapshot_copy_path(home: &Path, operation_id: &str) -> Result<PathBuf, SdkError> {
+    let directory = home.join("tmp").join("snapshots");
+    fs::create_dir_all(&directory).map_err(|error| {
+        SdkError::filesystem("create private snapshot directory", &directory, error)
+    })?;
+    let metadata = fs::symlink_metadata(&directory).map_err(|error| {
+        SdkError::filesystem("inspect private snapshot directory", &directory, error)
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(SdkError::SnapshotCapability {
+            capability: "private full-copy fallback".to_owned(),
+            reason: "the private snapshot directory is not a real directory".to_owned(),
+        });
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).map_err(|error| {
+            SdkError::filesystem("protect private snapshot directory", &directory, error)
+        })?;
+    }
+    Ok(directory.join(format!("{operation_id}.ext4")))
+}
+
+fn stored_disk_size(input: &SnapshotArchiveInput) -> Result<u64, SdkError> {
+    if input.metadata.disk_size_bytes == 0 {
+        return Err(SdkError::InvalidRequest {
+            field: "snapshot_disk_size".to_owned(),
+            reason: "must be greater than zero".to_owned(),
+        });
+    }
+    Ok(input.metadata.disk_size_bytes)
+}
+
+fn snapshot_cleanup_errors(primary: SdkError, failures: Vec<SdkError>) -> SdkError {
+    if failures.is_empty() {
+        primary
+    } else {
+        SdkError::Cleanup {
+            primary: primary.to_string(),
+            failures: failures
+                .into_iter()
+                .map(|failure| failure.to_string())
+                .collect(),
+        }
     }
 }
 
@@ -825,11 +885,13 @@ impl MicroVmSdk {
         vm_name: &str,
         output_path: &Path,
         password: &str,
+        address_policy: SnapshotAddressPolicy,
     ) -> Result<SnapshotResult, SdkError> {
         self.create_snapshot_with_cancellation(
             vm_name,
             output_path,
             password,
+            address_policy,
             SnapshotCancellation::new(),
         )
         .await
@@ -846,12 +908,14 @@ impl MicroVmSdk {
         vm_name: &str,
         output_path: &Path,
         password: &str,
+        address_policy: SnapshotAddressPolicy,
         cancellation: SnapshotCancellation,
     ) -> Result<SnapshotResult, SdkError> {
         self.create_snapshot_with_cancellation_and_progress(
             vm_name,
             output_path,
             password,
+            address_policy,
             cancellation,
             |_| {},
         )
@@ -869,6 +933,7 @@ impl MicroVmSdk {
         vm_name: &str,
         output_path: &Path,
         password: &str,
+        address_policy: SnapshotAddressPolicy,
         cancellation: SnapshotCancellation,
         on_progress: F,
     ) -> Result<SnapshotResult, SdkError>
@@ -927,6 +992,17 @@ impl MicroVmSdk {
             });
         }
         let (network, credential, _) = stored.require_full("create snapshot")?;
+        let guest_ipv4 = snapshot_ipv4(network.config.guest_address, "guest address")?;
+        let guest_gateway_ipv4 = network
+            .config
+            .gateway
+            .map(|address| snapshot_ipv4(address, "guest gateway"))
+            .transpose()?;
+        let lan_ipv4 = network
+            .config
+            .lan_address
+            .map(|address| snapshot_ipv4(address, "LAN address"))
+            .transpose()?;
         let rootfs_size = fs::metadata(&stored.record.rootfs_path)
             .map_err(|error| {
                 SdkError::filesystem(
@@ -954,15 +1030,20 @@ impl MicroVmSdk {
                 distribution_version: stored_metadata.distribution_version,
                 image_id: stored.record.image_id.clone(),
                 image_sha256: stored_metadata.image_sha256,
-                kernel_id: stored.record.kernel_id.clone(),
+                kernel: stored_metadata.kernel.clone(),
                 disk_size_bytes: stored.record.disk_size_bytes,
                 memory_bytes: stored.record.memory_bytes,
                 memory_effective_mib: stored.record.memory_effective_mib,
                 vcpu_count: stored.record.vcpu_count,
                 root_device: stored_metadata.root_device,
                 kernel_args: stored_metadata.kernel_args,
+                address_policy,
                 network_mode: network.config.mode.to_string(),
                 expose_on_lan: stored.record.expose_on_lan,
+                guest_ipv4: Some(guest_ipv4),
+                prefix_length: Some(network.config.prefix_length),
+                guest_gateway_ipv4,
+                lan_ipv4,
                 guest_mac: network.guest_mac.clone(),
                 ssh_user: credential.ssh_user.clone(),
                 ssh_port: credential.ssh_port,
@@ -1004,9 +1085,16 @@ impl MicroVmSdk {
         let home = self.home.clone();
         let vm_name = stored.record.name.clone();
         let rootfs_path = stored.record.rootfs_path.clone();
+        let requested_output_path = output_path.to_path_buf();
         let runtime_disk = Arc::clone(&self.runtime_disk);
+        let storage = Arc::clone(&self.storage);
         let token = cancellation.token();
         let future_cancellation = SnapshotFutureCancellation(token.clone());
+        let snapshot_operation_id = format!(
+            "snapshot-{}-{}",
+            std::process::id(),
+            TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed)
+        );
         let worker = tokio::task::spawn_blocking(move || {
             let _runtime_lock = runtime_lock;
             let _name_guard = name_guard;
@@ -1016,72 +1104,246 @@ impl MicroVmSdk {
             }
             let mut input = input;
             let mut on_progress = on_progress;
-            if running {
+            let output_parent = requested_output_path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or(Path::new("."));
+            let staged_output_path =
+                output_parent.join(format!(".tmvm-{snapshot_operation_id}.staged"));
+            let mut snapshot_view: Option<PathBuf> = None;
+            let mut private_dm_view: Option<PathBuf> = None;
+            let mut private_copy_path: Option<PathBuf> = None;
+
+            let capture_result = (|| {
+                if running {
+                    on_progress(SnapshotProgress {
+                        stage: SnapshotProgressStage::PreparingDiskView,
+                        completed_bytes: 0,
+                        total_bytes: 0,
+                    });
+                    snapshot_view = Some(runtime_disk.create_snapshot_view(
+                        &home,
+                        &vm_name,
+                        &rootfs_path,
+                        &mut on_progress,
+                    )?);
+                }
+
+                if address_policy == SnapshotAddressPolicy::RegenerateIpv4 {
+                    on_progress(SnapshotProgress {
+                        stage: SnapshotProgressStage::PreparingPrivateView,
+                        completed_bytes: 0,
+                        total_bytes: 0,
+                    });
+                    let stable_source = snapshot_view.as_deref().unwrap_or(&rootfs_path);
+                    let private_path = if let Some(parent_view) = snapshot_view.as_deref() {
+                        match runtime_disk.create_private_snapshot_view(
+                            &home,
+                            &vm_name,
+                            &rootfs_path,
+                            parent_view,
+                            &snapshot_operation_id,
+                            &mut on_progress,
+                        ) {
+                            Ok(path) => {
+                                private_dm_view = Some(path.clone());
+                                path
+                            }
+                            Err(SdkError::SnapshotCapability { capability, .. })
+                                if capability == "nested_classic_snapshot_unsupported" =>
+                            {
+                                let path =
+                                    private_snapshot_copy_path(&home, &snapshot_operation_id)?;
+                                let mut copied = |completed_bytes, total_bytes| {
+                                    on_progress(SnapshotProgress {
+                                        stage: SnapshotProgressStage::CopyingPrivateDisk,
+                                        completed_bytes,
+                                        total_bytes,
+                                    });
+                                };
+                                storage.copy_rootfs_exact(
+                                    stable_source,
+                                    &path,
+                                    stored_disk_size(&input)?,
+                                    token.clone(),
+                                    &mut copied,
+                                )?;
+                                private_copy_path = Some(path.clone());
+                                path
+                            }
+                            Err(error) => return Err(error),
+                        }
+                    } else {
+                        let path = private_snapshot_copy_path(&home, &snapshot_operation_id)?;
+                        let mut copied = |completed_bytes, total_bytes| {
+                            on_progress(SnapshotProgress {
+                                stage: SnapshotProgressStage::CopyingPrivateDisk,
+                                completed_bytes,
+                                total_bytes,
+                            });
+                        };
+                        storage.copy_rootfs_exact(
+                            stable_source,
+                            &path,
+                            stored_disk_size(&input)?,
+                            token.clone(),
+                            &mut copied,
+                        )?;
+                        private_copy_path = Some(path.clone());
+                        path
+                    };
+                    on_progress(SnapshotProgress {
+                        stage: SnapshotProgressStage::SanitizingNetwork,
+                        completed_bytes: 0,
+                        total_bytes: 0,
+                    });
+                    storage.prepare_private_snapshot_view(&private_path)?;
+                    let root_payload =
+                        input
+                            .payloads
+                            .first_mut()
+                            .ok_or_else(|| SdkError::SnapshotArchive {
+                                operation: "prepare snapshot payload",
+                                reason: "the root-disk payload is missing".to_owned(),
+                            })?;
+                    root_payload.source_path = private_path;
+                } else if let Some(path) = snapshot_view.as_ref() {
+                    let root_payload =
+                        input
+                            .payloads
+                            .first_mut()
+                            .ok_or_else(|| SdkError::SnapshotArchive {
+                                operation: "prepare snapshot payload",
+                                reason: "the root-disk payload is missing".to_owned(),
+                            })?;
+                    root_payload.source_path = path.clone();
+                }
+
+                input.output_path = staged_output_path.clone();
                 on_progress(SnapshotProgress {
-                    stage: SnapshotProgressStage::PreparingDiskView,
+                    stage: SnapshotProgressStage::PreparingArchive,
                     completed_bytes: 0,
                     total_bytes: 0,
                 });
-            }
-            let snapshot_view = if running {
-                Some(runtime_disk.create_snapshot_view(
-                    &home,
-                    &vm_name,
-                    &rootfs_path,
-                    &mut on_progress,
-                )?)
-            } else {
-                None
-            };
-            on_progress(SnapshotProgress {
-                stage: SnapshotProgressStage::PreparingArchive,
-                completed_bytes: 0,
-                total_bytes: 0,
-            });
-            if let Some(path) = snapshot_view.as_ref() {
-                input.payloads[0].source_path = path.clone();
-            }
-            let view_disk = Arc::clone(&runtime_disk);
-            let view_home = home.clone();
-            let view_name = vm_name.clone();
-            let view_rootfs = rootfs_path.clone();
-            let archive_result = age_tar_zstd::create_archive_with_progress(
-                input,
-                token.clone(),
-                move || {
-                    if running {
-                        view_disk.check_snapshot_view(&view_home, &view_name, &view_rootfs)
-                    } else {
+                let view_disk = Arc::clone(&runtime_disk);
+                let view_home = home.clone();
+                let view_name = vm_name.clone();
+                let view_rootfs = rootfs_path.clone();
+                let view_parent = snapshot_view.clone();
+                let view_operation = snapshot_operation_id.clone();
+                let private_view_active = private_dm_view.is_some();
+                age_tar_zstd::create_archive_with_progress(
+                    input,
+                    token.clone(),
+                    move || {
+                        if running {
+                            view_disk.check_snapshot_view(&view_home, &view_name, &view_rootfs)?;
+                            if private_view_active {
+                                let parent = view_parent.as_deref().ok_or_else(|| {
+                                    SdkError::SnapshotViewInvalid {
+                                        vm_name: view_name.clone(),
+                                        reason: "the private child has no stable parent view"
+                                            .to_owned(),
+                                    }
+                                })?;
+                                view_disk.check_private_snapshot_view(
+                                    &view_home,
+                                    &view_name,
+                                    &view_rootfs,
+                                    parent,
+                                    &view_operation,
+                                )?;
+                            }
+                        }
                         Ok(())
-                    }
-                },
-                on_progress,
-            );
-            let cleanup_result = if snapshot_view.is_some() {
-                runtime_disk.remove_snapshot_view(&home, &vm_name, &rootfs_path)
-            } else {
-                Ok(())
-            };
-            match (archive_result, cleanup_result) {
-                (Ok(archive), Ok(())) => Ok(SnapshotResult {
-                    vm_name,
-                    output_path: archive.output_path,
-                    encrypted_size_bytes: archive.encrypted_size_bytes,
-                    source_was_running: running,
-                }),
-                (Err(primary), Ok(())) => Err(primary),
-                (Ok(archive), Err(cleanup)) => {
-                    let output_cleanup = fs::remove_file(&archive.output_path).err().map(|error| {
-                        SdkError::filesystem(
-                            "remove unpublished snapshot after cleanup failure",
+                    },
+                    on_progress,
+                )
+            })();
+
+            let mut cleanup_failures = Vec::new();
+            if private_dm_view.is_some() {
+                let parent_view =
+                    snapshot_view
+                        .as_deref()
+                        .ok_or_else(|| SdkError::SnapshotViewInvalid {
+                            vm_name: vm_name.clone(),
+                            reason: "the private child has no stable parent view during cleanup"
+                                .to_owned(),
+                        });
+                match parent_view.and_then(|parent| {
+                    runtime_disk.remove_private_snapshot_view(
+                        &home,
+                        &vm_name,
+                        &rootfs_path,
+                        parent,
+                        &snapshot_operation_id,
+                    )
+                }) {
+                    Ok(()) => {}
+                    Err(error) => cleanup_failures.push(error),
+                }
+            }
+            if let Some(path) = private_copy_path.as_ref()
+                && let Err(error) = fs::remove_file(path)
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                cleanup_failures.push(SdkError::filesystem(
+                    "remove private snapshot disk copy",
+                    path,
+                    error,
+                ));
+            }
+            if snapshot_view.is_some()
+                && let Err(error) = runtime_disk.remove_snapshot_view(&home, &vm_name, &rootfs_path)
+            {
+                cleanup_failures.push(error);
+            }
+
+            let staged_archive = match capture_result {
+                Ok(archive) if cleanup_failures.is_empty() => archive,
+                Ok(archive) => {
+                    if let Err(error) = fs::remove_file(&archive.output_path)
+                        && error.kind() != std::io::ErrorKind::NotFound
+                    {
+                        cleanup_failures.push(SdkError::filesystem(
+                            "remove unpublished staged snapshot",
                             &archive.output_path,
+                            error,
+                        ));
+                    }
+                    return Err(snapshot_cleanup_errors(
+                        SdkError::SnapshotArchive {
+                            operation: "clean up snapshot views",
+                            reason: "temporary disk resources could not be removed; the archive was not published".to_owned(),
+                        },
+                        cleanup_failures,
+                    ));
+                }
+                Err(primary) if cleanup_failures.is_empty() => return Err(primary),
+                Err(primary) => return Err(snapshot_cleanup_errors(primary, cleanup_failures)),
+            };
+            if token.is_cancelled() {
+                let primary = SdkError::SnapshotCancelled;
+                let cleanup = fs::remove_file(&staged_archive.output_path)
+                    .err()
+                    .map(|error| {
+                        SdkError::filesystem(
+                            "remove cancelled staged snapshot",
+                            &staged_archive.output_path,
                             error,
                         )
                     });
-                    Err(snapshot_cleanup_error(cleanup, output_cleanup))
-                }
-                (Err(primary), Err(cleanup)) => Err(snapshot_cleanup_error(primary, Some(cleanup))),
+                return Err(snapshot_cleanup_error(primary, cleanup));
             }
+            let archive =
+                age_tar_zstd::publish_staged_archive(staged_archive, &requested_output_path)?;
+            Ok(SnapshotResult {
+                vm_name,
+                output_path: archive.output_path,
+                encrypted_size_bytes: archive.encrypted_size_bytes,
+                source_was_running: running,
+            })
         });
         let result = worker.await?;
         drop(future_cancellation);
@@ -1465,6 +1727,10 @@ impl MicroVmSdk {
             mode: expected_mode,
             guest_mac: persisted_network_ref.guest_mac.clone(),
             lan_address_override: None,
+            guest_address_override: None,
+            prefix_length_override: None,
+            gateway_override: None,
+            exact_network_values: false,
         };
         let used_addresses = self
             .run_repository(|repository| repository.list_host_only_networks())
@@ -2456,6 +2722,10 @@ impl MicroVmSdk {
             mode: expected_mode,
             guest_mac: persisted_network.guest_mac.clone(),
             lan_address_override: None,
+            guest_address_override: None,
+            prefix_length_override: None,
+            gateway_override: None,
+            exact_network_values: false,
         };
         let used_addresses = self
             .run_repository(|repository| repository.list_host_only_networks())
@@ -3129,6 +3399,10 @@ impl MicroVmSdk {
             },
             guest_mac,
             lan_address_override: validated.request.lan_address,
+            guest_address_override: None,
+            prefix_length_override: None,
+            gateway_override: None,
+            exact_network_values: false,
         };
         let used_addresses = match self
             .run_repository(|repository| repository.list_host_only_networks())
@@ -4289,7 +4563,6 @@ fn validate_persisted_network(stored: &StoredMicroVm) -> Result<(), SdkError> {
         NetworkMode::HostOnly => {
             if !host_only_addresses_are_consistent(network)
                 || network.config.prefix_length != 30
-                || network.config.gateway != network.host_address
                 || network.config.bridge_name.is_some()
                 || network.config.uplink_name.is_some()
                 || network.dhcp_lease_reference.is_some()
@@ -4321,18 +4594,19 @@ fn validate_persisted_network(stored: &StoredMicroVm) -> Result<(), SdkError> {
 }
 
 fn host_only_addresses_are_consistent(network: &PersistedNetwork) -> bool {
-    let (Some(IpAddr::V4(host)), IpAddr::V4(guest), Some(IpAddr::V4(gateway))) = (
-        network.host_address,
-        network.config.guest_address,
-        network.config.gateway,
-    ) else {
+    let (Some(IpAddr::V4(host)), IpAddr::V4(guest)) =
+        (network.host_address, network.config.guest_address)
+    else {
         return false;
     };
     let host = u32::from(host);
     let guest = u32::from(guest);
-    let gateway = u32::from(gateway);
     let network_base = host & !3;
-    gateway == host
+    let gateway_matches_host = network
+        .config
+        .gateway
+        .is_none_or(|gateway| matches!(gateway, IpAddr::V4(address) if u32::from(address) == host));
+    gateway_matches_host
         && guest & !3 == network_base
         && host == network_base + 1
         && guest == network_base + 2
@@ -4962,9 +5236,13 @@ mod tests {
     use std::io::{BufReader, Read};
     use std::net::{IpAddr, Ipv4Addr};
     use std::path::{Path, PathBuf};
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
 
+    use crate::adapters::archive::age_tar_zstd::{
+        SnapshotArchiveInput, SnapshotPayload, SnapshotPortableMetadata, create_archive,
+    };
+    use crate::adapters::credentials::ed25519::Ed25519CredentialStore;
     use age::secrecy::SecretString;
     use sha2::{Digest, Sha256};
     use tempfile::tempdir;
@@ -4976,15 +5254,16 @@ mod tests {
         NetworkConfiguration, NetworkResource, PersistedCredential, PersistedNetwork,
         PersistedNetworkResource, PersistedRuntime, TOTAL_CREATION_STEPS,
     };
-    use crate::domain::registry::TaumaruRegistry;
-    use crate::domain::snapshot::SnapshotCancellation;
+    use crate::domain::registry::{Architecture, Kernel, TaumaruRegistry};
+    use crate::domain::restore::{RestoreCancellation, RestoreProgressStage, RestoreRequest};
+    use crate::domain::snapshot::{SnapshotAddressPolicy, SnapshotCancellation};
     use crate::error::SdkError;
     use crate::ports::artifacts::{ArtifactSource, RegistryFuture};
     use crate::ports::credentials::{CredentialStore, GeneratedCredential};
     use crate::ports::network::{
         LanAddressOffer, NetworkController, NetworkOutcome, NetworkRequest, UplinkIdentity,
     };
-    use crate::ports::repository::InventoryState;
+    use crate::ports::repository::{InventoryState, RestoreJournal};
     use crate::ports::runtime::RuntimeController;
     use crate::ports::storage::{GuestStorage, PreparedRootfs};
 
@@ -5101,10 +5380,14 @@ mod tests {
         }
     }
 
+    type WrittenIpv4Config = (Ipv4Addr, u8, Option<Ipv4Addr>, Option<Ipv4Addr>);
+
     #[derive(Default)]
     struct TestStorage {
         prepare_calls: AtomicUsize,
         inject_calls: AtomicUsize,
+        private_sanitize_calls: AtomicUsize,
+        written_ipv4_configs: Mutex<Vec<WrittenIpv4Config>>,
     }
 
     impl GuestStorage for TestStorage {
@@ -5200,6 +5483,82 @@ mod tests {
                     reason: "test rootfs is missing".to_owned(),
                 });
             }
+            Ok(())
+        }
+
+        fn write_guest_ipv4_config(
+            &self,
+            rootfs_path: &Path,
+            guest_address: Ipv4Addr,
+            prefix_length: u8,
+            gateway: Option<Ipv4Addr>,
+            lan_address: Option<Ipv4Addr>,
+        ) -> Result<(), SdkError> {
+            if !rootfs_path.is_file() {
+                return Err(SdkError::GuestFilesystem {
+                    operation: "write test restored network unit".to_owned(),
+                    path: rootfs_path.to_path_buf(),
+                    reason: "test rootfs is missing".to_owned(),
+                });
+            }
+            self.written_ipv4_configs
+                .lock()
+                .expect("test restored network lock")
+                .push((guest_address, prefix_length, gateway, lan_address));
+            Ok(())
+        }
+
+        fn prepare_private_snapshot_view(&self, rootfs_path: &Path) -> Result<(), SdkError> {
+            if !rootfs_path.is_file() {
+                return Err(SdkError::SnapshotSanitization {
+                    path: rootfs_path.to_path_buf(),
+                    reason: "private test root disk is missing".to_owned(),
+                });
+            }
+            self.private_sanitize_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+
+        fn copy_rootfs_exact(
+            &self,
+            source: &Path,
+            destination: &Path,
+            size_bytes: u64,
+            cancellation: tokio_util::sync::CancellationToken,
+            on_copy_progress: &mut dyn FnMut(u64, u64),
+        ) -> Result<(), SdkError> {
+            if cancellation.is_cancelled() {
+                return Err(SdkError::SnapshotCancelled);
+            }
+            let metadata = fs::metadata(source).map_err(|error| {
+                SdkError::filesystem("inspect test stable root disk", source, error)
+            })?;
+            if metadata.len() != size_bytes {
+                return Err(SdkError::SnapshotArchive {
+                    operation: "copy test stable root disk",
+                    reason: "the disk size does not match the fixture".to_owned(),
+                });
+            }
+            let bytes = fs::read(source).map_err(|error| {
+                SdkError::filesystem("read test stable root disk", source, error)
+            })?;
+            let mut options = OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut output = options.open(destination).map_err(|error| {
+                SdkError::filesystem("create test private disk copy", destination, error)
+            })?;
+            std::io::Write::write_all(&mut output, &bytes).map_err(|error| {
+                SdkError::filesystem("write test private disk copy", destination, error)
+            })?;
+            output.sync_all().map_err(|error| {
+                SdkError::filesystem("sync test private disk copy", destination, error)
+            })?;
+            on_copy_progress(size_bytes, size_bytes);
             Ok(())
         }
     }
@@ -5331,14 +5690,28 @@ mod tests {
     fn test_configure_host_only(request: &NetworkRequest) -> Result<NetworkOutcome, SdkError> {
         let digest = Sha256::digest(request.vm_name.as_bytes());
         let third_octet = digest[0] & 0xfc;
-        let host = Ipv4Addr::new(10, 200, third_octet, 1);
-        let guest = Ipv4Addr::new(10, 200, third_octet, 2);
+        let default_host = Ipv4Addr::new(10, 200, third_octet, 1);
+        let guest =
+            request
+                .guest_address_override
+                .unwrap_or(Ipv4Addr::new(10, 200, third_octet, 2));
+        let host = if request.exact_network_values {
+            Ipv4Addr::from((u32::from(guest) & !3) + 1)
+        } else {
+            default_host
+        };
+        let gateway = if request.exact_network_values {
+            request.gateway_override
+        } else {
+            Some(host)
+        };
+        let prefix_length = request.prefix_length_override.unwrap_or(30);
         let tap_name = format!("tap-{}", request.vm_name);
         let config = NetworkConfiguration {
             mode: NetworkMode::HostOnly,
             guest_address: IpAddr::V4(guest),
-            prefix_length: 30,
-            gateway: Some(IpAddr::V4(host)),
+            prefix_length,
+            gateway: gateway.map(IpAddr::V4),
             tap_name: tap_name.clone(),
             bridge_name: None,
             uplink_name: None,
@@ -5374,7 +5747,10 @@ mod tests {
                 host_address: Some(IpAddr::V4(host)),
                 guest_mac: request.guest_mac.clone(),
                 dhcp_lease_reference: None,
-                desired_boot_parameters: format!("ip={guest}::{host}:255.255.255.252::eth0:off"),
+                desired_boot_parameters: format!(
+                    "ip={guest}::{}:255.255.255.252::eth0:off",
+                    gateway.map(|value| value.to_string()).unwrap_or_default()
+                ),
                 resources,
                 uplink_cidr: None,
                 proxy_arp_enabled_by_sdk: false,
@@ -5403,8 +5779,22 @@ mod tests {
     fn test_configure_lan(request: &NetworkRequest) -> Result<NetworkOutcome, SdkError> {
         let digest = Sha256::digest(request.vm_name.as_bytes());
         let third_octet = digest[0] & 0xfc;
-        let host = Ipv4Addr::new(10, 200, third_octet, 1);
-        let guest = Ipv4Addr::new(10, 200, third_octet, 2);
+        let default_host = Ipv4Addr::new(10, 200, third_octet, 1);
+        let guest =
+            request
+                .guest_address_override
+                .unwrap_or(Ipv4Addr::new(10, 200, third_octet, 2));
+        let host = if request.exact_network_values {
+            Ipv4Addr::from((u32::from(guest) & !3) + 1)
+        } else {
+            default_host
+        };
+        let gateway = if request.exact_network_values {
+            request.gateway_override
+        } else {
+            Some(host)
+        };
+        let prefix_length = request.prefix_length_override.unwrap_or(30);
         let lan = request
             .lan_address_override
             .unwrap_or_else(|| Ipv4Addr::new(192, 168, 3, 50 + (digest[1] % 100)));
@@ -5413,8 +5803,8 @@ mod tests {
         let config = NetworkConfiguration {
             mode: NetworkMode::Lan,
             guest_address: IpAddr::V4(guest),
-            prefix_length: 30,
-            gateway: Some(IpAddr::V4(host)),
+            prefix_length,
+            gateway: gateway.map(IpAddr::V4),
             tap_name: tap_name.clone(),
             bridge_name: None,
             uplink_name: Some(uplink.to_owned()),
@@ -5856,6 +6246,719 @@ mod tests {
                 (name, bytes)
             })
             .collect()
+    }
+
+    fn create_restore_archive(
+        directory: &Path,
+        vm_name: &str,
+        policy: SnapshotAddressPolicy,
+    ) -> PathBuf {
+        create_restore_archive_with_gateway(
+            directory,
+            vm_name,
+            policy,
+            Some(Ipv4Addr::new(192, 0, 2, 1)),
+        )
+    }
+
+    fn create_restore_archive_with_gateway(
+        directory: &Path,
+        vm_name: &str,
+        policy: SnapshotAddressPolicy,
+        guest_gateway_ipv4: Option<Ipv4Addr>,
+    ) -> PathBuf {
+        let source_directory = directory.join(format!("archive-source-{vm_name}"));
+        fs::create_dir_all(&source_directory).expect("archive source directory should be created");
+        let rootfs_path = source_directory.join("rootfs.ext4");
+        let kernel_path = source_directory.join("vmlinux");
+        fs::write(&rootfs_path, b"fixture rootfs").expect("root disk should be written");
+        fs::write(&kernel_path, b"kernel!").expect("kernel should be written");
+        let generated = Ed25519CredentialStore
+            .generate(&source_directory)
+            .expect("valid Ed25519 keys should be generated");
+        let kernel_bytes = fs::read(&kernel_path).expect("kernel fixture should read");
+        let network_metadata = SnapshotPortableMetadata {
+            guest_architecture: "x86_64".to_owned(),
+            distribution_id: "alpine-test-1.0".to_owned(),
+            distribution_name: "Alpine Test".to_owned(),
+            distribution_version: "1.0".to_owned(),
+            image_id: "alpine-test-minimal".to_owned(),
+            image_sha256: "a".repeat(64),
+            kernel: Kernel {
+                id: "restored-kernel-x86_64".to_owned(),
+                name: "Restored Linux Kernel".to_owned(),
+                display_name: "Restored Linux Kernel".to_owned(),
+                version: "6.1.0".to_owned(),
+                architecture: Architecture::X86_64,
+                path: "kernels/restored-kernel-x86_64/vmlinux".to_owned(),
+                url: "https://registry.example.test/kernels/restored-kernel-x86_64/vmlinux"
+                    .to_owned(),
+                filename: "vmlinux".to_owned(),
+                size_bytes: kernel_bytes.len() as u64,
+                sha256: hex_digest(Sha256::digest(&kernel_bytes)),
+                format: "elf".to_owned(),
+                mime_type: "application/octet-stream".to_owned(),
+                elf: None,
+                modified_at: "2026-01-01T00:00:00Z".to_owned(),
+            },
+            disk_size_bytes: 14,
+            memory_bytes: 128 * 1024 * 1024,
+            memory_effective_mib: 128,
+            vcpu_count: 1,
+            root_device: "/dev/vda".to_owned(),
+            kernel_args: vec!["console=ttyS0".to_owned()],
+            address_policy: policy,
+            network_mode: "host_only".to_owned(),
+            expose_on_lan: false,
+            guest_ipv4: Some(Ipv4Addr::new(192, 0, 2, 2)),
+            prefix_length: Some(30),
+            guest_gateway_ipv4,
+            lan_ipv4: None,
+            guest_mac: crate::adapters::network::linux::guest_mac(vm_name),
+            ssh_user: "root".to_owned(),
+            ssh_port: 22,
+            ssh_key_type: "ed25519".to_owned(),
+            ssh_public_key_fingerprint: generated.fingerprint,
+        };
+        let output_path = directory.join(format!("{vm_name}.tmvmsnap"));
+        let input = SnapshotArchiveInput {
+            vm_name: vm_name.to_owned(),
+            output_path: output_path.clone(),
+            password: "restore-fixture-password".to_owned(),
+            metadata: network_metadata.clone(),
+            payloads: vec![
+                SnapshotPayload {
+                    archive_path: "payload/rootfs.ext4",
+                    source_path: rootfs_path,
+                    mode: 0o600,
+                    expected_size_bytes: Some(network_metadata.disk_size_bytes),
+                    expected_sha256: None,
+                },
+                SnapshotPayload {
+                    archive_path: "payload/kernel/vmlinux",
+                    source_path: kernel_path,
+                    mode: 0o644,
+                    expected_size_bytes: Some(network_metadata.kernel.size_bytes),
+                    expected_sha256: Some(network_metadata.kernel.sha256.clone()),
+                },
+                SnapshotPayload {
+                    archive_path: "payload/ssh/id_ed25519",
+                    source_path: generated.private_key_path,
+                    mode: 0o600,
+                    expected_size_bytes: None,
+                    expected_sha256: None,
+                },
+                SnapshotPayload {
+                    archive_path: "payload/ssh/id_ed25519.pub",
+                    source_path: generated.public_key_path,
+                    mode: 0o644,
+                    expected_size_bytes: None,
+                    expected_sha256: None,
+                },
+            ],
+        };
+        create_archive(input, tokio_util::sync::CancellationToken::new(), || Ok(()))
+            .expect("valid encrypted restore fixture should be written");
+        output_path
+    }
+
+    #[tokio::test]
+    async fn restores_both_ipv4_policies_with_local_paths_and_stopped_inventory() {
+        for (vm_name, policy) in [
+            ("restored_preserve", SnapshotAddressPolicy::PreserveIpv4),
+            ("restored_regenerate", SnapshotAddressPolicy::RegenerateIpv4),
+        ] {
+            let (sdk, directory, storage, _credentials, _network, _runtime) = test_sdk(false);
+            let archive_path = create_restore_archive(directory.path(), vm_name, policy);
+            let restore_progress = Arc::new(Mutex::new(Vec::new()));
+            let callback_progress = Arc::clone(&restore_progress);
+            let result = sdk
+                .restore_snapshot_with_progress(
+                    RestoreRequest {
+                        archive_path: archive_path.clone(),
+                        password: "restore-fixture-password".to_owned(),
+                    },
+                    move |event| {
+                        callback_progress
+                            .lock()
+                            .expect("restore progress lock")
+                            .push(event);
+                    },
+                )
+                .await
+                .expect("snapshot restore should complete");
+
+            assert_eq!(result.vm_name, vm_name);
+            assert_eq!(result.state, MicroVmState::Stopped);
+            assert_eq!(result.address_policy, policy);
+            {
+                let progress = restore_progress.lock().expect("restore progress lock");
+                assert!(
+                    progress
+                        .iter()
+                        .any(|event| event.stage == RestoreProgressStage::Staging)
+                );
+                assert!(
+                    progress
+                        .iter()
+                        .any(|event| event.stage == RestoreProgressStage::Completed)
+                );
+            }
+            assert_eq!(
+                fs::read(&result.rootfs_path).expect("restored root disk should read"),
+                b"fixture rootfs"
+            );
+            assert_eq!(
+                fs::read(&result.kernel_path).expect("restored kernel should read"),
+                b"kernel!"
+            );
+            let private_key_metadata =
+                fs::metadata(&result.ssh.private_key_path).expect("private key metadata");
+            assert!(private_key_metadata.len() > 0);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                assert_eq!(private_key_metadata.permissions().mode() & 0o777, 0o600);
+            }
+            assert!(
+                fs::read_to_string(&result.ssh.public_key_path)
+                    .expect("public key should read")
+                    .starts_with("ssh-ed25519 ")
+            );
+            assert_eq!(result.network.mode, NetworkMode::HostOnly);
+            assert_eq!(result.ssh.address, result.network.guest_address);
+            match policy {
+                SnapshotAddressPolicy::PreserveIpv4 => {
+                    assert_eq!(
+                        result.network.guest_address,
+                        IpAddr::V4(Ipv4Addr::new(192, 0, 2, 2))
+                    );
+                    assert_eq!(
+                        result.network.gateway,
+                        Some(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)))
+                    );
+                    assert_eq!(result.network.prefix_length, 30);
+                }
+                SnapshotAddressPolicy::RegenerateIpv4 => {
+                    assert_ne!(
+                        result.network.guest_address,
+                        IpAddr::V4(Ipv4Addr::new(192, 0, 2, 2))
+                    );
+                    assert_eq!(result.network.prefix_length, 30);
+                }
+            }
+            let summaries = sdk
+                .list_microvms()
+                .await
+                .expect("restored VM should be discoverable");
+            assert_eq!(summaries.len(), 1);
+            assert_eq!(summaries[0].name, vm_name);
+            assert_eq!(summaries[0].state, MicroVmState::Stopped);
+            let kernel = sdk
+                .repository
+                .resolve_kernel("restored-kernel-x86_64")
+                .expect("embedded kernel should be registered for start");
+            assert_eq!(kernel.path, result.kernel_path);
+            assert_eq!(
+                fs::read(&kernel.path).expect("kernel inventory path should resolve"),
+                b"kernel!"
+            );
+            let stored = sdk
+                .repository
+                .find_microvm(vm_name)
+                .expect("restored inventory should resolve")
+                .expect("restored MicroVM should be committed");
+            assert_eq!(stored.record.distribution_id, "alpine-test-1.0");
+            assert_eq!(stored.record.image_id, "alpine-test-minimal");
+            assert_eq!(stored.record.kernel_id, "restored-kernel-x86_64");
+            assert_eq!(stored.record.disk_size_bytes, 14);
+            assert_eq!(stored.record.memory_bytes, 128 * 1024 * 1024);
+            assert_eq!(stored.record.memory_effective_mib, 128);
+            assert_eq!(stored.record.vcpu_count, 1);
+            assert!(!stored.record.expose_on_lan);
+            let restored_network = stored.network.as_ref().expect("restored network record");
+            assert_eq!(
+                restored_network.guest_mac,
+                crate::adapters::network::linux::guest_mac(vm_name)
+            );
+            assert_eq!(
+                stored
+                    .runtime
+                    .as_ref()
+                    .map(|runtime| runtime.process_state.as_str()),
+                Some("stopped")
+            );
+            assert_eq!(
+                stored
+                    .runtime
+                    .as_ref()
+                    .and_then(|runtime| runtime.process_id),
+                None
+            );
+            let credential = stored.credential.as_ref().expect("restored SSH metadata");
+            assert_eq!(credential.ssh_user, "root");
+            assert_eq!(credential.ssh_port, 22);
+            assert_eq!(credential.key_type, "ed25519");
+            assert_eq!(credential.private_key_path, result.ssh.private_key_path);
+            assert_eq!(credential.public_key_path, result.ssh.public_key_path);
+            assert_eq!(result.ssh.user, "root");
+            assert_eq!(result.ssh.port, 22);
+            assert_eq!(
+                storage
+                    .written_ipv4_configs
+                    .lock()
+                    .expect("test restored network lock")
+                    .last()
+                    .copied(),
+                Some((
+                    match result.network.guest_address {
+                        IpAddr::V4(address) => address,
+                        IpAddr::V6(_) => panic!("restore only supports IPv4"),
+                    },
+                    result.network.prefix_length,
+                    match result.network.gateway {
+                        Some(IpAddr::V4(address)) => Some(address),
+                        None => None,
+                        Some(IpAddr::V6(_)) => panic!("restore only supports IPv4"),
+                    },
+                    match result.network.lan_address {
+                        Some(IpAddr::V4(address)) => Some(address),
+                        None => None,
+                        Some(IpAddr::V6(_)) => panic!("restore only supports IPv4"),
+                    },
+                ))
+            );
+            let metadata = sdk
+                .repository
+                .snapshot_metadata(vm_name)
+                .expect("restored boot metadata should resolve");
+            assert_eq!(metadata.distribution_name, "Alpine Test");
+            assert_eq!(metadata.distribution_version, "1.0");
+            assert_eq!(metadata.root_device, "/dev/vda");
+            assert_eq!(metadata.kernel_args, ["console=ttyS0"]);
+            assert_eq!(metadata.image_sha256, "a".repeat(64));
+            assert_eq!(metadata.guest_architecture, "x86_64");
+            let started = sdk
+                .start_microvm(vm_name)
+                .await
+                .expect("the ordinary start path should resolve the restored kernel");
+            assert_eq!(started.state, MicroVmState::Running);
+            let stopped = sdk
+                .stop_microvm(vm_name)
+                .await
+                .expect("the restored test VM should stop cleanly");
+            assert_eq!(stopped.state, MicroVmState::Stopped);
+        }
+    }
+
+    #[tokio::test]
+    async fn preserve_restore_without_guest_gateway_remains_startable() {
+        let (sdk, directory, _storage, _credentials, _network, _runtime) = test_sdk(false);
+        let archive_path = create_restore_archive_with_gateway(
+            directory.path(),
+            "restore_without_gateway",
+            SnapshotAddressPolicy::PreserveIpv4,
+            None,
+        );
+        let restored = sdk
+            .restore_snapshot(RestoreRequest {
+                archive_path,
+                password: "restore-fixture-password".to_owned(),
+            })
+            .await
+            .expect("restore without a guest gateway should succeed");
+        assert_eq!(restored.network.gateway, None);
+        let stored = sdk
+            .repository
+            .find_microvm("restore_without_gateway")
+            .expect("restored inventory should resolve")
+            .expect("restored VM should exist");
+        assert!(
+            stored
+                .network
+                .as_ref()
+                .expect("network row")
+                .host_address
+                .is_some()
+        );
+        assert_eq!(
+            stored.network.as_ref().expect("network row").config.gateway,
+            None
+        );
+        assert_eq!(
+            sdk.start_microvm("restore_without_gateway")
+                .await
+                .expect("restored VM should pass ordinary start validation")
+                .state,
+            MicroVmState::Running
+        );
+        assert_eq!(
+            sdk.stop_microvm("restore_without_gateway")
+                .await
+                .expect("test VM should stop")
+                .state,
+            MicroVmState::Stopped
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_rejects_a_preserved_mac_used_by_another_vm() {
+        let (sdk, directory, _storage, _credentials, network, _runtime) = test_sdk(false);
+        let archived_name = "restore_duplicate_mac";
+        let existing = start_fixture_vm(&sdk, "existing_mac_owner", false, None);
+        let mut existing_network = existing
+            .network
+            .expect("existing fixture should have network metadata");
+        existing_network.guest_mac = crate::adapters::network::linux::guest_mac(archived_name);
+        sdk.repository
+            .persist_network(existing.record.id, &existing_network)
+            .expect("duplicate MAC fixture should be persisted");
+        let archive_path = create_restore_archive(
+            directory.path(),
+            archived_name,
+            SnapshotAddressPolicy::PreserveIpv4,
+        );
+
+        let error = sdk
+            .restore_snapshot(RestoreRequest {
+                archive_path,
+                password: "restore-fixture-password".to_owned(),
+            })
+            .await
+            .expect_err("an archived MAC already used by another VM should conflict");
+
+        assert!(matches!(
+            error,
+            SdkError::SnapshotNetworkConflict { ref field, .. } if field == "guest MAC"
+        ));
+        assert!(
+            !directory.path().join("vms").join(archived_name).exists(),
+            "the conflicting restore must not install a VM volume"
+        );
+        assert_eq!(network.cleanup_calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn concurrent_restore_attempts_for_one_name_publish_only_one_vm() {
+        let (sdk, directory, _storage, _credentials, _network, _runtime) = test_sdk(false);
+        let vm_name = "restore_concurrent";
+        let archive_path = create_restore_archive(
+            directory.path(),
+            vm_name,
+            SnapshotAddressPolicy::RegenerateIpv4,
+        );
+        let request = || RestoreRequest {
+            archive_path: archive_path.clone(),
+            password: "restore-fixture-password".to_owned(),
+        };
+
+        let (first, second) = tokio::join!(
+            sdk.restore_snapshot(request()),
+            sdk.restore_snapshot(request())
+        );
+        let results = [first, second];
+        assert_eq!(
+            results.iter().filter(|result| result.is_ok()).count(),
+            1,
+            "exactly one concurrent restore may publish the VM"
+        );
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(result, Err(SdkError::RestoreConflict { .. })))
+                .count(),
+            1,
+            "the serialized restore must observe the name conflict"
+        );
+        assert_eq!(
+            sdk.list_microvms()
+                .await
+                .expect("inventory should remain readable")
+                .iter()
+                .filter(|vm| vm.name == vm_name)
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_rejects_an_unregistered_kernel_path_without_removing_it() {
+        let (sdk, directory, _storage, _credentials, network, _runtime) = test_sdk(false);
+        let vm_name = "restore_kernel_path_conflict";
+        let archive_path = create_restore_archive(
+            directory.path(),
+            vm_name,
+            SnapshotAddressPolicy::RegenerateIpv4,
+        );
+        let occupied_kernel = directory
+            .path()
+            .join("artifacts")
+            .join("kernels")
+            .join("restored-kernel-x86_64")
+            .join("vmlinux");
+        fs::create_dir_all(occupied_kernel.parent().expect("kernel parent"))
+            .expect("kernel directory should be created");
+        fs::write(&occupied_kernel, b"pre-existing kernel")
+            .expect("pre-existing kernel should be written");
+
+        let error = sdk
+            .restore_snapshot(RestoreRequest {
+                archive_path,
+                password: "restore-fixture-password".to_owned(),
+            })
+            .await
+            .expect_err("unregistered kernel path should conflict");
+
+        assert!(matches!(
+            error,
+            SdkError::RestoreConflict { ref resource, .. } if resource == "kernel path"
+        ));
+        assert_eq!(
+            fs::read(&occupied_kernel).expect("pre-existing kernel should survive"),
+            b"pre-existing kernel"
+        );
+        assert!(
+            sdk.list_microvms()
+                .await
+                .expect("inventory should read")
+                .is_empty()
+        );
+        assert_eq!(network.delete_cleanup_calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn restore_with_unavailable_runtime_does_not_create_destination_state() {
+        let (sdk, directory, _storage, _credentials, network, runtime) = test_sdk(false);
+        *runtime.fail_host.lock().expect("test host lock") = true;
+        let archive_path = create_restore_archive(
+            directory.path(),
+            "restore_runtime_unavailable",
+            SnapshotAddressPolicy::RegenerateIpv4,
+        );
+
+        let error = sdk
+            .restore_snapshot(RestoreRequest {
+                archive_path,
+                password: "restore-fixture-password".to_owned(),
+            })
+            .await
+            .expect_err("unavailable local runtime should fail");
+
+        assert!(matches!(error, SdkError::RuntimeIncompatible { .. }));
+        assert!(
+            !directory
+                .path()
+                .join("vms")
+                .join("restore_runtime_unavailable")
+                .exists()
+        );
+        assert!(
+            sdk.list_microvms()
+                .await
+                .expect("inventory should read")
+                .is_empty()
+        );
+        assert_eq!(network.delete_cleanup_calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn restore_rejects_an_existing_name_without_replacing_inventory_or_files() {
+        let (sdk, directory, _storage, _credentials, _network, _runtime) = test_sdk(false);
+        let archive_path = create_restore_archive(
+            directory.path(),
+            "restore_conflict",
+            SnapshotAddressPolicy::RegenerateIpv4,
+        );
+        let restored = sdk
+            .restore_snapshot(RestoreRequest {
+                archive_path: archive_path.clone(),
+                password: "restore-fixture-password".to_owned(),
+            })
+            .await
+            .expect("first restore should succeed");
+        let rootfs_before = fs::read(&restored.rootfs_path).expect("root disk before retry");
+
+        let error = sdk
+            .restore_snapshot(RestoreRequest {
+                archive_path,
+                password: "restore-fixture-password".to_owned(),
+            })
+            .await
+            .expect_err("duplicate VM name should be rejected");
+
+        assert!(matches!(error, SdkError::RestoreConflict { .. }));
+        assert_eq!(
+            fs::read(&restored.rootfs_path).expect("root disk after retry"),
+            rootfs_before
+        );
+        let machines = sdk
+            .list_microvms()
+            .await
+            .expect("inventory should remain readable");
+        assert_eq!(machines.len(), 1);
+        assert_eq!(machines[0].name, "restore_conflict");
+    }
+
+    #[tokio::test]
+    async fn restore_rejects_an_occupied_volume_path_without_touching_its_contents() {
+        let (sdk, directory, _storage, _credentials, network, _runtime) = test_sdk(false);
+        let vm_name = "restore_path_conflict";
+        let archive_path = create_restore_archive(
+            directory.path(),
+            vm_name,
+            SnapshotAddressPolicy::RegenerateIpv4,
+        );
+        let occupied_volume = directory.path().join("vms").join(vm_name);
+        fs::create_dir_all(&occupied_volume).expect("occupied VM path should be created");
+        let marker = occupied_volume.join("keep.txt");
+        fs::write(&marker, b"pre-existing").expect("marker should be written");
+
+        let error = sdk
+            .restore_snapshot(RestoreRequest {
+                archive_path,
+                password: "restore-fixture-password".to_owned(),
+            })
+            .await
+            .expect_err("occupied destination path should be rejected");
+
+        assert!(matches!(error, SdkError::RestoreConflict { .. }));
+        assert_eq!(
+            fs::read(&marker).expect("existing marker must survive"),
+            b"pre-existing"
+        );
+        assert!(
+            sdk.list_microvms()
+                .await
+                .expect("inventory should read")
+                .is_empty()
+        );
+        assert_eq!(network.delete_cleanup_calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn reopening_the_sdk_reconciles_journaled_restore_files_before_retry() {
+        let (initial_sdk, directory, storage, credentials, network, runtime) = test_sdk(false);
+        let home = directory.path();
+        let vm_name = "restore_recovery_retry";
+        let staging_path = home
+            .join("tmp")
+            .join("restores")
+            .join("restore-interrupted");
+        let volume_path = home.join("vms").join(vm_name);
+        let kernel_path = home
+            .join("artifacts")
+            .join("kernels")
+            .join("interrupted-kernel")
+            .join("vmlinux");
+        fs::create_dir_all(&staging_path).expect("stale staging path should be created");
+        fs::write(staging_path.join("partial"), b"partial payload")
+            .expect("staged partial should be written");
+        fs::create_dir_all(&volume_path).expect("stale volume should be created");
+        fs::write(volume_path.join("rootfs.ext4"), b"partial disk")
+            .expect("partial disk should be written");
+        fs::create_dir_all(kernel_path.parent().expect("kernel parent"))
+            .expect("kernel cache directory should be created");
+        fs::write(&kernel_path, b"partial kernel").expect("partial kernel should be written");
+        initial_sdk
+            .repository
+            .record_restore_journal(&RestoreJournal {
+                operation_id: "restore-interrupted-operation".to_owned(),
+                vm_name: vm_name.to_owned(),
+                staging_path: staging_path.clone(),
+                volume_path: volume_path.clone(),
+                volume_created: true,
+                kernel_path: kernel_path.clone(),
+                kernel_created: true,
+                network: None,
+                progress_state: "volume_created".to_owned(),
+            })
+            .expect("interrupted restore journal should be durable");
+        drop(initial_sdk);
+
+        let mut sdk = MicroVmSdk::new(home).expect("reopened SDK should load local inventory");
+        sdk.registry = Arc::new(TestArtifactSource {
+            manifest: fixture_manifest(),
+        });
+        sdk.storage = storage;
+        sdk.credentials = credentials;
+        sdk.network = network;
+        sdk.runtime = runtime.clone();
+        sdk.runtime_disk = runtime;
+        let archive_path =
+            create_restore_archive(home, vm_name, SnapshotAddressPolicy::RegenerateIpv4);
+
+        let restored = sdk
+            .restore_snapshot(RestoreRequest {
+                archive_path,
+                password: "restore-fixture-password".to_owned(),
+            })
+            .await
+            .expect("retry should succeed after recovery");
+
+        assert!(!staging_path.exists());
+        assert!(volume_path.join("rootfs.ext4").is_file());
+        assert!(
+            !kernel_path.exists(),
+            "interrupted kernel should be removed"
+        );
+        assert_eq!(
+            fs::read(&restored.kernel_path).expect("restored kernel"),
+            b"kernel!"
+        );
+        assert!(
+            sdk.repository
+                .list_restore_journals(vm_name)
+                .expect("journal query")
+                .is_empty()
+        );
+        assert_eq!(
+            sdk.list_microvms()
+                .await
+                .expect("restored inventory should resolve")[0]
+                .state,
+            MicroVmState::Stopped
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_restore_removes_its_staged_payloads_before_returning() {
+        let (sdk, directory, _storage, _credentials, _network, _runtime) = test_sdk(false);
+        let archive_path = create_restore_archive(
+            directory.path(),
+            "restore_cancelled",
+            SnapshotAddressPolicy::RegenerateIpv4,
+        );
+        let cancellation = RestoreCancellation::new();
+        cancellation.cancel();
+
+        let error = sdk
+            .restore_snapshot_with_cancellation_and_progress(
+                RestoreRequest {
+                    archive_path,
+                    password: "restore-fixture-password".to_owned(),
+                },
+                cancellation,
+                |_| {},
+            )
+            .await
+            .expect_err("cancelled restore should stop");
+
+        assert!(matches!(error, SdkError::RestoreCancelled));
+        let staging_root = directory.path().join("tmp").join("restores");
+        if staging_root.exists() {
+            assert!(
+                fs::read_dir(staging_root)
+                    .expect("staging root should be readable")
+                    .next()
+                    .is_none()
+            );
+        }
+        assert!(
+            sdk.list_microvms()
+                .await
+                .expect("inventory should read")
+                .is_empty()
+        );
     }
 
     fn fixture_manifest() -> TaumaruRegistry {
@@ -6644,7 +7747,12 @@ mod tests {
         let output = directory.path().join("stopped.tmvmsnap");
 
         let result = sdk
-            .create_snapshot("stopped_snapshot", &output, "snapshot-passphrase")
+            .create_snapshot(
+                "stopped_snapshot",
+                &output,
+                "snapshot-passphrase",
+                SnapshotAddressPolicy::PreserveIpv4,
+            )
             .await
             .expect("stopped VM snapshot should succeed");
 
@@ -6708,11 +7816,107 @@ mod tests {
             sdk.create_snapshot(
                 "stopped_snapshot",
                 &result.output_path,
-                "snapshot-passphrase"
+                "snapshot-passphrase",
+                SnapshotAddressPolicy::PreserveIpv4
             )
             .await,
             Err(SdkError::SnapshotOutputExists { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn regenerate_policy_sanitizes_only_a_private_copy_before_publication() {
+        let (sdk, directory, storage, _credentials, _network, _runtime) = test_sdk(false);
+        let stored = start_fixture_vm(&sdk, "regenerate_snapshot", false, None);
+        let original_disk = fs::read(&stored.record.rootfs_path).expect("source disk should read");
+        let output = directory.path().join("regenerate.tmvmsnap");
+
+        sdk.create_snapshot(
+            "regenerate_snapshot",
+            &output,
+            "snapshot-passphrase",
+            SnapshotAddressPolicy::RegenerateIpv4,
+        )
+        .await
+        .expect("regenerate snapshot should use a private disk copy");
+
+        assert_eq!(
+            fs::read(&stored.record.rootfs_path).expect("source disk should remain"),
+            original_disk
+        );
+        assert_eq!(storage.private_sanitize_calls.load(Ordering::Relaxed), 1);
+        let members = decrypt_snapshot_members(&output, "snapshot-passphrase");
+        assert_eq!(members[0].1, original_disk);
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&members[4].1).expect("manifest JSON");
+        let network = manifest["network"]
+            .as_object()
+            .expect("network policy object");
+        assert_eq!(network.len(), 2);
+        assert_eq!(network["address_policy"], "regenerate_ipv4");
+        assert_eq!(
+            fs::read_dir(directory.path().join("tmp/snapshots"))
+                .expect("snapshot temp dir")
+                .count(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn running_regenerate_snapshot_falls_back_only_to_an_exact_private_copy() {
+        let (sdk, directory, storage, _credentials, _network, runtime) = test_sdk(false);
+        let stored = start_fixture_vm(&sdk, "live_regenerate", false, Some(4242));
+        runtime
+            .process_answers
+            .lock()
+            .expect("process map lock")
+            .replace([(4242, true)].into_iter().collect());
+        runtime
+            .socket_answers
+            .lock()
+            .expect("socket map lock")
+            .replace(
+                [(
+                    stored.record.socket_path.to_string_lossy().into_owned(),
+                    true,
+                )]
+                .into_iter()
+                .collect(),
+            );
+        *runtime
+            .snapshot_write_after_capture
+            .lock()
+            .expect("snapshot write lock") = true;
+        let output = directory.path().join("live-regenerate.tmvmsnap");
+
+        sdk.create_snapshot(
+            "live_regenerate",
+            &output,
+            "snapshot-passphrase",
+            SnapshotAddressPolicy::RegenerateIpv4,
+        )
+        .await
+        .expect("unsupported nested snapshot should use the full-copy fallback");
+
+        assert_eq!(
+            fs::read(&stored.record.rootfs_path).expect("source disk should reflect guest write"),
+            b"post-capture!!"
+        );
+        assert_eq!(storage.private_sanitize_calls.load(Ordering::Relaxed), 1);
+        let members = decrypt_snapshot_members(&output, "snapshot-passphrase");
+        assert_eq!(members[0].1, b"fixture rootfs");
+        assert!(
+            !directory
+                .path()
+                .join("tmp/test-snapshot-live_regenerate.ext4")
+                .exists()
+        );
+        assert_eq!(
+            fs::read_dir(directory.path().join("tmp/snapshots"))
+                .expect("snapshot temp dir")
+                .count(),
+            0
+        );
     }
 
     #[tokio::test]
@@ -6743,7 +7947,12 @@ mod tests {
         let output = directory.path().join("live.tmvmsnap");
 
         let result = sdk
-            .create_snapshot("live_snapshot", &output, "snapshot-passphrase")
+            .create_snapshot(
+                "live_snapshot",
+                &output,
+                "snapshot-passphrase",
+                SnapshotAddressPolicy::PreserveIpv4,
+            )
             .await
             .expect("running VM snapshot should succeed");
 
@@ -6798,8 +8007,18 @@ mod tests {
         let first = directory.path().join("first.tmvmsnap");
         let second = directory.path().join("second.tmvmsnap");
         let (first_result, second_result) = tokio::join!(
-            sdk.create_snapshot("serialized_snapshot", &first, "snapshot-passphrase"),
-            sdk.create_snapshot("serialized_snapshot", &second, "snapshot-passphrase"),
+            sdk.create_snapshot(
+                "serialized_snapshot",
+                &first,
+                "snapshot-passphrase",
+                SnapshotAddressPolicy::PreserveIpv4
+            ),
+            sdk.create_snapshot(
+                "serialized_snapshot",
+                &second,
+                "snapshot-passphrase",
+                SnapshotAddressPolicy::PreserveIpv4
+            ),
         );
         first_result.expect("first serialized snapshot should finish");
         second_result.expect("second serialized snapshot should finish");
@@ -6814,6 +8033,7 @@ mod tests {
                 "serialized_snapshot",
                 &cancelled,
                 "snapshot-passphrase",
+                SnapshotAddressPolicy::PreserveIpv4,
                 cancellation,
             )
             .await

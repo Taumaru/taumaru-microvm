@@ -136,7 +136,161 @@ impl GuestStorage for Ext4Storage {
     ) -> Result<(), SdkError> {
         guest_fs::write_guest_lan_config(rootfs_path, guest_address, gateway, lan_address)
     }
+
+    fn write_guest_ipv4_config(
+        &self,
+        rootfs_path: &Path,
+        guest_address: std::net::Ipv4Addr,
+        prefix_length: u8,
+        gateway: Option<std::net::Ipv4Addr>,
+        lan_address: Option<std::net::Ipv4Addr>,
+    ) -> Result<(), SdkError> {
+        guest_fs::write_guest_ipv4_config(
+            rootfs_path,
+            guest_address,
+            prefix_length,
+            gateway,
+            lan_address,
+        )
+    }
+
+    fn prepare_private_snapshot_view(&self, rootfs_path: &Path) -> Result<(), SdkError> {
+        verify_ext4_filesystem(rootfs_path)?;
+        guest_fs::sanitize_private_snapshot_network_file(rootfs_path)
+    }
+
+    fn copy_rootfs_exact(
+        &self,
+        source: &Path,
+        destination: &Path,
+        size_bytes: u64,
+        cancellation: tokio_util::sync::CancellationToken,
+        on_copy_progress: &mut dyn FnMut(u64, u64),
+    ) -> Result<(), SdkError> {
+        copy_stable_view_exact(
+            source,
+            destination,
+            size_bytes,
+            cancellation,
+            on_copy_progress,
+        )
+    }
 }
+fn copy_stable_view_exact(
+    source: &Path,
+    destination: &Path,
+    size_bytes: u64,
+    cancellation: tokio_util::sync::CancellationToken,
+    on_copy_progress: &mut dyn FnMut(u64, u64),
+) -> Result<(), SdkError> {
+    if size_bytes == 0 {
+        return Err(SdkError::InvalidRequest {
+            field: "snapshot_disk_size".to_owned(),
+            reason: "must be greater than zero".to_owned(),
+        });
+    }
+    let parent = destination.parent().unwrap_or(Path::new("."));
+    let available = available_bytes(parent)?;
+    if available < size_bytes {
+        return Err(SdkError::SnapshotCapability {
+            capability: "private full-copy fallback".to_owned(),
+            reason: format!(
+                "requires {size_bytes} bytes, but only {available} bytes are available"
+            ),
+        });
+    }
+    let mut input = fs::File::open(source)
+        .map_err(|error| SdkError::filesystem("open stable snapshot view", source, error))?;
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut output = options.open(destination).map_err(|error| {
+        SdkError::filesystem("create private snapshot disk copy", destination, error)
+    })?;
+    let result = (|| {
+        let mut copied = 0_u64;
+        let mut buffer = [0_u8; 128 * 1024];
+        on_copy_progress(0, size_bytes);
+        while copied < size_bytes {
+            if cancellation.is_cancelled() {
+                return Err(SdkError::SnapshotCancelled);
+            }
+            let limit = buffer.len().min((size_bytes - copied) as usize);
+            let read = input.read(&mut buffer[..limit]).map_err(|error| {
+                SdkError::filesystem("read stable snapshot view", source, error)
+            })?;
+            if read == 0 {
+                return Err(SdkError::SnapshotArchive {
+                    operation: "copy stable snapshot view",
+                    reason: "source ended before the recorded disk size".to_owned(),
+                });
+            }
+            output.write_all(&buffer[..read]).map_err(|error| {
+                SdkError::filesystem("write private snapshot disk copy", destination, error)
+            })?;
+            copied = copied.saturating_add(read as u64);
+            on_copy_progress(copied, size_bytes);
+        }
+        output.sync_all().map_err(|error| {
+            SdkError::filesystem("sync private snapshot disk copy", destination, error)
+        })
+    })();
+    if let Err(error) = result {
+        drop(output);
+        let cleanup = fs::remove_file(destination).err().map(|cleanup| {
+            SdkError::filesystem("remove failed private snapshot copy", destination, cleanup)
+        });
+        return Err(match cleanup {
+            Some(cleanup) => SdkError::Cleanup {
+                primary: error.to_string(),
+                failures: vec![cleanup.to_string()],
+            },
+            None => error,
+        });
+    }
+    Ok(())
+}
+
+fn available_bytes(path: &Path) -> Result<u64, SdkError> {
+    let output = Command::new("df")
+        .args(["-Pk"])
+        .arg(path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|error| SdkError::HostCommand {
+            program: "df".to_owned(),
+            reason: error.to_string(),
+        })?;
+    if !output.status.success() {
+        return Err(SdkError::HostCommand {
+            program: "df".to_owned(),
+            reason: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+        });
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let available_kib = stdout
+        .lines()
+        .last()
+        .and_then(|line| line.split_ascii_whitespace().nth(3))
+        .and_then(|value| value.parse::<u64>().ok())
+        .ok_or_else(|| SdkError::HostCommand {
+            program: "df".to_owned(),
+            reason: "could not read available storage from df output".to_owned(),
+        })?;
+    available_kib
+        .checked_mul(1024)
+        .ok_or_else(|| SdkError::HostCommand {
+            program: "df".to_owned(),
+            reason: "available storage exceeds the supported size".to_owned(),
+        })
+}
+
 fn verify_ext4_filesystem(path: &Path) -> Result<(), SdkError> {
     let output = Command::new("blkid")
         .args(["-p", "-o", "value", "-s", "TYPE"])
@@ -261,7 +415,32 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use super::copy_rootfs;
+    use super::{copy_rootfs, copy_stable_view_exact};
+    use crate::error::SdkError;
+
+    #[test]
+    fn refuses_a_private_copy_larger_than_available_storage_before_creating_output() {
+        let directory = tempdir().expect("temporary directory should be created");
+        let source = directory.path().join("stable-view.ext4");
+        let destination = directory.path().join("private-copy.ext4");
+        fs::write(&source, b"stable-view").expect("source view should be written");
+
+        let error = copy_stable_view_exact(
+            &source,
+            &destination,
+            u64::MAX,
+            tokio_util::sync::CancellationToken::new(),
+            &mut |_, _| {},
+        )
+        .expect_err("an impossible copy size should be rejected");
+
+        assert!(matches!(error, SdkError::SnapshotCapability { .. }));
+        assert!(!destination.exists());
+        assert_eq!(
+            fs::read(&source).expect("source view should remain"),
+            b"stable-view"
+        );
+    }
 
     #[test]
     fn copies_the_source_without_mutating_it() {
