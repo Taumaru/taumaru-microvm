@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 use tokio::fs as async_fs;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use crate::adapters::archive::age_tar_zstd::{
+use crate::adapters::archive::tar_zstd::{
     self, SnapshotArchiveInput, SnapshotPayload, SnapshotPortableMetadata,
 };
 use crate::adapters::credentials::ed25519::Ed25519CredentialStore;
@@ -874,7 +874,10 @@ impl MicroVmSdk {
     /// The observer is caller-owned, infallible, and non-blocking, and cannot change
     /// integrity, persistence, or error decisions. When `None`, no events are emitted
     /// and behavior is identical to an unobserved creation.
-    /// Creates one encrypted, portable snapshot of a stopped or running MicroVM.
+    /// Creates one unencrypted, portable snapshot of a stopped or running MicroVM.
+    ///
+    /// The archive contains the VM disk and SSH credentials and is readable by any account that
+    /// can access the output file.
     ///
     /// A running VM remains active while a Device Mapper snapshot view preserves the disk
     /// contents captured at the point the view is attached. This is a disk-only,
@@ -884,20 +887,18 @@ impl MicroVmSdk {
         &self,
         vm_name: &str,
         output_path: &Path,
-        password: &str,
         address_policy: SnapshotAddressPolicy,
     ) -> Result<SnapshotResult, SdkError> {
         self.create_snapshot_with_cancellation(
             vm_name,
             output_path,
-            password,
             address_policy,
             SnapshotCancellation::new(),
         )
         .await
     }
 
-    /// Creates an encrypted MicroVM snapshot and observes a caller-owned cancellation handle.
+    /// Creates a MicroVM snapshot and observes a caller-owned cancellation handle.
     ///
     /// Cancellation is cooperative between bounded disk reads. The operation retains its
     /// per-VM locks and cleans up temporary snapshot resources before returning. Dropping the
@@ -907,14 +908,12 @@ impl MicroVmSdk {
         &self,
         vm_name: &str,
         output_path: &Path,
-        password: &str,
         address_policy: SnapshotAddressPolicy,
         cancellation: SnapshotCancellation,
     ) -> Result<SnapshotResult, SdkError> {
         self.create_snapshot_with_cancellation_and_progress(
             vm_name,
             output_path,
-            password,
             address_policy,
             cancellation,
             |_| {},
@@ -922,7 +921,7 @@ impl MicroVmSdk {
         .await
     }
 
-    /// Creates an encrypted snapshot, reports operation progress, and observes cancellation.
+    /// Creates a snapshot, reports operation progress, and observes cancellation.
     ///
     /// Progress events report COW-store allocation and uncompressed payload bytes read into the
     /// archive stream. The callback runs synchronously on the snapshot's blocking worker, so it
@@ -932,7 +931,6 @@ impl MicroVmSdk {
         &self,
         vm_name: &str,
         output_path: &Path,
-        password: &str,
         address_policy: SnapshotAddressPolicy,
         cancellation: SnapshotCancellation,
         on_progress: F,
@@ -941,12 +939,6 @@ impl MicroVmSdk {
         F: FnMut(SnapshotProgress) + Send + 'static,
     {
         crate::domain::config::validate_vm_name(vm_name)?;
-        if password.is_empty() {
-            return Err(SdkError::InvalidRequest {
-                field: "password".to_owned(),
-                reason: "must not be empty".to_owned(),
-            });
-        }
         let runtime_lock = acquire_lifecycle_lock(&self.home, vm_name).await?;
         let lookup_name = vm_name.to_owned();
         let name_lock = self.target_lock(&self.home.join("vms").join(vm_name))?;
@@ -1022,7 +1014,6 @@ impl MicroVmSdk {
         let input = SnapshotArchiveInput {
             vm_name: stored.record.name.clone(),
             output_path: output_path.to_path_buf(),
-            password: password.to_owned(),
             metadata: SnapshotPortableMetadata {
                 guest_architecture: stored_metadata.guest_architecture,
                 distribution_id: stored.record.distribution_id.clone(),
@@ -1232,7 +1223,7 @@ impl MicroVmSdk {
                 let view_parent = snapshot_view.clone();
                 let view_operation = snapshot_operation_id.clone();
                 let private_view_active = private_dm_view.is_some();
-                age_tar_zstd::create_archive_with_progress(
+                tar_zstd::create_archive_with_progress(
                     input,
                     token.clone(),
                     move || {
@@ -1336,12 +1327,11 @@ impl MicroVmSdk {
                     });
                 return Err(snapshot_cleanup_error(primary, cleanup));
             }
-            let archive =
-                age_tar_zstd::publish_staged_archive(staged_archive, &requested_output_path)?;
+            let archive = tar_zstd::publish_staged_archive(staged_archive, &requested_output_path)?;
             Ok(SnapshotResult {
                 vm_name,
                 output_path: archive.output_path,
-                encrypted_size_bytes: archive.encrypted_size_bytes,
+                archive_size_bytes: archive.archive_size_bytes,
                 source_was_running: running,
             })
         });
@@ -5233,17 +5223,16 @@ fn create_managed_directories(home: &Path) -> Result<(), SdkError> {
 #[cfg(test)]
 mod tests {
     use std::fs::{self, OpenOptions};
-    use std::io::{BufReader, Read};
+    use std::io::Read;
     use std::net::{IpAddr, Ipv4Addr};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
-    use crate::adapters::archive::age_tar_zstd::{
+    use crate::adapters::archive::tar_zstd::{
         SnapshotArchiveInput, SnapshotPayload, SnapshotPortableMetadata, create_archive,
     };
     use crate::adapters::credentials::ed25519::Ed25519CredentialStore;
-    use age::secrecy::SecretString;
     use sha2::{Digest, Sha256};
     use tempfile::tempdir;
 
@@ -6219,15 +6208,10 @@ mod tests {
         }
     }
 
-    fn decrypt_snapshot_members(path: &Path, password: &str) -> Vec<(String, Vec<u8>)> {
+    fn read_snapshot_members(path: &Path) -> Vec<(String, Vec<u8>)> {
         let file = fs::File::open(path).expect("snapshot should open");
-        let decryptor = age::Decryptor::new(BufReader::new(file)).expect("age header should parse");
-        let identity = age::scrypt::Identity::new(SecretString::from(password.to_owned()));
-        let reader = decryptor
-            .decrypt(std::iter::once(&identity as &dyn age::Identity))
-            .expect("snapshot password should decrypt");
         let decoder =
-            zstd::stream::read::Decoder::new(reader).expect("Zstandard stream should decode");
+            zstd::stream::read::Decoder::new(file).expect("Zstandard frame should decode");
         let mut archive = tar::Archive::new(decoder);
         archive
             .entries()
@@ -6324,7 +6308,6 @@ mod tests {
         let input = SnapshotArchiveInput {
             vm_name: vm_name.to_owned(),
             output_path: output_path.clone(),
-            password: "restore-fixture-password".to_owned(),
             metadata: network_metadata.clone(),
             payloads: vec![
                 SnapshotPayload {
@@ -6376,7 +6359,6 @@ mod tests {
                 .restore_snapshot_with_progress(
                     RestoreRequest {
                         archive_path: archive_path.clone(),
-                        password: "restore-fixture-password".to_owned(),
                     },
                     move |event| {
                         callback_progress
@@ -6561,10 +6543,7 @@ mod tests {
             None,
         );
         let restored = sdk
-            .restore_snapshot(RestoreRequest {
-                archive_path,
-                password: "restore-fixture-password".to_owned(),
-            })
+            .restore_snapshot(RestoreRequest { archive_path })
             .await
             .expect("restore without a guest gateway should succeed");
         assert_eq!(restored.network.gateway, None);
@@ -6620,10 +6599,7 @@ mod tests {
         );
 
         let error = sdk
-            .restore_snapshot(RestoreRequest {
-                archive_path,
-                password: "restore-fixture-password".to_owned(),
-            })
+            .restore_snapshot(RestoreRequest { archive_path })
             .await
             .expect_err("an archived MAC already used by another VM should conflict");
 
@@ -6649,7 +6625,6 @@ mod tests {
         );
         let request = || RestoreRequest {
             archive_path: archive_path.clone(),
-            password: "restore-fixture-password".to_owned(),
         };
 
         let (first, second) = tokio::join!(
@@ -6702,10 +6677,7 @@ mod tests {
             .expect("pre-existing kernel should be written");
 
         let error = sdk
-            .restore_snapshot(RestoreRequest {
-                archive_path,
-                password: "restore-fixture-password".to_owned(),
-            })
+            .restore_snapshot(RestoreRequest { archive_path })
             .await
             .expect_err("unregistered kernel path should conflict");
 
@@ -6737,10 +6709,7 @@ mod tests {
         );
 
         let error = sdk
-            .restore_snapshot(RestoreRequest {
-                archive_path,
-                password: "restore-fixture-password".to_owned(),
-            })
+            .restore_snapshot(RestoreRequest { archive_path })
             .await
             .expect_err("unavailable local runtime should fail");
 
@@ -6772,17 +6741,13 @@ mod tests {
         let restored = sdk
             .restore_snapshot(RestoreRequest {
                 archive_path: archive_path.clone(),
-                password: "restore-fixture-password".to_owned(),
             })
             .await
             .expect("first restore should succeed");
         let rootfs_before = fs::read(&restored.rootfs_path).expect("root disk before retry");
 
         let error = sdk
-            .restore_snapshot(RestoreRequest {
-                archive_path,
-                password: "restore-fixture-password".to_owned(),
-            })
+            .restore_snapshot(RestoreRequest { archive_path })
             .await
             .expect_err("duplicate VM name should be rejected");
 
@@ -6814,10 +6779,7 @@ mod tests {
         fs::write(&marker, b"pre-existing").expect("marker should be written");
 
         let error = sdk
-            .restore_snapshot(RestoreRequest {
-                archive_path,
-                password: "restore-fixture-password".to_owned(),
-            })
+            .restore_snapshot(RestoreRequest { archive_path })
             .await
             .expect_err("occupied destination path should be rejected");
 
@@ -6888,10 +6850,7 @@ mod tests {
             create_restore_archive(home, vm_name, SnapshotAddressPolicy::RegenerateIpv4);
 
         let restored = sdk
-            .restore_snapshot(RestoreRequest {
-                archive_path,
-                password: "restore-fixture-password".to_owned(),
-            })
+            .restore_snapshot(RestoreRequest { archive_path })
             .await
             .expect("retry should succeed after recovery");
 
@@ -6933,10 +6892,7 @@ mod tests {
 
         let error = sdk
             .restore_snapshot_with_cancellation_and_progress(
-                RestoreRequest {
-                    archive_path,
-                    password: "restore-fixture-password".to_owned(),
-                },
+                RestoreRequest { archive_path },
                 cancellation,
                 |_| {},
             )
@@ -7741,6 +7697,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn snapshot_archive_is_plain_zstandard_tar_with_checksum_and_default_permissions() {
+        let (sdk, directory, _storage, _credentials, _network, _runtime) = test_sdk(false);
+        start_fixture_vm(&sdk, "plain_snapshot", false, None);
+        let output = directory.path().join("plain.tmvmsnap");
+
+        sdk.create_snapshot(
+            "plain_snapshot",
+            &output,
+            SnapshotAddressPolicy::PreserveIpv4,
+        )
+        .await
+        .expect("snapshot should be created");
+
+        let bytes = fs::read(&output).expect("snapshot bytes should read");
+        assert_eq!(&bytes[..4], &[0x28, 0xb5, 0x2f, 0xfd]);
+        assert_ne!(
+            bytes[4] & 0x04,
+            0,
+            "Zstandard content checksum must be enabled"
+        );
+
+        let decoder = zstd::stream::read::Decoder::new(
+            fs::File::open(&output).expect("snapshot should open"),
+        )
+        .expect("plain Zstandard frame should decode");
+        let mut archive = tar::Archive::new(decoder);
+        let members = archive
+            .entries()
+            .expect("TAR entries should parse")
+            .map(|entry| {
+                let mut entry = entry.expect("TAR member should parse");
+                let name = entry
+                    .path()
+                    .expect("member path should parse")
+                    .to_string_lossy()
+                    .into_owned();
+                let mut content = Vec::new();
+                entry.read_to_end(&mut content).expect("member should read");
+                (name, content)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(members.len(), 5);
+        assert_eq!(members[0].0, "payload/rootfs.ext4");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&members[4].1).expect("manifest should parse");
+        assert_eq!(manifest["format_version"], 3);
+
+        let default_file = directory.path().join("default-permissions-reference");
+        fs::File::create(&default_file).expect("default-mode reference should be created");
+        use std::os::unix::fs::PermissionsExt;
+        let snapshot_mode = fs::metadata(&output)
+            .expect("snapshot metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        let default_mode = fs::metadata(default_file)
+            .expect("reference metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(snapshot_mode, default_mode);
+    }
+
+    #[tokio::test]
     async fn creates_a_stopped_vm_snapshot_with_portable_payloads() {
         let (sdk, directory, _storage, _credentials, _network, runtime) = test_sdk(false);
         let stored = start_fixture_vm(&sdk, "stopped_snapshot", false, None);
@@ -7750,7 +7770,6 @@ mod tests {
             .create_snapshot(
                 "stopped_snapshot",
                 &output,
-                "snapshot-passphrase",
                 SnapshotAddressPolicy::PreserveIpv4,
             )
             .await
@@ -7768,7 +7787,7 @@ mod tests {
                 .iter()
                 .all(|event| !event.starts_with("snapshot-"))
         );
-        let members = decrypt_snapshot_members(&result.output_path, "snapshot-passphrase");
+        let members = read_snapshot_members(&result.output_path);
         let names = members
             .iter()
             .map(|(name, _)| name.as_str())
@@ -7811,12 +7830,10 @@ mod tests {
                 "portable manifest must exclude {host_only_value}"
             );
         }
-        assert!(!rendered.contains("snapshot-passphrase"));
         assert!(matches!(
             sdk.create_snapshot(
                 "stopped_snapshot",
                 &result.output_path,
-                "snapshot-passphrase",
                 SnapshotAddressPolicy::PreserveIpv4
             )
             .await,
@@ -7834,7 +7851,6 @@ mod tests {
         sdk.create_snapshot(
             "regenerate_snapshot",
             &output,
-            "snapshot-passphrase",
             SnapshotAddressPolicy::RegenerateIpv4,
         )
         .await
@@ -7845,7 +7861,7 @@ mod tests {
             original_disk
         );
         assert_eq!(storage.private_sanitize_calls.load(Ordering::Relaxed), 1);
-        let members = decrypt_snapshot_members(&output, "snapshot-passphrase");
+        let members = read_snapshot_members(&output);
         assert_eq!(members[0].1, original_disk);
         let manifest: serde_json::Value =
             serde_json::from_slice(&members[4].1).expect("manifest JSON");
@@ -7892,7 +7908,6 @@ mod tests {
         sdk.create_snapshot(
             "live_regenerate",
             &output,
-            "snapshot-passphrase",
             SnapshotAddressPolicy::RegenerateIpv4,
         )
         .await
@@ -7903,7 +7918,7 @@ mod tests {
             b"post-capture!!"
         );
         assert_eq!(storage.private_sanitize_calls.load(Ordering::Relaxed), 1);
-        let members = decrypt_snapshot_members(&output, "snapshot-passphrase");
+        let members = read_snapshot_members(&output);
         assert_eq!(members[0].1, b"fixture rootfs");
         assert!(
             !directory
@@ -7950,7 +7965,6 @@ mod tests {
             .create_snapshot(
                 "live_snapshot",
                 &output,
-                "snapshot-passphrase",
                 SnapshotAddressPolicy::PreserveIpv4,
             )
             .await
@@ -7961,7 +7975,7 @@ mod tests {
             fs::read(&stored.record.rootfs_path).expect("running root disk should remain"),
             b"post-capture!!"
         );
-        let members = decrypt_snapshot_members(&result.output_path, "snapshot-passphrase");
+        let members = read_snapshot_members(&result.output_path);
         assert_eq!(members[0].1, b"fixture rootfs");
         let events = runtime.disk_events.lock().expect("disk event lock").clone();
         let create = events
@@ -8010,13 +8024,11 @@ mod tests {
             sdk.create_snapshot(
                 "serialized_snapshot",
                 &first,
-                "snapshot-passphrase",
                 SnapshotAddressPolicy::PreserveIpv4
             ),
             sdk.create_snapshot(
                 "serialized_snapshot",
                 &second,
-                "snapshot-passphrase",
                 SnapshotAddressPolicy::PreserveIpv4
             ),
         );
@@ -8032,7 +8044,6 @@ mod tests {
             .create_snapshot_with_cancellation(
                 "serialized_snapshot",
                 &cancelled,
-                "snapshot-passphrase",
                 SnapshotAddressPolicy::PreserveIpv4,
                 cancellation,
             )

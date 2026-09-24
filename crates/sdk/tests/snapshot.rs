@@ -9,12 +9,7 @@ async fn missing_vm_returns_a_typed_error_without_publishing_output() {
     let output = home.path().join("missing.tmvmsnap");
 
     let error = sdk
-        .create_snapshot(
-            "missing_vm",
-            &output,
-            "passphrase",
-            SnapshotAddressPolicy::PreserveIpv4,
-        )
+        .create_snapshot("missing_vm", &output, SnapshotAddressPolicy::PreserveIpv4)
         .await
         .expect_err("unknown VM should be rejected");
 

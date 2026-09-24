@@ -8,7 +8,7 @@ use crate::domain::snapshot::SnapshotAddressPolicy;
 use crate::error::SdkError;
 
 pub(crate) const FORMAT_ID: &str = "taumaru.microvm.snapshot";
-pub(crate) const FORMAT_VERSION: u32 = 2;
+pub(crate) const FORMAT_VERSION: u32 = 3;
 pub(crate) const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
 pub(crate) const ROOTFS_MEMBER: &str = "payload/rootfs.ext4";
 pub(crate) const KERNEL_MEMBER: &str = "payload/kernel/vmlinux";
@@ -365,7 +365,7 @@ mod tests {
     fn minimal_manifest(network: serde_json::Value) -> serde_json::Value {
         serde_json::json!({
             "format": FORMAT_ID,
-            "format_version": 2,
+            "format_version": 3,
             "created_at_unix_seconds": 1,
             "vm": {"name":"demo","disk_size_bytes":4096,"memory_bytes":1024,"memory_effective_mib":1,"vcpu_count":1},
             "compatibility": {"host_os":"linux","guest_architecture":"x86_64","requires_kvm":true,"runtime":"firecracker"},

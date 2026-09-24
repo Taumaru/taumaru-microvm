@@ -25,7 +25,7 @@ fn help_identifies_the_microvm_command() {
 }
 
 #[test]
-fn snapshot_help_exposes_name_output_path_and_password() {
+fn snapshot_help_exposes_name_and_output_path_without_a_password_option() {
     let output = run_microvm(&["snapshot", "--help"]);
     let stdout = String::from_utf8_lossy(&output.stdout);
 
@@ -33,19 +33,19 @@ fn snapshot_help_exposes_name_output_path_and_password() {
     assert!(stdout.contains("Usage: microvm snapshot"));
     assert!(stdout.contains("[NAME]"));
     assert!(stdout.contains("[OUTPUT_PATH]"));
-    assert!(stdout.contains("--password <PASSWORD>"));
+    assert!(!stdout.contains("--password"));
     assert!(stdout.contains("--address-policy <POLICY>"));
 }
 
 #[test]
-fn restore_help_exposes_archive_password_and_non_interactive_options() {
+fn restore_help_exposes_archive_and_non_interactive_options_without_a_password_option() {
     let output = run_microvm(&["restore", "--help"]);
     let stdout = String::from_utf8_lossy(&output.stdout);
 
     assert!(output.status.success());
     assert!(stdout.contains("Usage: microvm restore"));
     assert!(stdout.contains("[ARCHIVE_PATH]"));
-    assert!(stdout.contains("--password <PASSWORD>"));
+    assert!(!stdout.contains("--password"));
     assert!(stdout.contains("--non-interactive"));
 }
 
@@ -53,7 +53,7 @@ fn restore_help_exposes_archive_password_and_non_interactive_options() {
 fn non_interactive_snapshot_requires_an_explicit_address_policy() {
     let home = tempfile::tempdir().expect("temporary home should be created");
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_microvm"))
-        .args(["snapshot", "web-01", "--password", "secret"])
+        .args(["snapshot", "web-01"])
         .env("TAUMARU_HOME", home.path())
         .output()
         .expect("failed to execute microvm");
@@ -61,6 +61,7 @@ fn non_interactive_snapshot_requires_an_explicit_address_policy() {
 
     assert!(!output.status.success());
     assert!(stderr.contains("Missing snapshot IPv4 policy"));
+    assert!(!stderr.to_ascii_lowercase().contains("password"));
     assert!(!stderr.contains("Choose a MicroVM"));
 }
 
@@ -68,7 +69,7 @@ fn non_interactive_snapshot_requires_an_explicit_address_policy() {
 fn non_interactive_restore_rejects_a_missing_archive_without_prompting() {
     let home = tempfile::tempdir().expect("temporary home should be created");
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_microvm"))
-        .args(["restore", "--non-interactive", "--password", "secret"])
+        .args(["restore", "--non-interactive"])
         .env("TAUMARU_HOME", home.path())
         .output()
         .expect("failed to execute microvm");
@@ -80,7 +81,7 @@ fn non_interactive_restore_rejects_a_missing_archive_without_prompting() {
 }
 
 #[test]
-fn non_interactive_restore_rejects_a_missing_password_without_prompting() {
+fn non_interactive_restore_does_not_require_a_password() {
     let home = tempfile::tempdir().expect("temporary home should be created");
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_microvm"))
         .args(["restore", "./backup.tmvmsnap", "--non-interactive"])
@@ -90,8 +91,13 @@ fn non_interactive_restore_rejects_a_missing_password_without_prompting() {
     let stderr = String::from_utf8_lossy(&output.stderr);
 
     assert!(!output.status.success());
-    assert!(stderr.contains("Missing snapshot password"));
-    assert!(!stderr.contains("Snapshot password"));
+    assert!(!stderr.to_ascii_lowercase().contains("password"));
+    let normalized_stderr = stderr.to_ascii_lowercase();
+    assert!(
+        normalized_stderr.contains("restore failed")
+            || normalized_stderr.contains("snapshot archive")
+            || normalized_stderr.contains("elevated rights are required")
+    );
 }
 
 #[test]
@@ -113,6 +119,7 @@ fn supplied_restore_password_is_not_echoed_on_failure() {
     let stderr = String::from_utf8_lossy(&output.stderr);
 
     assert!(!output.status.success());
+    assert!(stderr.contains("unexpected argument"));
     assert!(!stdout.contains(password));
     assert!(!stderr.contains(password));
 }
@@ -133,22 +140,23 @@ fn non_interactive_snapshot_rejects_missing_name_without_prompting() {
 }
 
 #[test]
-fn snapshot_rejects_an_empty_password_without_escalating() {
+fn removed_snapshot_password_option_is_rejected_without_echoing_its_value() {
     let home = tempfile::tempdir().expect("temporary home should be created");
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_microvm"))
-        .args(["snapshot", "web-01", "--password", ""])
+        .args(["snapshot", "--password", "snapshot-password-must-not-echo"])
         .env("TAUMARU_HOME", home.path())
         .output()
         .expect("failed to execute microvm");
     let stderr = String::from_utf8_lossy(&output.stderr);
 
     assert!(!output.status.success());
-    assert!(stderr.contains("Snapshot password is empty"));
+    assert!(stderr.contains("unexpected argument"));
+    assert!(!stderr.contains("snapshot-password-must-not-echo"));
     assert!(!stderr.contains("elevated rights"));
 }
 
 #[test]
-fn non_interactive_snapshot_rejects_missing_password_without_escalating() {
+fn non_interactive_snapshot_does_not_require_a_password() {
     let home = tempfile::tempdir().expect("temporary home should be created");
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_microvm"))
         .args(["snapshot", "web-01"])
@@ -158,7 +166,8 @@ fn non_interactive_snapshot_rejects_missing_password_without_escalating() {
     let stderr = String::from_utf8_lossy(&output.stderr);
 
     assert!(!output.status.success());
-    assert!(stderr.contains("Missing snapshot password"));
+    assert!(stderr.contains("Missing snapshot IPv4 policy"));
+    assert!(!stderr.to_ascii_lowercase().contains("password"));
     assert!(!stderr.contains("elevated rights"));
 }
 
@@ -168,7 +177,7 @@ fn version_exits_successfully() {
     let stdout = String::from_utf8_lossy(&output.stdout);
 
     assert!(output.status.success());
-    assert!(stdout.contains("0.1.0"));
+    assert!(stdout.contains("0.2.0"));
 }
 
 #[test]

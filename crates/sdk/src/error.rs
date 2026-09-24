@@ -254,7 +254,7 @@ pub enum SdkError {
         value: String,
     },
 
-    /// A snapshot could not be decrypted, parsed, or verified.
+    /// A snapshot archive could not be parsed or verified. Integrity checks detect accidental damage; they do not authenticate the archive source.
     #[error("snapshot restore {operation} failed: {reason}")]
     RestoreArchive {
         operation: &'static str,

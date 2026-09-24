@@ -3,6 +3,17 @@
 //! The SDK is intentionally silent and side-effect free until callers invoke an explicit
 //! operation through its public API.
 
+//!
+//! # Snapshot API migration
+//!
+//! Version 0.2 removes password parameters from snapshot creation and removes the password
+//! field from [`RestoreRequest`]. [`SnapshotResult::archive_size_bytes`] replaces the former
+//! encrypted-size field. Snapshot archives created before format version 3 use age encryption
+//! and cannot be restored by this release. To migrate one, restore it with a compatible prior
+//! release, then create a new snapshot using version 0.2. Version 3 archives are not
+//! encrypted and include the VM disk and SSH credentials, so access is controlled by the
+//! archive file permissions and filesystem policy.
+
 mod adapters;
 mod domain;
 mod error;

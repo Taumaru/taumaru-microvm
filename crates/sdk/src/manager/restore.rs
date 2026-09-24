@@ -39,9 +39,9 @@ const RESTORE_COPY_BUFFER_BYTES: usize = 128 * 1024;
 type ProgressCallback = Arc<Mutex<Box<dyn FnMut(RestoreProgress) + Send>>>;
 
 impl MicroVmSdk {
-    /// Restores a stopped MicroVM from one password-encrypted snapshot archive.
+    /// Restores a stopped MicroVM from one supported unencrypted snapshot archive.
     ///
-    /// The VM name and portable settings come from the authenticated archive manifest. The
+    /// The VM name and portable settings come from the validated archive manifest. The
     /// destination must have compatible runtime binaries and free local network/storage
     /// resources. Restore never launches Firecracker and never overwrites existing paths.
     pub async fn restore_snapshot(
@@ -75,7 +75,7 @@ impl MicroVmSdk {
 
     /// Restores a snapshot with cooperative cancellation and progress reporting.
     ///
-    /// Cancellation is checked while decrypting and staging payload bytes and while copying the
+    /// Cancellation is checked while reading and staging payload bytes and while copying the
     /// root disk. Operation-owned files and network resources are cleaned before an error is
     /// returned. Dropping the future requests cancellation while its blocking worker keeps the
     /// per-VM lifecycle locks until cleanup finishes.
@@ -88,12 +88,6 @@ impl MicroVmSdk {
     where
         F: FnMut(RestoreProgress) + Send + 'static,
     {
-        if request.password.is_empty() {
-            return Err(SdkError::InvalidRequest {
-                field: "password".to_owned(),
-                reason: "must not be empty".to_owned(),
-            });
-        }
         let operation_id = new_restore_operation_id()?;
         let staging_parent = self.home.join("tmp").join("restores");
         ensure_directory(&staging_parent, 0o700)?;
@@ -103,7 +97,6 @@ impl MicroVmSdk {
         let read_callback = Arc::clone(&callback);
         let token = cancellation.token();
         let future_cancellation = SnapshotFutureCancellation(token.clone());
-        let password = request.password;
         let stage_token = token.clone();
         let stage_worker = tokio::task::spawn_blocking(move || {
             let mut progress = |completed_bytes, total_bytes| {
@@ -116,13 +109,7 @@ impl MicroVmSdk {
                     },
                 );
             };
-            restore::read_archive(
-                &archive_path,
-                &password,
-                &staging_path,
-                stage_token,
-                &mut progress,
-            )
+            restore::read_archive(&archive_path, &staging_path, stage_token, &mut progress)
         });
         let staged = stage_worker.await??;
         if cancellation.is_cancelled() {

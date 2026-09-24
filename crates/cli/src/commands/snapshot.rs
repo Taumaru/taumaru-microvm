@@ -1,7 +1,7 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
 
-use inquire::{Confirm, Password, PasswordDisplayMode, Select, Text};
+use inquire::{Confirm, Select, Text};
 use taumaru_microvm::{
     MicroVmSummary, SdkError, SnapshotAddressPolicy, SnapshotCancellation, SnapshotResult,
 };
@@ -26,7 +26,6 @@ impl std::fmt::Display for MachineOption {
 pub(crate) fn escalated_child_command(
     name: Option<&str>,
     output_path: Option<&std::path::Path>,
-    password: Option<&str>,
     address_policy: Option<SnapshotAddressPolicyArg>,
 ) -> Vec<OsString> {
     let mut command = vec![OsString::from("snapshot")];
@@ -35,10 +34,6 @@ pub(crate) fn escalated_child_command(
     }
     if let Some(path) = output_path {
         command.push(path.as_os_str().to_owned());
-    }
-    if let Some(password) = password {
-        command.push(OsString::from("--password"));
-        command.push(OsString::from(password));
     }
     if let Some(policy) = address_policy {
         command.push(OsString::from("--address-policy"));
@@ -161,22 +156,11 @@ fn sdk_address_policy(policy: SnapshotAddressPolicyArg) -> SnapshotAddressPolicy
     }
 }
 
-fn prompt_password(terminal: TerminalCapabilities) -> Result<String, CliError> {
-    Password::new("Snapshot password")
-        .with_display_mode(PasswordDisplayMode::Masked)
-        .with_help_message("Characters are masked as you type")
-        .with_custom_confirmation_message("Confirm snapshot password")
-        .with_custom_confirmation_error_message("Passwords do not match. Try again.")
-        .with_render_config(super::download::prompt_render_config(terminal.color))
-        .prompt()
-        .map_err(|error| prompt_error(error, "Snapshot password prompt"))
-}
-
 fn snapshot_success_message(result: &SnapshotResult) -> String {
     format!(
-        "✓ Snapshot created\n  Path: {}\n  Encrypted size: {} bytes",
+        "✓ Snapshot created\n  Path: {}\n  Archive size: {} bytes\n  Security: unencrypted; includes the VM disk and SSH credentials",
         result.output_path.display(),
-        result.encrypted_size_bytes
+        result.archive_size_bytes
     )
 }
 
@@ -200,10 +184,9 @@ async fn require_privileged(
     context: &CliContext,
     name: Option<&str>,
     output_path: Option<&std::path::Path>,
-    password: Option<&str>,
     address_policy: Option<SnapshotAddressPolicyArg>,
 ) -> Result<Option<u8>, CliError> {
-    let command = escalated_child_command(name, output_path, password, address_policy);
+    let command = escalated_child_command(name, output_path, address_policy);
     crate::privilege::require_privileged(
         &crate::privilege::SystemPrivilege,
         context.terminal,
@@ -220,7 +203,6 @@ async fn run_sdk_snapshot(
     context: &CliContext,
     name: &str,
     output_path: &std::path::Path,
-    password: &str,
     address_policy: SnapshotAddressPolicy,
 ) -> Result<SnapshotResult, CliError> {
     let cancellation = SnapshotCancellation::new();
@@ -229,7 +211,6 @@ async fn run_sdk_snapshot(
     let operation = context.sdk.create_snapshot_with_cancellation_and_progress(
         name,
         output_path,
-        password,
         address_policy,
         cancellation.clone(),
         move |event| callback_progress.on_progress(event),
@@ -255,19 +236,13 @@ pub(crate) async fn run(context: &CliContext, arguments: SnapshotArgs) -> Result
         return Err(CliError::missing_value(
             "machine name",
             "<NAME>",
-            "Run `microvm snapshot <NAME> --password <PASSWORD>`",
+            "Run `microvm snapshot <NAME>`",
         ));
     }
 
     if name.is_none() {
-        if let Some(exit) = require_privileged(
-            context,
-            None,
-            None,
-            arguments.password.as_deref(),
-            arguments.address_policy,
-        )
-        .await?
+        if let Some(exit) =
+            require_privileged(context, None, None, arguments.address_policy).await?
         {
             return Ok(exit);
         }
@@ -284,20 +259,6 @@ pub(crate) async fn run(context: &CliContext, arguments: SnapshotArgs) -> Result
     let name = name.ok_or_else(|| {
         CliError::missing_value("machine name", "<NAME>", "Run `microvm snapshot <NAME>`")
     })?;
-    if arguments.password.as_deref() == Some("") {
-        return Err(CliError::creation(
-            "Snapshot password is empty",
-            "an encryption password is required",
-            "Supply a non-empty `--password` or use the hidden prompt",
-        ));
-    }
-    if arguments.password.is_none() && !context.terminal.interactive {
-        return Err(CliError::missing_value(
-            "snapshot password",
-            "--password <PASSWORD>",
-            "Run `microvm snapshot <NAME> --password <PASSWORD>`",
-        ));
-    }
     let address_policy = match arguments.address_policy {
         Some(policy) => policy,
         None if context.terminal.interactive => prompt_address_policy(context.terminal)?,
@@ -305,7 +266,7 @@ pub(crate) async fn run(context: &CliContext, arguments: SnapshotArgs) -> Result
             return Err(CliError::missing_value(
                 "snapshot IPv4 policy",
                 "--address-policy <preserve|regenerate>",
-                "Run `microvm snapshot <NAME> --address-policy regenerate --password <PASSWORD>`",
+                "Run `microvm snapshot <NAME> --address-policy regenerate`",
             ));
         }
     };
@@ -314,7 +275,6 @@ pub(crate) async fn run(context: &CliContext, arguments: SnapshotArgs) -> Result
         context,
         Some(&name),
         arguments.output_path.as_deref(),
-        arguments.password.as_deref(),
         Some(address_policy),
     )
     .await?
@@ -328,24 +288,11 @@ pub(crate) async fn run(context: &CliContext, arguments: SnapshotArgs) -> Result
         None => PathBuf::from(format!("{name}.tmvmsnap")),
     };
 
-    let password = match arguments.password {
-        Some(password) => password,
-        None if context.terminal.interactive => prompt_password(context.terminal)?,
-        None => {
-            return Err(CliError::missing_value(
-                "snapshot password",
-                "--password <PASSWORD>",
-                "Run `microvm snapshot <NAME> --password <PASSWORD>`",
-            ));
-        }
-    };
-
-    eprintln!("·  Creating encrypted snapshot for {name}");
+    eprintln!("·  Creating unencrypted snapshot for {name}");
     let result = run_sdk_snapshot(
         context,
         &name,
         &output_path,
-        &password,
         sdk_address_policy(address_policy),
     )
     .await?;
@@ -366,11 +313,10 @@ mod tests {
     use taumaru_microvm::{SdkError, SnapshotResult};
 
     #[test]
-    fn elevated_command_preserves_name_path_and_password() {
+    fn elevated_command_preserves_name_path_and_address_policy() {
         let command = escalated_child_command(
             Some("web-01"),
             Some(Path::new("/tmp/export.tmvmsnap")),
-            Some("private"),
             Some(SnapshotAddressPolicyArg::Preserve),
         );
         assert_eq!(
@@ -379,8 +325,6 @@ mod tests {
                 OsString::from("snapshot"),
                 OsString::from("web-01"),
                 OsString::from("/tmp/export.tmvmsnap"),
-                OsString::from("--password"),
-                OsString::from("private"),
                 OsString::from("--address-policy"),
                 OsString::from("preserve"),
             ]
@@ -388,24 +332,17 @@ mod tests {
     }
 
     #[test]
-    fn forwards_password_when_elevating_an_interactive_selection() {
-        let command = escalated_child_command(None, None, Some("private"), None);
-        assert_eq!(
-            command,
-            [
-                OsString::from("snapshot"),
-                OsString::from("--password"),
-                OsString::from("private"),
-            ]
-        );
+    fn elevated_interactive_selection_forwards_no_secret_arguments() {
+        let command = escalated_child_command(None, None, None);
+        assert_eq!(command, [OsString::from("snapshot")]);
     }
 
     #[test]
-    fn success_report_contains_the_final_path_and_size_without_the_password() {
+    fn success_report_discloses_plaintext_contents_and_archive_size() {
         let result = SnapshotResult {
             vm_name: "web-01".to_owned(),
             output_path: PathBuf::from("/tmp/web-01.tmvmsnap"),
-            encrypted_size_bytes: 4096,
+            archive_size_bytes: 4096,
             source_was_running: true,
         };
 
@@ -413,11 +350,13 @@ mod tests {
 
         assert!(message.contains("/tmp/web-01.tmvmsnap"));
         assert!(message.contains("4096 bytes"));
-        assert!(!message.contains("private-passphrase"));
+        assert!(message.to_ascii_lowercase().contains("unencrypted"));
+        assert!(message.contains("VM disk"));
+        assert!(message.contains("SSH credentials"));
     }
 
     #[test]
-    fn destination_conflict_reports_no_overwrite_and_does_not_expose_a_password() {
+    fn destination_conflict_reports_no_overwrite() {
         let error = map_snapshot_error(SdkError::SnapshotOutputExists {
             path: PathBuf::from("/tmp/existing.tmvmsnap"),
         });
@@ -425,7 +364,6 @@ mod tests {
 
         assert!(message.contains("will not be overwritten"));
         assert!(message.contains("/tmp/existing.tmvmsnap"));
-        assert!(!message.contains("private-passphrase"));
     }
 
     #[test]

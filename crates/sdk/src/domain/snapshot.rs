@@ -32,11 +32,11 @@ pub enum SnapshotProgressStage {
     SanitizingNetwork,
     /// Copying a stable disk view when nested snapshots are unavailable.
     CopyingPrivateDisk,
-    /// Preparing the encrypted archive before payload streaming begins.
+    /// Preparing the archive before payload streaming begins.
     PreparingArchive,
-    /// Reading payload bytes and writing them into the encrypted archive.
+    /// Reading payload bytes and writing them into the archive.
     StreamingPayloads,
-    /// Writing archive metadata and finalizing compression and encryption.
+    /// Writing archive metadata and finalizing compression.
     FinalizingArchive,
 }
 
@@ -54,15 +54,18 @@ pub struct SnapshotProgress {
     pub total_bytes: u64,
 }
 
-/// Result of creating a password-encrypted MicroVM snapshot.
+/// Result of creating an unencrypted MicroVM snapshot archive.
+///
+/// The archive contains the VM disk and SSH credentials and is readable by any account that can
+/// access the output file.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SnapshotResult {
     /// Name of the captured MicroVM.
     pub vm_name: String,
-    /// Final path of the encrypted snapshot archive.
+    /// Final path of the unencrypted snapshot archive.
     pub output_path: PathBuf,
-    /// Number of encrypted bytes written to the archive.
-    pub encrypted_size_bytes: u64,
+    /// Number of compressed archive bytes written.
+    pub archive_size_bytes: u64,
     /// Whether the VM was running when the disk capture began.
     pub source_was_running: bool,
 }

@@ -22,9 +22,9 @@ pub(crate) enum Command {
     Start(StartArgs),
     /// Stop a running MicroVM by name or interactive selection.
     Stop(StopArgs),
-    /// Create a password-encrypted snapshot archive for a MicroVM.
+    /// Create an unencrypted snapshot archive for a MicroVM.
     Snapshot(SnapshotArgs),
-    /// Restore a stopped MicroVM from a password-encrypted snapshot archive.
+    /// Restore a stopped MicroVM from a supported snapshot archive.
     Restore(RestoreArgs),
     /// Delete a MicroVM by name or interactive selection.
     Delete(DeleteArgs),
@@ -142,10 +142,6 @@ pub(crate) struct SnapshotArgs {
     /// Non-interactive mode defaults to ./<NAME>.tmvmsnap.
     pub(crate) output_path: Option<std::path::PathBuf>,
 
-    /// Snapshot encryption password. Omit to enter it through a hidden prompt.
-    #[arg(long = "password", value_name = "PASSWORD")]
-    pub(crate) password: Option<String>,
-
     /// Whether to preserve source IPv4 assignments or allocate destination addresses later.
     #[arg(long = "address-policy", value_enum, value_name = "POLICY")]
     pub(crate) address_policy: Option<SnapshotAddressPolicyArg>,
@@ -164,11 +160,7 @@ pub(crate) struct RestoreArgs {
     /// Snapshot archive path; interactive mode prompts when omitted.
     pub(crate) archive_path: Option<std::path::PathBuf>,
 
-    /// Snapshot decryption password. Omit to enter it through a hidden prompt.
-    #[arg(long = "password", value_name = "PASSWORD")]
-    pub(crate) password: Option<String>,
-
-    /// Disable prompts and require an archive path and password.
+    /// Disable prompts and require an archive path.
     #[arg(long = "non-interactive")]
     pub(crate) non_interactive: bool,
 }
@@ -258,7 +250,7 @@ mod tests {
 
     #[test]
     fn snapshot_parser_accepts_interactive_name_and_output_forms() {
-        for (arguments, expected_name, expected_output, expected_password) in [
+        for (arguments, expected_name, expected_output, expected_policy) in [
             (vec!["microvm", "snapshot"], None, None, None),
             (
                 vec!["microvm", "snapshot", "web-01"],
@@ -272,14 +264,12 @@ mod tests {
                     "snapshot",
                     "web-01",
                     "./copy.tmvmsnap",
-                    "--password",
-                    "secret",
                     "--address-policy",
                     "preserve",
                 ],
                 Some("web-01"),
                 Some("./copy.tmvmsnap"),
-                Some("secret"),
+                Some(SnapshotAddressPolicyArg::Preserve),
             ),
         ] {
             let cli = Cli::try_parse_from(arguments).expect("snapshot command should parse");
@@ -294,24 +284,17 @@ mod tests {
                     .map(|path| path.to_string_lossy()),
                 expected_output.map(std::borrow::Cow::Borrowed)
             );
-            assert_eq!(snapshot.password.as_deref(), expected_password);
-            if expected_password.is_some() {
-                assert_eq!(
-                    snapshot.address_policy,
-                    Some(SnapshotAddressPolicyArg::Preserve)
-                );
-            }
+            assert_eq!(snapshot.address_policy, expected_policy);
         }
     }
 
     #[test]
     fn restore_parser_accepts_interactive_and_explicit_archive_forms() {
-        for (arguments, expected_path, expected_password, expected_non_interactive) in [
-            (vec!["microvm", "restore"], None, None, false),
+        for (arguments, expected_path, expected_non_interactive) in [
+            (vec!["microvm", "restore"], None, false),
             (
                 vec!["microvm", "restore", "./backup.tmvmsnap"],
                 Some("./backup.tmvmsnap"),
-                None,
                 false,
             ),
             (
@@ -319,12 +302,9 @@ mod tests {
                     "microvm",
                     "restore",
                     "./backup.tmvmsnap",
-                    "--password",
-                    "secret",
                     "--non-interactive",
                 ],
                 Some("./backup.tmvmsnap"),
-                Some("secret"),
                 true,
             ),
         ] {
@@ -339,9 +319,14 @@ mod tests {
                     .map(|path| path.to_string_lossy()),
                 expected_path.map(std::borrow::Cow::Borrowed)
             );
-            assert_eq!(restore.password.as_deref(), expected_password);
             assert_eq!(restore.non_interactive, expected_non_interactive);
         }
+    }
+
+    #[test]
+    fn snapshot_and_restore_reject_the_removed_password_option() {
+        assert!(Cli::try_parse_from(["microvm", "snapshot", "--password", "secret"]).is_err());
+        assert!(Cli::try_parse_from(["microvm", "restore", "--password", "secret"]).is_err());
     }
 
     #[test]

@@ -37,6 +37,53 @@ fn public_artifact_types_are_exported() {
     let _ = std::mem::size_of::<SdkError>();
     let _ = std::mem::size_of::<SshConnectionInfo>();
 }
+#[tokio::test]
+async fn public_snapshot_api_uses_the_password_free_archive_contract() {
+    use std::path::PathBuf;
+    use taumaru_microvm::{MicroVmSdk, SdkError, SnapshotAddressPolicy, SnapshotResult};
+    use tempfile::tempdir;
+
+    let home = tempdir().expect("temporary SDK home should be created");
+    let sdk = MicroVmSdk::new(home.path()).expect("SDK construction should work");
+    let output = home.path().join("snapshot.tmvmsnap");
+    let error = sdk
+        .create_snapshot("missing_vm", &output, SnapshotAddressPolicy::PreserveIpv4)
+        .await
+        .expect_err("unknown VM should be rejected");
+
+    assert!(matches!(error, SdkError::NotFound { .. }));
+    let result = SnapshotResult {
+        vm_name: "web-01".to_owned(),
+        output_path: PathBuf::from("web-01.tmvmsnap"),
+        archive_size_bytes: 4096,
+        source_was_running: false,
+    };
+    assert_eq!(result.archive_size_bytes, 4096);
+}
+
+#[tokio::test]
+async fn public_restore_api_uses_an_archive_path_only_request() {
+    use taumaru_microvm::{MicroVmSdk, RestoreRequest, SdkError};
+    use tempfile::tempdir;
+
+    let home = tempdir().expect("temporary SDK home should be created");
+    let sdk = MicroVmSdk::new(home.path()).expect("SDK construction should work");
+    let error = sdk
+        .restore_snapshot(RestoreRequest {
+            archive_path: home.path().join("missing.tmvmsnap"),
+        })
+        .await
+        .expect_err("missing archive should return a typed error");
+
+    assert!(matches!(error, SdkError::Filesystem { .. }));
+    assert!(
+        sdk.list_microvms()
+            .await
+            .expect("inventory should be readable")
+            .is_empty()
+    );
+}
+
 #[test]
 fn public_resolver_method_is_available_without_process_local_state() {
     use taumaru_microvm::MicroVmSdk;

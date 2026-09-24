@@ -1,11 +1,8 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufReader, Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
-use age::secrecy::SecretString;
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
@@ -21,68 +18,7 @@ const MAX_ARCHIVE_BYTES: u64 = 3 * 1024 * 1024 * 1024 * 1024;
 const MAX_ROOTFS_BYTES: u64 = 2 * 1024 * 1024 * 1024 * 1024;
 const MAX_KERNEL_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_SSH_KEY_BYTES: u64 = 1024 * 1024;
-const MAX_SCRYPT_WORK_FACTOR: u8 = 20;
 const MANIFEST_MEMBER: &str = "manifest.json";
-
-struct ArchiveProgressReader {
-    source: File,
-    completed_bytes: Arc<AtomicU64>,
-}
-
-impl Read for ArchiveProgressReader {
-    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        let read = self.source.read(buffer)?;
-        if read > 0 {
-            self.completed_bytes
-                .fetch_add(read as u64, Ordering::Relaxed);
-        }
-        Ok(read)
-    }
-}
-
-struct ArchiveProgress {
-    completed_bytes: Arc<AtomicU64>,
-    total_bytes: u64,
-    last_reported_percent: u64,
-}
-
-impl ArchiveProgress {
-    fn new(total_bytes: u64) -> Self {
-        Self {
-            completed_bytes: Arc::new(AtomicU64::new(0)),
-            total_bytes,
-            last_reported_percent: 0,
-        }
-    }
-
-    fn wrap(&self, source: File) -> ArchiveProgressReader {
-        ArchiveProgressReader {
-            source,
-            completed_bytes: Arc::clone(&self.completed_bytes),
-        }
-    }
-
-    fn report(&mut self, on_progress: &mut dyn FnMut(u64, u64)) {
-        if self.total_bytes == 0 {
-            return;
-        }
-        let completed_bytes = self
-            .completed_bytes
-            .load(Ordering::Relaxed)
-            .min(self.total_bytes);
-        let percent = ((u128::from(completed_bytes) * 100) / u128::from(self.total_bytes)) as u64;
-        let report_percent = percent.min(99);
-        if report_percent > self.last_reported_percent {
-            on_progress(completed_bytes.min(self.total_bytes - 1), self.total_bytes);
-            self.last_reported_percent = report_percent;
-        }
-    }
-
-    fn finish(&mut self, on_progress: &mut dyn FnMut(u64, u64)) {
-        on_progress(self.total_bytes, self.total_bytes);
-        self.last_reported_percent = 100;
-    }
-}
 
 pub(crate) struct StagedSnapshot {
     pub manifest: SnapshotManifest,
@@ -95,17 +31,13 @@ pub(crate) struct StagedSnapshot {
 
 pub(crate) fn read_archive(
     archive_path: &Path,
-    password: &str,
     staging_path: &Path,
     cancellation: CancellationToken,
     on_progress: &mut dyn FnMut(u64, u64),
 ) -> Result<StagedSnapshot, SdkError> {
-    if password.is_empty() {
-        return Err(SdkError::InvalidRequest {
-            field: "password".to_owned(),
-            reason: "must not be empty".to_owned(),
-        });
-    }
+    const LEGACY_AGE_HEADER: &[u8] = b"age-encryption.org/v1\n";
+    const ZSTANDARD_MAGIC: &[u8; 4] = &[0x28, 0xb5, 0x2f, 0xfd];
+
     let archive_metadata = fs::symlink_metadata(archive_path)
         .map_err(|error| SdkError::filesystem("inspect snapshot archive", archive_path, error))?;
     if archive_metadata.file_type().is_symlink() || !archive_metadata.is_file() {
@@ -117,39 +49,44 @@ pub(crate) fn read_archive(
     if archive_metadata.len() == 0 || archive_metadata.len() > MAX_ARCHIVE_BYTES {
         return Err(restore_archive_error(
             "validate snapshot archive",
-            "encrypted archive size is outside the supported limit",
+            "archive size is outside the supported limit",
         ));
     }
-    let staging_guard = StagingDirectoryGuard::create(staging_path)?;
-    let source = File::open(archive_path)
+
+    let mut source = File::open(archive_path)
         .map_err(|error| SdkError::filesystem("open snapshot archive", archive_path, error))?;
-    let mut progress = ArchiveProgress::new(archive_metadata.len());
-    on_progress(0, archive_metadata.len());
-    let source = progress.wrap(source);
-    let decryptor = age::Decryptor::new(BufReader::new(source)).map_err(|error| {
-        restore_archive_error(
-            "read age header",
-            &format!("invalid encrypted archive: {error}"),
-        )
-    })?;
-    if !decryptor.is_scrypt() {
+    let mut prefix = [0_u8; 22];
+    let mut prefix_len = 0;
+    while prefix_len < prefix.len() {
+        let read = source.read(&mut prefix[prefix_len..]).map_err(|error| {
+            SdkError::filesystem("read snapshot archive header", archive_path, error)
+        })?;
+        if read == 0 {
+            break;
+        }
+        prefix_len += read;
+    }
+    if prefix_len >= LEGACY_AGE_HEADER.len()
+        && &prefix[..LEGACY_AGE_HEADER.len()] == LEGACY_AGE_HEADER
+    {
         return Err(restore_archive_error(
-            "validate encryption",
-            "archive does not use password-based age encryption",
+            "detect legacy snapshot format",
+            "age-encrypted snapshots are unsupported; create a new unencrypted snapshot and try again",
         ));
     }
-    let mut identity = age::scrypt::Identity::new(SecretString::from(password.to_owned()));
-    identity.set_max_work_factor(MAX_SCRYPT_WORK_FACTOR);
-    let decrypted = decryptor
-        .decrypt(std::iter::once(&identity as &dyn age::Identity))
-        .map_err(|error| {
-            restore_archive_error(
-                "decrypt snapshot",
-                &format!("password is incorrect or encrypted data is damaged: {error}"),
-            )
-        })?;
-    progress.report(on_progress);
-    let decoder = zstd::stream::read::Decoder::new(decrypted)
+    if prefix_len < ZSTANDARD_MAGIC.len() || &prefix[..ZSTANDARD_MAGIC.len()] != ZSTANDARD_MAGIC {
+        return Err(restore_archive_error(
+            "validate snapshot format",
+            "archive is not a supported unencrypted Zstandard snapshot",
+        ));
+    }
+    source
+        .seek(SeekFrom::Start(0))
+        .map_err(|error| SdkError::filesystem("rewind snapshot archive", archive_path, error))?;
+
+    let staging_guard = StagingDirectoryGuard::create(staging_path)?;
+    on_progress(0, 0);
+    let decoder = zstd::stream::read::Decoder::new(source)
         .map_err(|error| restore_archive_error("decompress snapshot", &error.to_string()))?;
     let mut archive = tar::Archive::new(decoder);
     let mut seen = HashSet::new();
@@ -199,6 +136,9 @@ pub(crate) fn read_archive(
                     &format!("archive member {member:?} exceeds its supported size"),
                 ));
             }
+            if member == ROOTFS_MEMBER {
+                on_progress(0, declared_size);
+            }
             if member == MANIFEST_MEMBER {
                 let mut bytes = Vec::with_capacity(declared_size as usize);
                 entry
@@ -214,7 +154,6 @@ pub(crate) fn read_archive(
                     ));
                 }
                 manifest_bytes = Some(bytes);
-                progress.report(on_progress);
                 continue;
             }
             let output_path = staging_guard.member_path(&member)?;
@@ -238,7 +177,12 @@ pub(crate) fn read_archive(
                 })?;
                 hasher.update(&buffer[..read]);
                 member_bytes = member_bytes.saturating_add(read as u64);
-                progress.report(on_progress);
+                if member == ROOTFS_MEMBER {
+                    on_progress(
+                        member_bytes.min(declared_size.saturating_sub(1)),
+                        declared_size,
+                    );
+                }
             }
             if member_bytes != declared_size {
                 return Err(restore_archive_error(
@@ -271,14 +215,13 @@ pub(crate) fn read_archive(
     loop {
         let read = decoder.read(&mut tail).map_err(|error| {
             restore_archive_error(
-                "authenticate encrypted archive",
+                "verify compressed archive",
                 &format!("compressed stream is damaged or incomplete: {error}"),
             )
         })?;
         if read == 0 {
             break;
         }
-        progress.report(on_progress);
         if tail[..read].iter().any(|byte| *byte != 0) {
             return Err(restore_archive_error(
                 "validate TAR end marker",
@@ -289,18 +232,17 @@ pub(crate) fn read_archive(
     if cancellation.is_cancelled() {
         return Err(SdkError::RestoreCancelled);
     }
-    let mut encrypted_reader = decoder.finish();
+    let mut archive_reader = decoder.finish();
     let mut discard = [0_u8; COPY_BUFFER_SIZE];
-    let trailing_bytes = encrypted_reader.read(&mut discard).map_err(|error| {
+    let trailing_bytes = archive_reader.read(&mut discard).map_err(|error| {
         restore_archive_error(
-            "authenticate encrypted archive",
-            &format!("encrypted stream authentication failed: {error}"),
+            "validate archive framing",
+            &format!("could not read bytes after the compressed frame: {error}"),
         )
     })?;
-    progress.report(on_progress);
     if trailing_bytes != 0 {
         return Err(restore_archive_error(
-            "validate encrypted archive framing",
+            "validate archive framing",
             "unexpected bytes follow the compressed TAR stream",
         ));
     }
@@ -320,9 +262,13 @@ pub(crate) fn read_archive(
     let kernel_path = path_for(KERNEL_MEMBER)?;
     let private_key_path = path_for(PRIVATE_KEY_MEMBER)?;
     let public_key_path = path_for(PUBLIC_KEY_MEMBER)?;
+    let rootfs_size_bytes = extracted
+        .get(ROOTFS_MEMBER)
+        .map(|payload| payload.size_bytes)
+        .ok_or_else(|| restore_archive_error("stage snapshot", "root disk payload is missing"))?;
     set_mode(&kernel_path, 0o644)?;
     set_mode(&public_key_path, 0o644)?;
-    progress.finish(on_progress);
+    on_progress(rootfs_size_bytes, rootfs_size_bytes);
     Ok(StagedSnapshot {
         manifest,
         rootfs_path,
@@ -490,7 +436,6 @@ mod tests {
     use std::io::Write;
     use std::path::Path;
 
-    use age::secrecy::SecretString;
     use sha2::{Digest, Sha256};
     use tempfile::tempdir;
 
@@ -500,22 +445,19 @@ mod tests {
 
     use super::read_archive;
 
-    const PASSWORD: &str = "restore-test-password";
-
     #[test]
-    fn reads_authenticated_v2_archive_with_exact_fixed_members_and_real_progress() {
+    fn reads_plain_v3_archive_with_exact_fixed_members_and_real_progress() {
         let fixture = ArchiveFixture::new(false, false);
         let directory = tempdir().expect("test directory");
         let staging = directory.path().join("stage");
         let mut ticks = Vec::new();
         let restored = read_archive(
             &fixture.archive_path,
-            PASSWORD,
             &staging,
             tokio_util::sync::CancellationToken::new(),
             &mut |completed, total| ticks.push((completed, total)),
         )
-        .expect("valid encrypted archive should restore");
+        .expect("valid unencrypted archive should restore");
         assert_eq!(restored.manifest.vm.name, "demo");
         assert_eq!(
             fs::read(&restored.rootfs_path).expect("disk bytes"),
@@ -525,16 +467,54 @@ mod tests {
             fs::read(&restored.kernel_path).expect("kernel bytes"),
             b"kernel"
         );
-        let total = fs::metadata(&fixture.archive_path)
-            .expect("encrypted archive metadata")
+        let archive_size = fs::metadata(&fixture.archive_path)
+            .expect("snapshot archive metadata")
             .len();
-        assert_eq!(ticks.first().copied(), Some((0, total)));
+        let disk_size = b"root-disk".len() as u64;
+        assert!(archive_size > disk_size);
+        assert_eq!(ticks.first().copied(), Some((0, 0)));
+        assert!(ticks.contains(&(0, disk_size)));
         assert!(
             ticks
                 .windows(2)
                 .any(|progress| progress[1].0 > progress[0].0)
         );
-        assert_eq!(ticks.last().copied(), Some((total, total)));
+        assert_eq!(ticks.last().copied(), Some((disk_size, disk_size)));
+    }
+
+    #[test]
+    fn reports_uncompressed_rootfs_progress_for_a_highly_compressed_archive() {
+        let disk = vec![0_u8; 4 * 1024 * 1024];
+        let fixture = ArchiveFixture::with_disk(&disk);
+        let directory = tempdir().expect("test directory");
+        let staging = directory.path().join("stage");
+        let mut ticks = Vec::new();
+
+        let restored = read_archive(
+            &fixture.archive_path,
+            &staging,
+            tokio_util::sync::CancellationToken::new(),
+            &mut |completed, total| ticks.push((completed, total)),
+        )
+        .expect("valid unencrypted archive should restore");
+
+        let archive_size = fs::metadata(&fixture.archive_path)
+            .expect("snapshot archive metadata")
+            .len();
+        let disk_size = disk.len() as u64;
+        assert!(archive_size < disk_size / 10);
+        assert_eq!(ticks.first().copied(), Some((0, 0)));
+        assert!(ticks.contains(&(0, disk_size)));
+        assert!(ticks.iter().any(|(completed, total)| {
+            *total == disk_size && *completed > 0 && *completed < disk_size
+        }));
+        assert_eq!(ticks.last().copied(), Some((disk_size, disk_size)));
+        assert_eq!(
+            fs::metadata(&restored.rootfs_path)
+                .expect("staged disk metadata")
+                .len(),
+            disk_size
+        );
     }
 
     #[test]
@@ -545,7 +525,6 @@ mod tests {
         assert!(
             read_archive(
                 &fixture.archive_path,
-                PASSWORD,
                 &staging,
                 tokio_util::sync::CancellationToken::new(),
                 &mut |_, _| {}
@@ -563,7 +542,6 @@ mod tests {
         assert!(
             read_archive(
                 &fixture.archive_path,
-                PASSWORD,
                 &staging,
                 tokio_util::sync::CancellationToken::new(),
                 &mut |_, _| {}
@@ -574,22 +552,31 @@ mod tests {
     }
 
     #[test]
-    fn rejects_a_wrong_password_and_removes_staging_directory() {
-        let fixture = ArchiveFixture::new(false, false);
+    fn rejects_legacy_age_header_before_creating_staging_directory() {
         let directory = tempdir().expect("test directory");
+        let archive_path = directory.path().join("legacy.tmvmsnap");
+        fs::write(
+            &archive_path,
+            b"age-encryption.org/v1\n-> scrypt\nlegacy fixture",
+        )
+        .expect("legacy archive fixture should be written");
         let staging = directory.path().join("stage");
 
         let error = read_archive(
-            &fixture.archive_path,
-            "incorrect-password",
+            &archive_path,
             &staging,
             tokio_util::sync::CancellationToken::new(),
             &mut |_, _| {},
         )
         .err()
-        .expect("a wrong password must be rejected");
+        .expect("legacy age-encrypted archive must be rejected");
 
         assert!(matches!(error, SdkError::RestoreArchive { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("create a new unencrypted snapshot")
+        );
         assert!(!staging.exists());
     }
 
@@ -601,7 +588,6 @@ mod tests {
 
         let error = read_archive(
             &fixture.archive_path,
-            PASSWORD,
             &staging,
             tokio_util::sync::CancellationToken::new(),
             &mut |_, _| {},
@@ -623,17 +609,29 @@ mod tests {
 
     impl ArchiveFixture {
         fn new(duplicate_root: bool, corrupt_digest: bool) -> Self {
-            Self::with_version(2, duplicate_root, corrupt_digest)
+            Self::with_version(3, duplicate_root, corrupt_digest)
         }
 
         fn with_version(version: u32, duplicate_root: bool, corrupt_digest: bool) -> Self {
+            Self::with_version_and_disk(version, duplicate_root, corrupt_digest, b"root-disk")
+        }
+
+        fn with_disk(disk: &[u8]) -> Self {
+            Self::with_version_and_disk(3, false, false, disk)
+        }
+
+        fn with_version_and_disk(
+            version: u32,
+            duplicate_root: bool,
+            corrupt_digest: bool,
+            disk: &[u8],
+        ) -> Self {
             let directory = tempdir().expect("fixture directory");
             let credentials = Ed25519CredentialStore
                 .generate(directory.path())
                 .expect("test SSH key generation");
             let private_key = fs::read(&credentials.private_key_path).expect("private key");
             let public_key = fs::read(&credentials.public_key_path).expect("public key");
-            let disk = b"root-disk";
             let kernel = b"kernel";
             let mut root_hash = digest(disk);
             if corrupt_digest {
@@ -652,7 +650,7 @@ mod tests {
                 version,
             );
             let archive_path = directory.path().join("snapshot.tmvmsnap");
-            write_encrypted_archive(
+            write_plain_archive(
                 &archive_path,
                 &manifest,
                 disk,
@@ -667,7 +665,6 @@ mod tests {
             }
         }
     }
-
     #[allow(clippy::too_many_arguments)]
     fn manifest_json(
         disk_size: u64,
@@ -703,7 +700,7 @@ mod tests {
         })).expect("serialize fixture manifest")
     }
 
-    fn write_encrypted_archive(
+    fn write_plain_archive(
         path: &Path,
         manifest: &[u8],
         disk: &[u8],
@@ -713,10 +710,10 @@ mod tests {
         duplicate_root: bool,
     ) {
         let file = fs::File::create(path).expect("archive output");
-        let encryptor =
-            age::Encryptor::with_user_passphrase(SecretString::from(PASSWORD.to_owned()));
-        let age_writer = encryptor.wrap_output(file).expect("age writer");
-        let zstd_writer = zstd::stream::write::Encoder::new(age_writer, 1).expect("zstd writer");
+        let mut zstd_writer = zstd::stream::write::Encoder::new(file, 3).expect("zstd writer");
+        zstd_writer
+            .include_checksum(true)
+            .expect("Zstandard checksum should be enabled");
         let mut tar_writer = tar::Builder::new(zstd_writer);
         append(&mut tar_writer, "payload/rootfs.ext4", disk, 0o600);
         if duplicate_root {
@@ -738,8 +735,7 @@ mod tests {
         append(&mut tar_writer, "manifest.json", manifest, 0o600);
         tar_writer.finish().expect("finish TAR");
         let zstd_writer = tar_writer.into_inner().expect("finish TAR writer");
-        let age_writer = zstd_writer.finish().expect("finish Zstandard");
-        age_writer.finish().expect("finish age");
+        zstd_writer.finish().expect("finish Zstandard");
     }
 
     fn append<W: Write>(writer: &mut tar::Builder<W>, path: &str, contents: &[u8], mode: u32) {

@@ -296,9 +296,9 @@ impl SnapshotProgressRenderer {
             SnapshotProgressStage::PreparingPrivateView => "Preparing private snapshot view",
             SnapshotProgressStage::SanitizingNetwork => "Removing source network settings",
             SnapshotProgressStage::CopyingPrivateDisk => "Copying private snapshot disk",
-            SnapshotProgressStage::PreparingArchive => "Preparing encrypted archive",
-            SnapshotProgressStage::StreamingPayloads => "Copying and encrypting snapshot",
-            SnapshotProgressStage::FinalizingArchive => "Finalizing encrypted snapshot",
+            SnapshotProgressStage::PreparingArchive => "Preparing snapshot archive",
+            SnapshotProgressStage::StreamingPayloads => "Writing snapshot payloads",
+            SnapshotProgressStage::FinalizingArchive => "Finalizing snapshot archive",
         };
         self.bar.set_message(message);
     }
@@ -310,12 +310,14 @@ impl SnapshotProgressRenderer {
     }
 }
 
+type SharedRestoreProgressUpdate = Arc<Mutex<Option<(RestoreProgressStage, Option<u8>)>>>;
+
 #[derive(Clone)]
 pub(crate) struct RestoreProgressRenderer {
     bar: ProgressBar,
     interactive: bool,
     color: bool,
-    last_non_interactive_update: Arc<Mutex<Option<(RestoreProgressStage, Option<u8>)>>>,
+    last_non_interactive_update: SharedRestoreProgressUpdate,
 }
 
 impl RestoreProgressRenderer {
@@ -352,8 +354,8 @@ impl RestoreProgressRenderer {
             self.bar.set_position(position);
         }
         let message = match progress.stage {
-            RestoreProgressStage::ValidatingInput => "Validating encrypted snapshot",
-            RestoreProgressStage::Staging => "Decrypting and staging snapshot",
+            RestoreProgressStage::ValidatingInput => "Validating snapshot archive",
+            RestoreProgressStage::Staging => "Staging snapshot disk",
             RestoreProgressStage::Verifying => "Verifying snapshot and restored disk integrity",
             RestoreProgressStage::PreparingDestination => "Preparing destination VM",
             RestoreProgressStage::Installing => "Installing disk, kernel, and keys",
@@ -403,15 +405,17 @@ pub(crate) fn write_restore_result(
         stdout,
         "{}",
         format_microvm_result(
-            &result.vm_name,
-            "restored",
-            result.network.mode == taumaru_microvm::NetworkMode::Lan,
-            &result.network,
-            result.disk_size_bytes,
-            result.memory_bytes,
-            result.vcpu_count,
-            &result.volume_path,
-            &result.ssh,
+            MicroVmResultView {
+                name: &result.vm_name,
+                action: "restored",
+                expose_on_lan: result.network.mode == taumaru_microvm::NetworkMode::Lan,
+                network: &result.network,
+                disk_size_bytes: result.disk_size_bytes,
+                memory_bytes: result.memory_bytes,
+                vcpu_count: result.vcpu_count,
+                volume_path: &result.volume_path,
+                ssh: &result.ssh,
+            },
             capabilities,
         )
     )
@@ -1055,37 +1059,41 @@ pub(crate) fn format_creation_progress_line(
     }
 }
 
-fn format_microvm_result(
-    name: &str,
-    action: &str,
+struct MicroVmResultView<'a> {
+    name: &'a str,
+    action: &'a str,
     expose_on_lan: bool,
-    network: &taumaru_microvm::NetworkConfiguration,
+    network: &'a taumaru_microvm::NetworkConfiguration,
     disk_size_bytes: u64,
     memory_bytes: u64,
     vcpu_count: u32,
-    volume_path: &std::path::Path,
-    ssh: &taumaru_microvm::SshConnectionInfo,
+    volume_path: &'a std::path::Path,
+    ssh: &'a taumaru_microvm::SshConnectionInfo,
+}
+
+fn format_microvm_result(
+    result: MicroVmResultView<'_>,
     capabilities: TerminalCapabilities,
 ) -> String {
-    let network_summary = if expose_on_lan {
-        format!("LAN exposed {}", network.guest_address)
+    let network_summary = if result.expose_on_lan {
+        format!("LAN exposed {}", result.network.guest_address)
     } else {
-        format!("host-only {}", network.guest_address)
+        format!("host-only {}", result.network.guest_address)
     };
     let capacity = format!(
         "{} · {} · {} vCPUs",
-        format_gb(disk_size_bytes),
-        format_mb_gb(memory_bytes),
-        vcpu_count
+        format_gb(result.disk_size_bytes),
+        format_mb_gb(result.memory_bytes),
+        result.vcpu_count
     );
     let ssh_summary = format!(
         "{}:{} · key {}",
-        ssh.user,
-        ssh.port,
-        ssh.private_key_path.display()
+        result.ssh.user,
+        result.ssh.port,
+        result.ssh.private_key_path.display()
     );
     let title = paint(
-        format!("MicroVM {name} {action}"),
+        format!("MicroVM {} {}", result.name, result.action),
         ANSI_BOLD,
         capabilities.color,
     );
@@ -1099,11 +1107,15 @@ fn format_microvm_result(
     output.push_str(&format!("{check} {title}\n{rule}\n\n"));
     output.push_str(&format!("  {network_label} {network_summary}\n"));
     output.push_str(&format!("  {resources_label} {capacity}\n"));
-    output.push_str(&format!("  {volume_label} {}\n", volume_path.display()));
+    output.push_str(&format!(
+        "  {volume_label} {}\n",
+        result.volume_path.display()
+    ));
     output.push_str(&format!("  {ssh_label} {ssh_summary}\n"));
     output.push_str(&format!(
-        "  {} microvm start {name}\n",
+        "  {} microvm start {}\n",
         paint("Start:", ANSI_DIM, capabilities.color),
+        result.name,
     ));
     output
 }
@@ -1115,15 +1127,17 @@ pub(crate) fn format_new_result(
     capabilities: TerminalCapabilities,
 ) -> String {
     let mut output = format_microvm_result(
-        &result.name,
-        "created",
-        request.expose_on_lan,
-        &result.network,
-        result.disk_size_bytes,
-        result.memory_bytes,
-        result.vcpu_count,
-        &result.volume_path,
-        &result.ssh,
+        MicroVmResultView {
+            name: &result.name,
+            action: "created",
+            expose_on_lan: request.expose_on_lan,
+            network: &result.network,
+            disk_size_bytes: result.disk_size_bytes,
+            memory_bytes: result.memory_bytes,
+            vcpu_count: result.vcpu_count,
+            volume_path: &result.volume_path,
+            ssh: &result.ssh,
+        },
         capabilities,
     );
     if interrupted {

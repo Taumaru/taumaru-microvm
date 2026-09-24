@@ -4,7 +4,6 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use age::secrecy::SecretString;
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
@@ -25,7 +24,6 @@ static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 pub(crate) struct SnapshotArchiveInput {
     pub vm_name: String,
     pub output_path: PathBuf,
-    pub password: String,
     pub metadata: SnapshotPortableMetadata,
     pub payloads: Vec<SnapshotPayload>,
 }
@@ -71,7 +69,7 @@ pub(crate) struct SnapshotPayload {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SnapshotArchiveResult {
     pub output_path: PathBuf,
-    pub encrypted_size_bytes: u64,
+    pub archive_size_bytes: u64,
 }
 
 pub(crate) fn publish_staged_archive(
@@ -100,7 +98,7 @@ pub(crate) fn publish_staged_archive(
                 path: output_path.clone(),
             }
         } else {
-            SdkError::filesystem("publish encrypted snapshot", &output_path, error)
+            SdkError::filesystem("publish snapshot archive", &output_path, error)
         };
         let cleanup = fs::remove_file(&staged.output_path).err().map(|source| {
             SdkError::filesystem(
@@ -112,34 +110,23 @@ pub(crate) fn publish_staged_archive(
         return Err(with_cleanup(primary, cleanup));
     }
     if let Err(error) = fs::remove_file(&staged.output_path) {
-        let primary = SdkError::filesystem(
-            "remove staged encrypted snapshot",
-            &staged.output_path,
-            error,
-        );
+        let primary =
+            SdkError::filesystem("remove staged snapshot archive", &staged.output_path, error);
         let output_cleanup = fs::remove_file(&output_path).err().map(|source| {
-            SdkError::filesystem(
-                "remove unpublished encrypted snapshot",
-                &output_path,
-                source,
-            )
+            SdkError::filesystem("remove unpublished snapshot archive", &output_path, source)
         });
         return Err(with_cleanup(primary, output_cleanup));
     }
     if let Err(error) = File::open(parent).and_then(|directory| directory.sync_all()) {
         let primary = SdkError::filesystem("sync snapshot output directory", parent, error);
         let output_cleanup = fs::remove_file(&output_path).err().map(|source| {
-            SdkError::filesystem(
-                "remove unpublished encrypted snapshot",
-                &output_path,
-                source,
-            )
+            SdkError::filesystem("remove unpublished snapshot archive", &output_path, source)
         });
         return Err(with_cleanup(primary, output_cleanup));
     }
     Ok(SnapshotArchiveResult {
         output_path,
-        encrypted_size_bytes: staged.encrypted_size_bytes,
+        archive_size_bytes: staged.archive_size_bytes,
     })
 }
 
@@ -156,7 +143,7 @@ where
 }
 
 pub(crate) fn create_archive_with_progress<F, P>(
-    mut input: SnapshotArchiveInput,
+    input: SnapshotArchiveInput,
     cancellation: CancellationToken,
     check_view: F,
     mut on_progress: P,
@@ -165,12 +152,6 @@ where
     F: Fn() -> Result<(), SdkError>,
     P: FnMut(SnapshotProgress),
 {
-    if input.password.is_empty() {
-        return Err(SdkError::InvalidRequest {
-            field: "password".to_owned(),
-            reason: "must not be empty".to_owned(),
-        });
-    }
     let output_path = normalize_output_path(&input.output_path)?;
     if path_entry_exists(&output_path)? {
         return Err(SdkError::SnapshotOutputExists { path: output_path });
@@ -190,16 +171,16 @@ where
     }
 
     let total_bytes = payload_total_bytes(&input.payloads)?;
-    let (temp_path, temp_file) = create_private_temp(parent)?;
+    let (temp_path, temp_file) = create_snapshot_temp(parent)?;
     let mut temp_guard = TempPathGuard::new(temp_path.clone());
     on_progress(SnapshotProgress {
         stage: SnapshotProgressStage::StreamingPayloads,
         completed_bytes: 0,
         total_bytes,
     });
-    let result = write_encrypted_stream(
+    let result = write_snapshot_stream(
         temp_file,
-        &mut input,
+        &input,
         cancellation.clone(),
         &check_view,
         total_bytes,
@@ -210,14 +191,14 @@ where
         Err(error) => return Err(with_cleanup(error, temp_guard.remove().err())),
     };
     if let Err(source) = temp_file.sync_all() {
-        let primary = SdkError::filesystem("sync encrypted snapshot", &temp_path, source);
+        let primary = SdkError::filesystem("sync snapshot archive", &temp_path, source);
         drop(temp_file);
         return Err(with_cleanup(primary, temp_guard.remove().err()));
     }
-    let encrypted_size_bytes = match temp_file.metadata() {
+    let archive_size_bytes = match temp_file.metadata() {
         Ok(metadata) => metadata.len(),
         Err(source) => {
-            let primary = SdkError::filesystem("inspect encrypted snapshot", &temp_path, source);
+            let primary = SdkError::filesystem("inspect snapshot archive", &temp_path, source);
             drop(temp_file);
             return Err(with_cleanup(primary, temp_guard.remove().err()));
         }
@@ -242,34 +223,26 @@ where
             ));
         }
         Err(error) => {
-            let primary = SdkError::filesystem("publish encrypted snapshot", &output_path, error);
+            let primary = SdkError::filesystem("publish snapshot archive", &output_path, error);
             return Err(with_cleanup(primary, temp_guard.remove().err()));
         }
     }
     if let Err(primary) = temp_guard.remove() {
         let output_cleanup = fs::remove_file(&output_path).err().map(|source| {
-            SdkError::filesystem(
-                "remove unpublished encrypted snapshot",
-                &output_path,
-                source,
-            )
+            SdkError::filesystem("remove unpublished snapshot archive", &output_path, source)
         });
         return Err(with_cleanup(primary, output_cleanup));
     }
     if let Err(source) = File::open(parent).and_then(|directory| directory.sync_all()) {
         let primary = SdkError::filesystem("sync snapshot output directory", parent, source);
         let output_cleanup = fs::remove_file(&output_path).err().map(|cleanup| {
-            SdkError::filesystem(
-                "remove unpublished encrypted snapshot",
-                &output_path,
-                cleanup,
-            )
+            SdkError::filesystem("remove unpublished snapshot archive", &output_path, cleanup)
         });
         return Err(with_cleanup(primary, output_cleanup));
     }
     Ok(SnapshotArchiveResult {
         output_path,
-        encrypted_size_bytes,
+        archive_size_bytes,
     })
 }
 
@@ -288,9 +261,9 @@ fn payload_total_bytes(payloads: &[SnapshotPayload]) -> Result<u64, SdkError> {
     })
 }
 
-fn write_encrypted_stream<F, P>(
+fn write_snapshot_stream<F, P>(
     output: File,
-    input: &mut SnapshotArchiveInput,
+    input: &SnapshotArchiveInput,
     cancellation: CancellationToken,
     check_view: &F,
     total_payload_bytes: u64,
@@ -300,13 +273,11 @@ where
     F: Fn() -> Result<(), SdkError>,
     P: FnMut(SnapshotProgress),
 {
-    let secret = SecretString::from(std::mem::take(&mut input.password));
-    let encryptor = age::Encryptor::with_user_passphrase(secret);
-    let age_writer = encryptor
-        .wrap_output(output)
-        .map_err(|error| archive_error("start age encryption", error))?;
-    let zstd_writer = zstd::stream::write::Encoder::new(age_writer, 3)
+    let mut zstd_writer = zstd::stream::write::Encoder::new(output, 3)
         .map_err(|error| archive_error("start Zstandard compression", error))?;
+    zstd_writer
+        .include_checksum(true)
+        .map_err(|error| archive_error("enable Zstandard frame checksum", error))?;
     let mut tar_writer = tar::Builder::new(zstd_writer);
     let mut records = Vec::with_capacity(input.payloads.len());
     let mut completed_payload_bytes = 0_u64;
@@ -530,12 +501,9 @@ where
     let zstd_writer = tar_writer
         .into_inner()
         .map_err(|error| archive_error("finalize TAR archive", error))?;
-    let age_writer = zstd_writer
+    zstd_writer
         .finish()
-        .map_err(|error| archive_error("finish Zstandard compression", error))?;
-    age_writer
-        .finish()
-        .map_err(|error| archive_error("finish age encryption", error))
+        .map_err(|error| archive_error("finish Zstandard compression", error))
 }
 
 fn architecture_name(architecture: &Architecture) -> &'static str {
@@ -721,7 +689,7 @@ impl TempPathGuard {
                 Ok(())
             }
             Err(error) => Err(SdkError::filesystem(
-                "remove encrypted snapshot temporary file",
+                "remove snapshot archive temporary file",
                 &self.path,
                 error,
             )),
@@ -737,7 +705,7 @@ impl Drop for TempPathGuard {
     }
 }
 
-fn create_private_temp(parent: &Path) -> Result<(PathBuf, File), SdkError> {
+fn create_snapshot_temp(parent: &Path) -> Result<(PathBuf, File), SdkError> {
     for _ in 0..128 {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -753,14 +721,14 @@ fn create_private_temp(parent: &Path) -> Result<(PathBuf, File), SdkError> {
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
+            options.mode(0o666);
         }
         match options.open(&path) {
             Ok(file) => return Ok((path, file)),
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(error) => {
                 return Err(SdkError::filesystem(
-                    "create encrypted snapshot temporary file",
+                    "create snapshot archive temporary file",
                     path,
                     error,
                 ));
@@ -768,7 +736,7 @@ fn create_private_temp(parent: &Path) -> Result<(PathBuf, File), SdkError> {
         }
     }
     Err(SdkError::SnapshotArchive {
-        operation: "create encrypted snapshot temporary file",
+        operation: "create snapshot archive temporary file",
         reason: "could not reserve a unique temporary path".to_owned(),
     })
 }
@@ -826,10 +794,9 @@ impl MetadataInode for fs::Metadata {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::io::{BufReader, Read};
+    use std::io::Read;
     use std::path::{Path, PathBuf};
 
-    use age::secrecy::SecretString;
     use sha2::{Digest, Sha256};
     use tokio_util::sync::CancellationToken;
 
@@ -904,7 +871,6 @@ mod tests {
         let input = SnapshotArchiveInput {
             vm_name: "fixture-vm".to_owned(),
             output_path: output.clone(),
-            password: "correct horse battery staple".to_owned(),
             metadata: portable_metadata,
             payloads: vec![
                 SnapshotPayload {
@@ -938,32 +904,28 @@ mod tests {
             ],
         };
         let result = create_archive(input, CancellationToken::new(), || Ok(()))
-            .expect("encrypted archive should be created");
-        assert!(result.encrypted_size_bytes > 0);
+            .expect("snapshot archive should be created");
+        assert!(result.archive_size_bytes > 0);
         (output, disk)
     }
 
-    fn decrypt(path: &Path, password: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-        let encrypted = fs::File::open(path)?;
-        let decryptor = age::Decryptor::new(BufReader::new(encrypted))?;
-        let identity = age::scrypt::Identity::new(SecretString::from(password.to_owned()));
-        let reader = decryptor.decrypt(std::iter::once(&identity as &dyn age::Identity))?;
-        let mut decoder = zstd::stream::read::Decoder::new(reader)?;
+    fn decompress(path: &Path) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        let file = fs::File::open(path)?;
+        let mut decoder = zstd::stream::read::Decoder::new(file)?;
         let mut plaintext = Vec::new();
         decoder.read_to_end(&mut plaintext)?;
         Ok(plaintext)
     }
 
     #[test]
-    fn encrypted_tar_places_integrity_manifest_last_and_keeps_temp_private() {
+    fn plain_tar_places_integrity_manifest_last_and_records_payload_digests() {
         let directory = tempfile::tempdir().expect("test directory should be created");
         let (archive_path, _) = create_test_archive(
             directory.path(),
             "snapshot.tmvmsnap",
             SnapshotAddressPolicy::PreserveIpv4,
         );
-        let plaintext = decrypt(&archive_path, "correct horse battery staple")
-            .expect("correct passphrase should decrypt the archive");
+        let plaintext = decompress(&archive_path).expect("plain Zstandard archive should decode");
         let mut archive = tar::Archive::new(plaintext.as_slice());
         let mut members = Vec::new();
         for entry in archive.entries().expect("TAR entries should parse") {
@@ -989,7 +951,7 @@ mod tests {
         let manifest: serde_json::Value = serde_json::from_slice(&members.last().unwrap().2)
             .expect("manifest should be valid JSON");
         assert_eq!(manifest["format"], "taumaru.microvm.snapshot");
-        assert_eq!(manifest["format_version"], 2);
+        assert_eq!(manifest["format_version"], 3);
         assert_eq!(manifest["boot"]["kernel"]["id"], "kernel-1");
         assert_eq!(manifest["network"]["address_policy"], "preserve_ipv4");
         assert_eq!(manifest["network"]["guest_ipv4"], "192.0.2.2");
@@ -1003,7 +965,7 @@ mod tests {
         assert_eq!(
             files.len(),
             5,
-            "only the four source fixtures and encrypted archive remain"
+            "only the four source fixtures and snapshot archive remain"
         );
         assert!(archive_path.exists());
     }
@@ -1016,8 +978,7 @@ mod tests {
             "regenerate.tmvmsnap",
             SnapshotAddressPolicy::RegenerateIpv4,
         );
-        let plaintext = decrypt(&archive_path, "correct horse battery staple")
-            .expect("correct passphrase should decrypt the archive");
+        let plaintext = decompress(&archive_path).expect("plain Zstandard archive should decode");
         let mut archive = tar::Archive::new(plaintext.as_slice());
         let mut bytes = Vec::new();
         let mut found_manifest = false;
@@ -1056,25 +1017,23 @@ mod tests {
     }
 
     #[test]
-    fn wrong_password_tampering_and_truncation_are_rejected() {
+    fn checksum_tampering_and_truncation_are_rejected() {
         let directory = tempfile::tempdir().expect("test directory should be created");
         let (archive_path, _) = create_test_archive(
             directory.path(),
             "snapshot.tmvmsnap",
             SnapshotAddressPolicy::PreserveIpv4,
         );
-        assert!(decrypt(&archive_path, "wrong password").is_err());
-
         let original = fs::read(&archive_path).expect("archive should read");
         let mut tampered = original.clone();
         let last = tampered.len() - 1;
         tampered[last] ^= 0x01;
         fs::write(&archive_path, tampered).expect("tampered archive should write");
-        assert!(decrypt(&archive_path, "correct horse battery staple").is_err());
+        assert!(decompress(&archive_path).is_err());
 
         fs::write(&archive_path, &original[..original.len() - 5])
             .expect("truncated archive should write");
-        assert!(decrypt(&archive_path, "correct horse battery staple").is_err());
+        assert!(decompress(&archive_path).is_err());
     }
 
     #[test]
@@ -1088,7 +1047,6 @@ mod tests {
         let input = SnapshotArchiveInput {
             vm_name: "fixture-vm".to_owned(),
             output_path: output.clone(),
-            password: "password".to_owned(),
             metadata: metadata(),
             payloads: vec![SnapshotPayload {
                 archive_path: "payload/rootfs.ext4",

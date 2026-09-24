@@ -6,13 +6,11 @@ use super::lifecycle::MicroVmState;
 use super::microvm::{NetworkConfiguration, SshConnectionInfo};
 use super::snapshot::SnapshotAddressPolicy;
 
-/// Caller input for restoring one password-encrypted snapshot archive.
+/// Caller input for restoring one supported snapshot archive.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RestoreRequest {
-    /// Path to the encrypted snapshot archive.
+    /// Path to the unencrypted snapshot archive.
     pub archive_path: PathBuf,
-    /// Password used to decrypt and authenticate the archive.
-    pub password: String,
 }
 
 /// A named phase of snapshot restoration.
@@ -20,7 +18,7 @@ pub struct RestoreRequest {
 pub enum RestoreProgressStage {
     /// Validating the archive path and request.
     ValidatingInput,
-    /// Decrypting and staging fixed archive members.
+    /// Reading and staging fixed archive members.
     Staging,
     /// Verifying archive payloads and installed file integrity.
     Verifying,
@@ -39,8 +37,9 @@ pub enum RestoreProgressStage {
 pub struct RestoreProgress {
     /// Current restore phase.
     pub stage: RestoreProgressStage,
-    /// Bytes consumed or processed in the current phase. During staging this counts encrypted
-    /// archive bytes read; later phases report the bytes relevant to that phase.
+    /// Bytes consumed or processed in the current phase. During staging this counts uncompressed
+    /// root disk bytes written to temporary storage; later phases report the bytes relevant to
+    /// that phase.
     pub completed_bytes: u64,
     /// Total bytes for the current phase when known, or zero while progress is indeterminate.
     pub total_bytes: u64,
@@ -81,7 +80,7 @@ impl Default for RestoreCancellation {
     }
 }
 
-/// Result of restoring a MicroVM from an encrypted snapshot.
+/// Result of restoring a MicroVM from a supported unencrypted snapshot.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RestoreResult {
     /// Restored VM identity taken from the archive manifest.
