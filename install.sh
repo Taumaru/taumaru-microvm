@@ -1,7 +1,7 @@
 #!/bin/sh
 # Installer for the taumaru-microvm CLI (`microvm`).
 #
-#   curl -fsSL https://raw.githubusercontent.com/Taumaru/taumaru-microvm/main/install.sh | sh
+#   curl -fsSL https://microvm.taumaru.com/install.sh | sh
 #
 # Environment overrides:
 #   TAUMARU_MICROVM_VERSION        Release to install, e.g. v0.3.0 (default: latest)
