@@ -1615,7 +1615,7 @@ dependencies = [
 
 [[package]]
 name = "taumaru-microvm"
-version = "0.2.0"
+version = "1.0.0"
 dependencies = [
  "base64 0.22.1",
  "fs4",
@@ -1636,7 +1636,7 @@ dependencies = [
 
 [[package]]
 name = "taumaru-microvm-cli"
-version = "0.2.0"
+version = "1.0.0"
 dependencies = [
  "clap",
  "indicatif",
