@@ -3,6 +3,7 @@ use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
 use crate::domain::artifact::{DownloadSpec, FileIntegrity, InstalledBinary};
+use crate::domain::autostart::{AutostartPolicy, AutostartSettings};
 use crate::domain::microvm::{
     MicroVmRecord, NetworkConfiguration, PersistedCredential, PersistedNetwork, PersistedRuntime,
 };
@@ -347,6 +348,26 @@ pub(crate) trait MicroVmRepository: Send + Sync {
 
     #[allow(dead_code)]
     fn load_network(&self, vm_id: i64) -> Result<NetworkConfiguration, SdkError>;
+
+    fn find_autostart_policy(&self, name: &str) -> Result<Option<AutostartPolicy>, SdkError>;
+
+    /// Returns every stored policy ordered by MicroVM name.
+    fn list_autostart_policies(&self) -> Result<Vec<AutostartPolicy>, SdkError>;
+
+    fn insert_autostart_policy(
+        &self,
+        vm_id: i64,
+        settings: &AutostartSettings,
+    ) -> Result<(), SdkError>;
+
+    fn update_autostart_policy(
+        &self,
+        vm_id: i64,
+        settings: &AutostartSettings,
+    ) -> Result<(), SdkError>;
+
+    /// Returns `true` when a policy row was removed.
+    fn delete_autostart_policy(&self, vm_id: i64) -> Result<bool, SdkError>;
 }
 
 pub(crate) trait LocalRepository: ArtifactRepository + MicroVmRepository {}

@@ -30,6 +30,11 @@ pub use domain::{
     SnapshotProgressStage, SnapshotResult,
 };
 pub use domain::{
+    AutostartDeleteResult, AutostartOutcome, AutostartPolicy, AutostartPolicyUpdate,
+    AutostartResult, AutostartRunReport, AutostartSettings, DEFAULT_AUTOSTART_ATTEMPTS,
+    MAX_AUTOSTART_ATTEMPTS, MIN_AUTOSTART_ATTEMPTS,
+};
+pub use domain::{
     CreateMicroVmRequest, CreationEventPhase, CreationOutcome, CreationProgress, CreationStage,
     MicroVmCreationResult, MicroVmDeleteResult, MicroVmStartResult, MicroVmState,
     MicroVmStopResult, MicroVmSummary, NetworkConfiguration, NetworkConfigurationResult,

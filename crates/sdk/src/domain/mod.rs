@@ -1,4 +1,5 @@
 pub mod artifact;
+pub mod autostart;
 pub mod config;
 pub mod lifecycle;
 pub mod microvm;
@@ -10,6 +11,11 @@ pub use artifact::{
     ArtifactKind, DownloadCancellation, DownloadDisposition, DownloadPhase, DownloadProgress,
     DownloadedBinary, DownloadedDistribution, DownloadedDistributionImage, DownloadedFile,
     DownloadedKernel, InstalledBinary, PruneFailure, PrunePreview, PruneSummary, PrunedImageId,
+};
+pub use autostart::{
+    AutostartDeleteResult, AutostartOutcome, AutostartPolicy, AutostartPolicyUpdate,
+    AutostartResult, AutostartRunReport, AutostartSettings, DEFAULT_AUTOSTART_ATTEMPTS,
+    MAX_AUTOSTART_ATTEMPTS, MIN_AUTOSTART_ATTEMPTS,
 };
 pub use lifecycle::{MicroVmState, NetworkMode};
 pub use microvm::{

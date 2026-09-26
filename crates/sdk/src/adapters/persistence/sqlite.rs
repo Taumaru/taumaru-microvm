@@ -6,6 +6,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 use crate::domain::artifact::{ArtifactKind, DownloadSpec, FileIntegrity, InstalledBinary};
+use crate::domain::autostart::{AutostartPolicy, AutostartSettings};
 use crate::domain::lifecycle::NetworkMode;
 use crate::domain::microvm::{
     MicroVmRecord, NetworkConfiguration, NetworkResource, PersistedCredential, PersistedNetwork,
@@ -1608,6 +1609,104 @@ impl MicroVmRepository for SqliteRepository {
             .map(|network| network.config)
             .ok_or_else(|| SdkError::Migration(format!("network record is missing for VM {vm_id}")))
     }
+
+    fn find_autostart_policy(&self, name: &str) -> Result<Option<AutostartPolicy>, SdkError> {
+        let connection = self.connection()?;
+        connection
+            .query_row(
+                "SELECT microvms.name, vm_autostart.enabled, vm_autostart.max_start_attempts
+                 FROM vm_autostart
+                 JOIN microvms ON microvms.id = vm_autostart.microvm_id
+                 WHERE microvms.name = ?1",
+                params![name],
+                autostart_policy_from_row,
+            )
+            .optional()?
+            .transpose()
+    }
+
+    fn list_autostart_policies(&self) -> Result<Vec<AutostartPolicy>, SdkError> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT microvms.name, vm_autostart.enabled, vm_autostart.max_start_attempts
+             FROM vm_autostart
+             JOIN microvms ON microvms.id = vm_autostart.microvm_id
+             ORDER BY microvms.name",
+        )?;
+        let rows = statement
+            .query_map([], autostart_policy_from_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter().collect()
+    }
+
+    fn insert_autostart_policy(
+        &self,
+        vm_id: i64,
+        settings: &AutostartSettings,
+    ) -> Result<(), SdkError> {
+        let connection = self.connection()?;
+        let now = unix_timestamp()?;
+        connection.execute(
+            "INSERT INTO vm_autostart (
+                microvm_id, enabled, max_start_attempts, created_at, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?4)",
+            params![
+                vm_id,
+                settings.enabled,
+                i64::from(settings.max_start_attempts),
+                now
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn update_autostart_policy(
+        &self,
+        vm_id: i64,
+        settings: &AutostartSettings,
+    ) -> Result<(), SdkError> {
+        let connection = self.connection()?;
+        connection.execute(
+            "UPDATE vm_autostart
+             SET enabled = ?2, max_start_attempts = ?3, updated_at = ?4
+             WHERE microvm_id = ?1",
+            params![
+                vm_id,
+                settings.enabled,
+                i64::from(settings.max_start_attempts),
+                unix_timestamp()?
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn delete_autostart_policy(&self, vm_id: i64) -> Result<bool, SdkError> {
+        let connection = self.connection()?;
+        let removed = connection.execute(
+            "DELETE FROM vm_autostart WHERE microvm_id = ?1",
+            params![vm_id],
+        )?;
+        Ok(removed > 0)
+    }
+}
+
+fn autostart_policy_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<Result<AutostartPolicy, SdkError>> {
+    let name = row.get::<_, String>(0)?;
+    let enabled = row.get::<_, bool>(1)?;
+    let attempts = row.get::<_, i64>(2)?;
+    Ok(u32::try_from(attempts)
+        .map(|max_start_attempts| AutostartPolicy {
+            name: name.clone(),
+            enabled,
+            max_start_attempts,
+        })
+        .map_err(|_| {
+            SdkError::Migration(format!(
+                "invalid persisted autostart attempts for {name}: {attempts}"
+            ))
+        }))
 }
 
 type MicroVmRow = (
@@ -2722,8 +2821,8 @@ mod tests {
         assert_eq!(metadata.kernel_args, ["console=ttyS0", "panic=1"]);
         assert_eq!(metadata.image_sha256, "b".repeat(64));
         assert_eq!(metadata.guest_architecture, "x86_64");
-        assert_eq!(
-            schema_version, 5,
+        assert!(
+            schema_version >= 5,
             "restore journal migration should be applied"
         );
     }

@@ -1,3 +1,4 @@
+pub(crate) mod autostart;
 pub(crate) mod delete;
 pub(crate) mod download;
 pub(crate) mod ls;
@@ -31,5 +32,6 @@ pub(crate) async fn run(cli: Cli) -> Result<u8, crate::error::CliError> {
         crate::cli::Command::Restore(arguments) => restore::run(&context, arguments).await,
         crate::cli::Command::Delete(arguments) => delete::run(&context, arguments).await,
         crate::cli::Command::Ls(arguments) => ls::run(&context, arguments).await,
+        crate::cli::Command::Autostart(arguments) => autostart::run(&context, arguments).await,
     }
 }

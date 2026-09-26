@@ -54,10 +54,12 @@ use crate::ports::runtime_disk::RuntimeDiskController;
 use crate::ports::storage::GuestStorage;
 use semver::Version;
 
+mod autostart;
 mod restore;
 
 const DEFAULT_REGISTRY_BASE_URL: &str = "https://artifacts.taumaru.com/v1/";
 const PROBE_TIMEOUT_SECS: u64 = 12;
+const AUTOSTART_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(5);
 /// Exit wait after a delivered graceful shutdown request before SIGKILL escalation.
 const STOP_EXIT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
 /// Re-verification wait after SIGKILL before reporting the forced outcome.
@@ -199,6 +201,7 @@ pub struct MicroVmSdk {
     runtime: Arc<dyn RuntimeController>,
     runtime_disk: Arc<dyn RuntimeDiskController>,
     target_locks: Arc<Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>>,
+    autostart_retry_backoff: std::time::Duration,
 }
 
 #[derive(Clone, Debug)]
@@ -413,6 +416,7 @@ impl MicroVmSdk {
             runtime: Arc::new(FirecrackerRuntime),
             runtime_disk: Arc::new(DeviceMapperRuntime::default()),
             target_locks: Arc::new(Mutex::new(HashMap::new())),
+            autostart_retry_backoff: AUTOSTART_RETRY_BACKOFF,
         })
     }
 
@@ -8434,6 +8438,86 @@ mod tests {
             .expect("dead VM should start fresh");
         assert_eq!(recovered.state, MicroVmState::Running);
         assert_eq!(runtime.launched.lock().expect("launch lock").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn autostart_run_starts_enabled_machines_and_skips_paused_ones() {
+        if std::env::consts::ARCH != "x86_64" {
+            return;
+        }
+        use crate::domain::autostart::{AutostartResult, AutostartSettings};
+        let (mut sdk, _directory, _storage, _credentials, _network, runtime) = test_sdk(false);
+        sdk.autostart_retry_backoff = std::time::Duration::ZERO;
+        start_fixture_vm(&sdk, "boot_vm", false, None);
+        start_fixture_vm(&sdk, "paused_vm", false, None);
+        sdk.create_autostart_policy("boot_vm", AutostartSettings::default())
+            .await
+            .expect("policy should be created");
+        sdk.create_autostart_policy(
+            "paused_vm",
+            AutostartSettings {
+                enabled: false,
+                max_start_attempts: 1,
+            },
+        )
+        .await
+        .expect("paused policy should be created");
+
+        let report = sdk
+            .start_autostart_microvms()
+            .await
+            .expect("autostart run should complete");
+
+        assert!(!report.has_failures());
+        assert_eq!(report.outcomes.len(), 2);
+        assert_eq!(report.outcomes[0].name, "boot_vm");
+        assert_eq!(report.outcomes[0].attempts, 1);
+        assert!(matches!(
+            &report.outcomes[0].result,
+            AutostartResult::Started(started) if started.state == MicroVmState::Running
+        ));
+        assert_eq!(report.outcomes[1].name, "paused_vm");
+        assert_eq!(report.outcomes[1].attempts, 0);
+        assert!(matches!(report.outcomes[1].result, AutostartResult::Paused));
+        let launched = runtime.launched.lock().expect("launch lock");
+        assert_eq!(launched.len(), 1);
+        assert_eq!(launched[0].vm_name, "boot_vm");
+    }
+
+    #[tokio::test]
+    async fn autostart_run_retries_up_to_the_attempt_limit_and_reports_failure() {
+        if std::env::consts::ARCH != "x86_64" {
+            return;
+        }
+        use crate::domain::autostart::{AutostartResult, AutostartSettings};
+        let (mut sdk, _directory, _storage, _credentials, _network, runtime) = test_sdk(false);
+        sdk.autostart_retry_backoff = std::time::Duration::ZERO;
+        start_fixture_vm(&sdk, "flaky_vm", false, None);
+        sdk.create_autostart_policy(
+            "flaky_vm",
+            AutostartSettings {
+                enabled: true,
+                max_start_attempts: 2,
+            },
+        )
+        .await
+        .expect("policy should be created");
+        *runtime.launch_result.lock().expect("launch result lock") =
+            Err("injected launch failure".to_owned());
+
+        let report = sdk
+            .start_autostart_microvms()
+            .await
+            .expect("autostart run should complete");
+
+        assert!(report.has_failures());
+        assert_eq!(report.outcomes.len(), 1);
+        assert_eq!(report.outcomes[0].attempts, 2);
+        assert!(matches!(
+            report.outcomes[0].result,
+            AutostartResult::Failed(_)
+        ));
+        assert_eq!(runtime.launched.lock().expect("launch lock").len(), 2);
     }
 
     #[tokio::test]

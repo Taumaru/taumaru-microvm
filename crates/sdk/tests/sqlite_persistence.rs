@@ -45,21 +45,21 @@ fn constructor_creates_idempotent_inventory_schema() {
                 'binary_files', 'distributions', 'distribution_images',
                 'distribution_kernels', 'network_bridges', 'microvms',
                 'vm_networks', 'vm_network_resources', 'vm_credentials',
-                'vm_runtime'
+                'vm_runtime', 'vm_autostart'
             )",
             [],
             |row| row.get(0),
         )
         .expect("schema table count should be readable");
 
-    assert_eq!(table_count, 14);
+    assert_eq!(table_count, 15);
 
     let migration_count: i64 = connection
         .query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| {
             row.get(0)
         })
         .expect("migration ledger should be readable");
-    assert_eq!(migration_count, 5);
+    assert_eq!(migration_count, 6);
     let preserved_count: i64 = connection
         .query_row(
             "SELECT COUNT(*) FROM downloads WHERE artifact_key = 'kernel:preserved'",
@@ -457,7 +457,7 @@ fn migration_v4_removes_the_persisted_state_column_and_keeps_vm_data() {
             row.get(0)
         })
         .expect("migration ledger should be readable");
-    assert_eq!(migration_count, 5);
+    assert_eq!(migration_count, 6);
     let vm_name: String = connection
         .query_row(
             "SELECT name FROM microvms WHERE volume_path = '/tmp/legacy'",

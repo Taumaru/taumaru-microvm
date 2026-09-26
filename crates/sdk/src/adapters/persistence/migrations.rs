@@ -38,6 +38,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "0005_snapshot_restore.sql",
         sql: include_str!("../../../migrations/0005_snapshot_restore.sql"),
     },
+    Migration {
+        version: 6,
+        name: "0006_microvm_autostart.sql",
+        sql: include_str!("../../../migrations/0006_microvm_autostart.sql"),
+    },
 ];
 
 pub(crate) fn apply_pending(connection: &mut Connection) -> Result<(), SdkError> {
@@ -309,6 +314,16 @@ fn verify_required_schema(connection: &Connection) -> Result<(), SdkError> {
                 "socket_path",
                 "process_id",
                 "process_state",
+                "updated_at",
+            ],
+        ),
+        (
+            "vm_autostart",
+            &[
+                "microvm_id",
+                "enabled",
+                "max_start_attempts",
+                "created_at",
                 "updated_at",
             ],
         ),

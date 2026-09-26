@@ -33,6 +33,8 @@ pub(crate) enum Command {
     Ls(LsArgs),
     /// Connect to a running MicroVM over SSH by name or interactive selection.
     Ssh(SshArgs),
+    /// Configure which MicroVMs start automatically when the host boots.
+    Autostart(AutostartArgs),
 }
 
 #[derive(Debug, Args, Clone)]
@@ -181,6 +183,98 @@ pub(crate) struct DeleteArgs {
 
 #[derive(Debug, Args, Clone)]
 pub(crate) struct LsArgs {
+    /// Disable prompts; root is required up front.
+    #[arg(long = "non-interactive")]
+    pub(crate) non_interactive: bool,
+}
+
+#[derive(Debug, Args, Clone)]
+pub(crate) struct AutostartArgs {
+    #[command(subcommand)]
+    pub(crate) command: AutostartCommand,
+}
+
+#[derive(Debug, Subcommand, Clone)]
+pub(crate) enum AutostartCommand {
+    /// Start a MicroVM automatically at host boot.
+    Add(AutostartAddArgs),
+    /// Change, pause, or resume the autostart settings of a MicroVM.
+    Edit(AutostartEditArgs),
+    /// Stop starting a MicroVM at host boot; the machine itself is kept.
+    #[command(visible_alias = "remove")]
+    Rm(AutostartRmArgs),
+    /// List MicroVMs configured to start at host boot.
+    #[command(visible_alias = "list")]
+    Ls(AutostartLsArgs),
+    /// Start every MicroVM with enabled autostart; run by the boot service.
+    #[command(hide = true)]
+    Run,
+}
+
+#[derive(Debug, Args, Clone)]
+pub(crate) struct AutostartAddArgs {
+    /// Machine name; skips the machine selector when supplied.
+    pub(crate) name: Option<String>,
+
+    /// Equivalent to the positional name; must agree when both are given.
+    #[arg(long = "name")]
+    pub(crate) explicit_name: Option<String>,
+
+    /// Start attempts at boot before reporting a failure (1-10, default 3).
+    #[arg(long = "max-attempts", value_parser = clap::value_parser!(u32).range(1..=10))]
+    pub(crate) max_attempts: Option<u32>,
+
+    /// Save the policy paused; the machine is not started at boot until resumed.
+    #[arg(long = "paused")]
+    pub(crate) paused: bool,
+
+    /// Disable prompts; the name is required and root is required up front.
+    #[arg(long = "non-interactive")]
+    pub(crate) non_interactive: bool,
+}
+
+#[derive(Debug, Args, Clone)]
+pub(crate) struct AutostartEditArgs {
+    /// Machine name; skips the machine selector when supplied.
+    pub(crate) name: Option<String>,
+
+    /// Equivalent to the positional name; must agree when both are given.
+    #[arg(long = "name")]
+    pub(crate) explicit_name: Option<String>,
+
+    /// New number of start attempts at boot (1-10).
+    #[arg(long = "max-attempts", value_parser = clap::value_parser!(u32).range(1..=10))]
+    pub(crate) max_attempts: Option<u32>,
+
+    /// Resume starting the machine at boot.
+    #[arg(long = "enable", conflicts_with = "pause")]
+    pub(crate) enable: bool,
+
+    /// Keep the policy but skip the machine at boot.
+    #[arg(long = "pause")]
+    pub(crate) pause: bool,
+
+    /// Disable prompts; the name and at least one change are required, and root up front.
+    #[arg(long = "non-interactive")]
+    pub(crate) non_interactive: bool,
+}
+
+#[derive(Debug, Args, Clone)]
+pub(crate) struct AutostartRmArgs {
+    /// Machine name; skips the machine selector when supplied.
+    pub(crate) name: Option<String>,
+
+    /// Equivalent to the positional name; must agree when both are given.
+    #[arg(long = "name")]
+    pub(crate) explicit_name: Option<String>,
+
+    /// Disable prompts; the name is required and root is required up front.
+    #[arg(long = "non-interactive")]
+    pub(crate) non_interactive: bool,
+}
+
+#[derive(Debug, Args, Clone)]
+pub(crate) struct AutostartLsArgs {
     /// Disable prompts; root is required up front.
     #[arg(long = "non-interactive")]
     pub(crate) non_interactive: bool,
@@ -531,5 +625,81 @@ mod tests {
         );
         assert!(Cli::try_parse_from(["microvm", "ssh", "--disk-gb", "20"]).is_err());
         assert!(Cli::try_parse_from(["microvm", "ssh", "--expose-lan"]).is_err());
+    }
+
+    #[test]
+    fn autostart_subcommands_parse_names_and_flags() {
+        use super::AutostartCommand;
+
+        let cli = Cli::try_parse_from([
+            "microvm",
+            "autostart",
+            "add",
+            "web-01",
+            "--max-attempts",
+            "5",
+            "--paused",
+            "--non-interactive",
+        ])
+        .expect("autostart add should parse");
+        let Some(Command::Autostart(arguments)) = cli.command else {
+            panic!("autostart command should be selected");
+        };
+        let AutostartCommand::Add(add) = arguments.command else {
+            panic!("add subcommand should be selected");
+        };
+        assert_eq!(add.name.as_deref(), Some("web-01"));
+        assert_eq!(add.max_attempts, Some(5));
+        assert!(add.paused);
+        assert!(add.non_interactive);
+
+        let cli = Cli::try_parse_from([
+            "microvm",
+            "autostart",
+            "edit",
+            "--name",
+            "web-01",
+            "--pause",
+        ])
+        .expect("autostart edit should parse");
+        let Some(Command::Autostart(arguments)) = cli.command else {
+            panic!("autostart command should be selected");
+        };
+        let AutostartCommand::Edit(edit) = arguments.command else {
+            panic!("edit subcommand should be selected");
+        };
+        assert_eq!(edit.explicit_name.as_deref(), Some("web-01"));
+        assert!(edit.pause);
+        assert!(!edit.enable);
+
+        for alias in ["rm", "remove"] {
+            let cli = Cli::try_parse_from(["microvm", "autostart", alias, "web-01"])
+                .expect("autostart removal should parse");
+            let Some(Command::Autostart(arguments)) = cli.command else {
+                panic!("autostart command should be selected");
+            };
+            assert!(matches!(arguments.command, AutostartCommand::Rm(_)));
+        }
+        let cli = Cli::try_parse_from(["microvm", "autostart", "run"])
+            .expect("hidden boot runner should parse");
+        let Some(Command::Autostart(arguments)) = cli.command else {
+            panic!("autostart command should be selected");
+        };
+        assert!(matches!(arguments.command, AutostartCommand::Run));
+    }
+
+    #[test]
+    fn autostart_edit_rejects_enable_with_pause() {
+        assert!(
+            Cli::try_parse_from([
+                "microvm",
+                "autostart",
+                "edit",
+                "web-01",
+                "--enable",
+                "--pause"
+            ])
+            .is_err()
+        );
     }
 }

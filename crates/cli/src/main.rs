@@ -1,3 +1,4 @@
+mod boot;
 mod cli;
 mod commands;
 mod context;

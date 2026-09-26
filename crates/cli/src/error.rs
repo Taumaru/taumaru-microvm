@@ -248,6 +248,38 @@ impl CliError {
         ))
     }
 
+    pub(crate) fn autostart_cancelled() -> Self {
+        Self::Creation(
+            "MicroVM autostart cancelled\u{1f}no autostart setting was changed\u{1f}Run `microvm autostart` again when you are ready"
+                .to_string(),
+        )
+    }
+
+    pub(crate) fn autostart_failed(what: impl Into<String>, error: &SdkError) -> Self {
+        Self::Creation(format!(
+            "{}\u{1f}{error}\u{1f}Check the reported cause, then run the same command again",
+            what.into()
+        ))
+    }
+
+    pub(crate) fn autostart_machine_not_found(name: &str) -> Self {
+        Self::Creation(format!(
+            "MicroVM {name:?} was not found\u{1f}no created machine named {name:?} exists in this home\u{1f}Run `microvm ls` to see available machines, then try again"
+        ))
+    }
+
+    pub(crate) fn autostart_not_configured(name: &str) -> Self {
+        Self::Creation(format!(
+            "Autostart is not configured for {name:?}\u{1f}machine {name:?} has no autostart policy to change\u{1f}Run `microvm autostart add {name}` to configure it"
+        ))
+    }
+
+    pub(crate) fn autostart_already_configured(name: &str) -> Self {
+        Self::Creation(format!(
+            "Autostart is already configured for {name:?}\u{1f}machine {name:?} has an autostart policy with different settings\u{1f}Run `microvm autostart edit {name}` to change it"
+        ))
+    }
+
     pub(crate) fn escalation_unavailable() -> Self {
         Self::Creation(
             "Elevated rights are required\u{1f}neither sudo nor pkexec is available on this host\u{1f}Install sudo or polkit, or run the command as root"
@@ -266,6 +298,7 @@ impl CliError {
             Self::Creation(payload) if payload.starts_with("MicroVM delete cancelled") => 130,
             Self::Creation(payload) if payload.starts_with("MicroVM prune cancelled") => 130,
             Self::Creation(payload) if payload.starts_with("MicroVM snapshot cancelled") => 130,
+            Self::Creation(payload) if payload.starts_with("MicroVM autostart cancelled") => 130,
             _ => 1,
         }
     }

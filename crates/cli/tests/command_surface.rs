@@ -656,3 +656,82 @@ fn non_interactive_delete_without_root_reports_privilege_error() {
     assert!(!output.status.success());
     assert!(stderr.to_ascii_lowercase().contains("elevated rights"));
 }
+
+#[test]
+fn autostart_help_lists_crud_subcommands_and_hides_the_boot_runner() {
+    let output = run_microvm(&["autostart", "--help"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(output.status.success());
+    assert!(stdout.contains("Usage: microvm autostart"));
+    for subcommand in ["add", "edit", "rm", "ls"] {
+        assert!(
+            stdout.contains(&format!("  {subcommand}")),
+            "missing {subcommand}"
+        );
+    }
+    assert!(!stdout.contains("  run "));
+}
+
+#[test]
+fn non_interactive_autostart_commands_require_a_name_without_prompting() {
+    let home = tempfile::tempdir().expect("temporary home should be created");
+    for subcommand in ["add", "edit", "rm"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_microvm"))
+            .args(["autostart", subcommand, "--non-interactive"])
+            .env("TAUMARU_HOME", home.path())
+            .output()
+            .expect("failed to execute microvm");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        assert_eq!(output.status.code(), Some(1), "{subcommand}");
+        assert!(stderr.contains("Missing machine name"), "{subcommand}");
+        assert!(!stderr.contains("Choose a MicroVM"), "{subcommand}");
+    }
+}
+
+#[test]
+fn non_interactive_autostart_edit_requires_a_change() {
+    let home = tempfile::tempdir().expect("temporary home should be created");
+    let output = Command::new(env!("CARGO_BIN_EXE_microvm"))
+        .args(["autostart", "edit", "web-01", "--non-interactive"])
+        .env("TAUMARU_HOME", home.path())
+        .output()
+        .expect("failed to execute microvm");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stderr.contains("Missing autostart change"));
+}
+
+#[test]
+fn autostart_rejects_out_of_range_attempts_at_parse_time() {
+    let output = run_microvm(&[
+        "autostart",
+        "add",
+        "web-01",
+        "--max-attempts",
+        "0",
+        "--non-interactive",
+    ]);
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("--max-attempts"));
+}
+
+#[test]
+fn non_root_non_interactive_autostart_requires_elevated_rights() {
+    if unsafe { libc_geteuid() } == 0 {
+        return;
+    }
+    let home = tempfile::tempdir().expect("temporary home should be created");
+    let output = Command::new(env!("CARGO_BIN_EXE_microvm"))
+        .args(["autostart", "add", "web-01", "--non-interactive"])
+        .env("TAUMARU_HOME", home.path())
+        .output()
+        .expect("failed to execute microvm");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stderr.contains("Elevated rights are required"));
+}

@@ -1,3 +1,5 @@
+pub(crate) mod autostart;
+
 use std::io::{self, Write};
 use std::sync::Arc;
 use std::sync::Mutex;
