@@ -1,0 +1,62 @@
+name: Publish SDK to crates.io
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: Git ref (tag) to publish
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Git ref (tag) to publish, e.g. v0.3.0
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CRATE: taumaru-microvm
+
+jobs:
+  publish:
+    name: cargo publish
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check whether this version is already published
+        id: exists
+        run: |
+          version="$(cargo metadata --no-deps --format-version 1 \
+            | jq -r --arg crate "$CRATE" '.packages[] | select(.name == $crate) | .version')"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          status="$(curl -s -o /dev/null -w '%{http_code}' \
+            -A "taumaru-microvm-release (github.com/${{ github.repository }})" \
+            "https://crates.io/api/v1/crates/$CRATE/$version")"
+          if [ "$status" = "200" ]; then
+            echo "$CRATE $version is already on crates.io; skipping."
+            echo "published=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "published=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish
+        if: steps.exists.outputs.published == 'false'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          if [ -z "$CARGO_REGISTRY_TOKEN" ]; then
+            echo "::error::CARGO_REGISTRY_TOKEN secret is not set"
+            exit 1
+          fi
+          cargo publish -p "$CRATE" --locked
