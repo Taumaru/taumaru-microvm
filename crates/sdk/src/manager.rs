@@ -2159,9 +2159,9 @@ impl MicroVmSdk {
     /// attempts to restore the previous disk size before returning, and a
     /// resize failure itself attempts the same restore before returning.
     /// A crash between the resize and the row update can still leave the
-    /// file and the record diverged; the next update refuses with a root
-    /// disk mismatch error until the operator reconciles the file with the
-    /// recorded size and retries.
+    /// file and the record diverged; the next update converges the file back
+    /// to the recorded size first when the filesystem fits, and refuses
+    /// otherwise, so a retry never truncates filesystem content.
     pub async fn update_microvm(
         &self,
         request: UpdateMicroVmRequest,
@@ -2315,25 +2315,29 @@ impl MicroVmSdk {
         }
 
         let disk_changed = new_disk != stored.record.disk_size_bytes;
+        // An interrupted resize or crash can leave the file converged to a
+        // different size than the record. Converge the file back to the
+        // recorded size first: resize refuses when the filesystem itself no
+        // longer fits, so converging never truncates filesystem content.
+        // This also repairs damage left by versions predating the converge
+        // logic, keeping a retry after an upgrade working without manual
+        // recovery.
+        let current_len =
+            std::fs::symlink_metadata(&stored.record.rootfs_path).map_err(|error| {
+                SdkError::filesystem("inspect VM rootfs", &stored.record.rootfs_path, error)
+            })?;
+        if current_len.file_type().is_symlink() || !current_len.is_file() {
+            return Err(SdkError::GuestFilesystem {
+                operation: "inspect VM rootfs".to_owned(),
+                path: stored.record.rootfs_path.clone(),
+                reason: "the root disk is not a regular file".to_owned(),
+            });
+        }
+        if current_len.len() != stored.record.disk_size_bytes {
+            self.storage
+                .resize_rootfs(&stored.record.rootfs_path, stored.record.disk_size_bytes)?;
+        }
         if disk_changed {
-            let current_len =
-                std::fs::symlink_metadata(&stored.record.rootfs_path).map_err(|error| {
-                    SdkError::filesystem("inspect VM rootfs", &stored.record.rootfs_path, error)
-                })?;
-            if current_len.file_type().is_symlink() || !current_len.is_file() {
-                return Err(SdkError::GuestFilesystem {
-                    operation: "inspect VM rootfs".to_owned(),
-                    path: stored.record.rootfs_path.clone(),
-                    reason: "the root disk is not a regular file".to_owned(),
-                });
-            }
-            if current_len.len() != stored.record.disk_size_bytes {
-                return Err(SdkError::GuestFilesystem {
-                    operation: "validate root disk".to_owned(),
-                    path: stored.record.rootfs_path.clone(),
-                    reason: "the root disk size no longer matches the VM record".to_owned(),
-                });
-            }
             let used_bytes = self.storage.disk_used_bytes(&stored.record.rootfs_path)?;
             if new_disk < used_bytes {
                 return Err(SdkError::InvalidRequest {
@@ -10550,6 +10554,42 @@ mod tests {
             .expect("lookup should work")
             .expect("record should exist");
         assert_eq!(stored.record.disk_size_bytes, used + 1);
+    }
+
+    #[tokio::test]
+    async fn update_converges_a_diverged_disk_file_before_applying() {
+        if std::env::consts::ARCH != "x86_64" {
+            return;
+        }
+        let (sdk, _directory, _storage, _credentials, _network, _runtime) = test_sdk(false);
+        let stored = start_fixture_vm(&sdk, "diverged_vm", false, None);
+        // Simulate an interrupted grow: the file was extended while the
+        // record still holds the old size.
+        let file = OpenOptions::new()
+            .write(true)
+            .open(&stored.record.rootfs_path)
+            .expect("fixture rootfs should open");
+        file.set_len(32).expect("fixture rootfs should extend");
+        drop(file);
+        let updated = sdk
+            .update_microvm(UpdateMicroVmRequest {
+                name: "diverged_vm".to_owned(),
+                disk_size_bytes: None,
+                memory_bytes: None,
+                vcpu_count: Some(2),
+            })
+            .await
+            .expect("a repairable diverged file should converge");
+        assert_eq!(updated.vcpu_count, 2);
+        assert_eq!(updated.disk_size_bytes, 14);
+        assert!(!updated.disk_resized);
+        assert_eq!(
+            std::fs::metadata(&stored.record.rootfs_path)
+                .expect("rootfs metadata")
+                .len(),
+            14,
+            "the file converges back to the recorded size"
+        );
     }
 
     #[tokio::test]
