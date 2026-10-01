@@ -1983,6 +1983,11 @@ fn dependency_matches(dependency: &str, loop_device: &LoopInfo) -> bool {
 
 fn parse_mapper_list(bytes: &[u8]) -> Result<Vec<MapperInfo>, SdkError> {
     let text = output_text(bytes);
+    // With no mappings at all, `dmsetup info` ignores the column options and prints this
+    // sentence to stdout while still exiting successfully.
+    if text.trim() == "No devices found" {
+        return Ok(Vec::new());
+    }
     let mut mappers = Vec::new();
     for line in text.lines().filter(|line| !line.trim().is_empty()) {
         let columns: Vec<_> = line.split('\t').map(str::trim).collect();
@@ -2358,7 +2363,7 @@ mod tests {
     use super::{
         DeviceMapperRuntime, DmTable, HostCommandRunner, LoopInfo, MappingIdentity, RootfsIdentity,
         SnapshotIdentity, acquire_lifecycle_lock, parse_dm_table, parse_loop_list,
-        parse_snapshot_dm_table, snapshot_cow_size,
+        parse_mapper_list, parse_snapshot_dm_table, snapshot_cow_size,
     };
     use crate::error::SdkError;
     use crate::ports::runtime_disk::RuntimeDiskController;
@@ -2677,6 +2682,15 @@ mod tests {
     }
 
     #[test]
+    fn treats_dmsetup_no_devices_message_as_an_empty_mapper_list() {
+        assert_eq!(
+            parse_mapper_list(b"No devices found\n").expect("empty listing"),
+            Vec::new()
+        );
+        assert!(parse_mapper_list(b"unexpected\n").is_err());
+    }
+
+    #[test]
     fn parses_only_one_snapshot_origin_table_with_a_single_dependency() {
         assert_eq!(
             parse_dm_table(b"0 4096 snapshot-origin 7:12\n"),
@@ -2734,7 +2748,7 @@ mod tests {
         std::fs::create_dir_all(&home).expect("test home");
         let identity = identity(&home, "vm_one");
         let commands = Arc::new(ScriptedCommands::default());
-        commands.push("dmsetup:info", success_output(""));
+        commands.push("dmsetup:info", success_output("No devices found\n"));
         commands.push(
             "dmsetup:info",
             success_output(&mapper_listing(&identity, 0)),
@@ -2919,7 +2933,7 @@ mod tests {
         let home = directory.path().join("home");
         std::fs::create_dir_all(&home).expect("test home");
         let commands = Arc::new(ScriptedCommands::default());
-        commands.push("dmsetup:info", success_output(""));
+        commands.push("dmsetup:info", success_output("No devices found\n"));
         commands.push(
             "losetup:list",
             success_output(&loop_listing(&rootfs, "/dev/loop12", "7:12", false)),
