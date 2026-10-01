@@ -539,12 +539,17 @@ fn tool_stderr(output: &std::process::Output) -> String {
     }
     // Keep the diagnostic short; tool output never carries secrets, only
     // filesystem state. Newlines collapse so the reason stays one line.
+    // Truncate at a character boundary: tool output can contain non-UTF8
+    // bytes echoed back as multi-byte replacement characters.
     let single_line = stderr.split_whitespace().collect::<Vec<_>>().join(" ");
-    if single_line.len() > 300 {
-        single_line[..300].to_owned()
-    } else {
-        single_line
+    if single_line.len() <= 300 {
+        return single_line;
     }
+    let mut end = 300;
+    while !single_line.is_char_boundary(end) {
+        end -= 1;
+    }
+    single_line[..end].to_owned()
 }
 
 fn run_e2fsck(rootfs_path: &Path) -> Result<(), SdkError> {
