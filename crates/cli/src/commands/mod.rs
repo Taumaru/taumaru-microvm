@@ -1,6 +1,7 @@
 pub(crate) mod autostart;
 pub(crate) mod delete;
 pub(crate) mod download;
+pub(crate) mod edit;
 pub(crate) mod ls;
 pub(crate) mod new;
 pub(crate) mod prune;
@@ -25,6 +26,7 @@ pub(crate) async fn run(cli: Cli) -> Result<u8, crate::error::CliError> {
             ArtifactsCommand::Prune(prune) => prune::run(&context, prune).await,
         },
         crate::cli::Command::New(arguments) => new::run(&context, arguments).await,
+        crate::cli::Command::Edit(arguments) => edit::run(&context, arguments).await,
         crate::cli::Command::Start(arguments) => start::run(&context, arguments).await,
         crate::cli::Command::Ssh(arguments) => ssh::run(&context, arguments).await,
         crate::cli::Command::Stop(arguments) => stop::run(&context, arguments).await,

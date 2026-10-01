@@ -1565,6 +1565,41 @@ impl MicroVmRepository for SqliteRepository {
         self.persist_network(vm_id, network)
     }
 
+    fn update_microvm_resources(
+        &self,
+        vm_id: i64,
+        disk_size_bytes: u64,
+        memory_bytes: u64,
+        memory_effective_mib: u64,
+        vcpu_count: u32,
+    ) -> Result<(), SdkError> {
+        let connection = self.connection()?;
+        let updated = connection.execute(
+            "UPDATE microvms
+             SET disk_size_bytes = ?2,
+                 memory_requested_bytes = ?3,
+                 memory_effective_mib = ?4,
+                 vcpu_count = ?5,
+                 updated_at = ?6
+             WHERE id = ?1",
+            params![
+                vm_id,
+                to_sqlite_integer(disk_size_bytes, "VM disk size")?,
+                to_sqlite_integer(memory_bytes, "VM memory")?,
+                to_sqlite_integer(memory_effective_mib, "VM effective memory")?,
+                i64::from(vcpu_count),
+                unix_timestamp()?,
+            ],
+        )?;
+        if updated == 0 {
+            return Err(SdkError::NotFound {
+                kind: "MicroVM".to_owned(),
+                id: vm_id.to_string(),
+            });
+        }
+        Ok(())
+    }
+
     fn bridge_has_other_references(
         &self,
         vm_id: i64,

@@ -18,6 +18,8 @@ pub(crate) enum Command {
     Artifacts(ArtifactsArgs),
     /// Create a new MicroVM through guided prompts or explicit flags.
     New(NewArgs),
+    /// Edit the vCPU, memory, and disk capacities of a stopped MicroVM.
+    Edit(EditArgs),
     /// Start a created MicroVM by name or interactive selection.
     Start(StartArgs),
     /// Stop a running MicroVM by name or interactive selection.
@@ -106,6 +108,32 @@ pub(crate) struct NewArgs {
     /// Internal only: set by privilege escalation for the elevated child.
     #[arg(long = "trusted-values", hide = true)]
     pub(crate) trusted_values: bool,
+}
+
+#[derive(Debug, Args, Clone)]
+pub(crate) struct EditArgs {
+    /// Machine name; skips the machine selector when supplied.
+    pub(crate) name: Option<String>,
+
+    /// Equivalent to the positional name; must agree when both are given.
+    #[arg(long = "name")]
+    pub(crate) explicit_name: Option<String>,
+
+    /// New root-disk size in gigabytes (decimal values allowed).
+    #[arg(long = "disk-gb")]
+    pub(crate) disk_gb: Option<String>,
+
+    /// New memory as xMB or xGB (for example 512MB or 1.5GB).
+    #[arg(long = "memory")]
+    pub(crate) memory: Option<String>,
+
+    /// New virtual CPU count.
+    #[arg(long = "vcpus")]
+    pub(crate) vcpus: Option<String>,
+
+    /// Disable prompts; the name and at least one change are required.
+    #[arg(long = "non-interactive")]
+    pub(crate) non_interactive: bool,
 }
 
 #[derive(Debug, Args, Clone)]
@@ -473,6 +501,49 @@ mod tests {
         assert!(Cli::try_parse_from(["microvm", "new", "--kernel", "x"]).is_err());
         assert!(Cli::try_parse_from(["microvm", "new", "--volume-path", "/tmp/x"]).is_err());
         assert!(Cli::try_parse_from(["microvm", "new", "--lan-address", "1.2.3.4"]).is_err());
+    }
+
+    #[test]
+    fn edit_parser_accepts_name_and_capacity_flags() {
+        let cli = Cli::try_parse_from([
+            "microvm",
+            "edit",
+            "web-01",
+            "--disk-gb",
+            "30",
+            "--memory",
+            "4GB",
+            "--vcpus",
+            "4",
+            "--non-interactive",
+        ])
+        .expect("valid explicit edit arguments");
+
+        let Some(Command::Edit(arguments)) = cli.command else {
+            panic!("edit command should be parsed");
+        };
+        assert_eq!(arguments.name.as_deref(), Some("web-01"));
+        assert_eq!(arguments.disk_gb.as_deref(), Some("30"));
+        assert_eq!(arguments.memory.as_deref(), Some("4GB"));
+        assert_eq!(arguments.vcpus.as_deref(), Some("4"));
+        assert!(arguments.non_interactive);
+    }
+
+    #[test]
+    fn edit_parser_accepts_bare_interactive_form() {
+        let cli = Cli::try_parse_from(["microvm", "edit"]).expect("bare edit should parse");
+        let Some(Command::Edit(arguments)) = cli.command else {
+            panic!("edit command should be selected");
+        };
+        assert!(arguments.name.is_none());
+        assert!(!arguments.non_interactive);
+    }
+
+    #[test]
+    fn edit_parser_rejects_out_of_scope_flags() {
+        assert!(Cli::try_parse_from(["microvm", "edit", "--image", "x=y"]).is_err());
+        assert!(Cli::try_parse_from(["microvm", "edit", "--expose-lan"]).is_err());
+        assert!(Cli::try_parse_from(["microvm", "edit", "--kernel", "x"]).is_err());
     }
 
     #[test]

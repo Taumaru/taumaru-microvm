@@ -32,9 +32,9 @@ use crate::domain::lifecycle::{MicroVmState, NetworkMode};
 use crate::domain::microvm::{
     CreateMicroVmRequest, CreationEventPhase, CreationOutcome, CreationProgress, CreationStage,
     MicroVmCreationResult, MicroVmDeleteResult, MicroVmRecord, MicroVmStartResult,
-    MicroVmStopResult, MicroVmSummary, NetworkConfigurationResult, PersistedCredential,
-    PersistedNetwork, PersistedRuntime, RunningMicroVm, SshConnectionInfo, TOTAL_CREATION_STEPS,
-    unspecified_address,
+    MicroVmStopResult, MicroVmSummary, MicroVmUpdateResult, NetworkConfigurationResult,
+    PersistedCredential, PersistedNetwork, PersistedRuntime, RunningMicroVm, SshConnectionInfo,
+    TOTAL_CREATION_STEPS, UpdateMicroVmRequest, unspecified_address,
 };
 use crate::domain::registry::{
     Architecture, BinaryFile, BinaryPackage, Distribution, DistributionImage, Kernel,
@@ -802,6 +802,47 @@ impl MicroVmSdk {
             });
         }
         Ok(running)
+    }
+
+    /// Reports how many bytes of a MicroVM root disk are actually in use.
+    ///
+    /// Returns the ext4 minimum size for the VM-local `rootfs.ext4`, which is
+    /// the edit-time disk minimum: a smaller requested disk is rejected.
+    /// The VM must be stopped; a live socket is refused with a stop-first
+    /// lifecycle conflict. The query performs no mutation, repair, or
+    /// persistence write, and emits no output, logs, or global state.
+    pub async fn microvm_disk_used_bytes(&self, name: &str) -> Result<u64, SdkError> {
+        crate::domain::config::validate_vm_name(name)?;
+        let _runtime_lock = acquire_lifecycle_lock(&self.home, name).await?;
+        let lookup_name = name.to_owned();
+        let name_lock_path = self.home.join("vms").join(name);
+        let name_lock = self.target_lock(&name_lock_path)?;
+        let _name_guard = name_lock.lock().await;
+        let stored = self
+            .run_repository(move |repository| repository.find_microvm(&lookup_name))
+            .await?
+            .ok_or_else(|| SdkError::NotFound {
+                kind: "MicroVM".to_owned(),
+                id: name.to_owned(),
+            })?;
+        let volume_lock = if stored.record.volume_path != name_lock_path {
+            Some(self.target_lock(&stored.record.volume_path)?)
+        } else {
+            None
+        };
+        let _volume_guard = match volume_lock.as_ref() {
+            Some(lock) => Some(lock.lock().await),
+            None => None,
+        };
+        stored.require_complete("inspect MicroVM disk usage")?;
+        if self.socket_answers(&stored.record.socket_path)? {
+            return Err(SdkError::LifecycleConflict {
+                name: stored.record.name.clone(),
+                state: MicroVmState::Running.to_string(),
+                operation: "inspect MicroVM disk usage (stop the machine first)".to_owned(),
+            });
+        }
+        self.storage.disk_used_bytes(&stored.record.rootfs_path)
     }
 
     /// Reports whether a distribution image is verified locally.
@@ -2101,6 +2142,272 @@ impl MicroVmSdk {
         self.run_repository(move |repository| repository.delete_microvm(vm_id))
             .await?;
         Ok(MicroVmDeleteResult { name: deleted_name })
+    }
+
+    /// Updates the resizable resources of one stopped MicroVM.
+    ///
+    /// Only `disk_size_bytes`, `memory_bytes`, and `vcpu_count` change. The
+    /// distribution, image, kernel, network identity, and credentials are
+    /// never modified. The VM must be stopped: a live control socket is
+    /// refused with a stop-first lifecycle conflict and no host change.
+    ///
+    /// Memory and vCPU values are validated against the distribution
+    /// requirements from the registry manifest, exactly like creation. A
+    /// requested disk size below the actual ext4 usage is rejected before
+    /// any resize. The root disk is resized in place first and the inventory
+    /// row is updated second; a database failure after a successful resize
+    /// attempts to restore the previous disk size before returning, and a
+    /// resize failure itself attempts the same restore before returning.
+    /// A crash between the resize and the row update can still leave the
+    /// file and the record diverged; the next update converges the file back
+    /// to the recorded size first when the filesystem fits, and refuses
+    /// otherwise, so a retry never truncates filesystem content.
+    pub async fn update_microvm(
+        &self,
+        request: UpdateMicroVmRequest,
+    ) -> Result<MicroVmUpdateResult, SdkError> {
+        crate::domain::config::validate_vm_name(&request.name)?;
+        if request.disk_size_bytes.is_none()
+            && request.memory_bytes.is_none()
+            && request.vcpu_count.is_none()
+        {
+            return Err(SdkError::InvalidRequest {
+                field: "update".to_owned(),
+                reason: "at least one of disk_size_bytes, memory_bytes, or vcpu_count must be set"
+                    .to_owned(),
+            });
+        }
+        if request.disk_size_bytes.is_some_and(|value| value == 0) {
+            return Err(SdkError::InvalidRequest {
+                field: "disk_size_bytes".to_owned(),
+                reason: "must be greater than zero".to_owned(),
+            });
+        }
+        if request.memory_bytes.is_some_and(|value| value == 0) {
+            return Err(SdkError::InvalidRequest {
+                field: "memory_bytes".to_owned(),
+                reason: "must be greater than zero".to_owned(),
+            });
+        }
+        if request.vcpu_count.is_some_and(|value| value == 0) {
+            return Err(SdkError::InvalidRequest {
+                field: "vcpu_count".to_owned(),
+                reason: "must be greater than zero".to_owned(),
+            });
+        }
+        if let Some(disk) = request.disk_size_bytes
+            && disk > i64::MAX as u64
+        {
+            return Err(SdkError::InvalidRequest {
+                field: "disk_size_bytes".to_owned(),
+                reason: "value exceeds the SQLite INTEGER range".to_owned(),
+            });
+        }
+        if let Some(memory) = request.memory_bytes
+            && memory > i64::MAX as u64
+        {
+            return Err(SdkError::InvalidRequest {
+                field: "memory_bytes".to_owned(),
+                reason: "value exceeds the SQLite INTEGER range".to_owned(),
+            });
+        }
+
+        let _runtime_lock = acquire_lifecycle_lock(&self.home, &request.name).await?;
+        let lookup_name = request.name.clone();
+        let name_lock_path = self.home.join("vms").join(&request.name);
+        let name_lock = self.target_lock(&name_lock_path)?;
+        let _name_guard = name_lock.lock().await;
+        let stored = self
+            .run_repository(move |repository| repository.find_microvm(&lookup_name))
+            .await?
+            .ok_or_else(|| SdkError::NotFound {
+                kind: "MicroVM".to_owned(),
+                id: request.name.clone(),
+            })?;
+        let volume_lock = if stored.record.volume_path != name_lock_path {
+            Some(self.target_lock(&stored.record.volume_path)?)
+        } else {
+            None
+        };
+        let _volume_guard = match volume_lock.as_ref() {
+            Some(lock) => Some(lock.lock().await),
+            None => None,
+        };
+        stored.require_complete("edit MicroVM")?;
+        if self.socket_answers(&stored.record.socket_path)? {
+            return Err(SdkError::LifecycleConflict {
+                name: stored.record.name.clone(),
+                state: MicroVmState::Running.to_string(),
+                operation: "edit MicroVM (stop the machine first)".to_owned(),
+            });
+        }
+        self.verify_recorded_process_exited(&stored)?;
+
+        let manifest = self.fetch_manifest().await?;
+        let distribution = manifest
+            .distributions
+            .iter()
+            .find(|candidate| candidate.id == stored.record.distribution_id)
+            .cloned()
+            .ok_or_else(|| SdkError::NotFound {
+                kind: "distribution".to_owned(),
+                id: stored.record.distribution_id.clone(),
+            })?;
+
+        let new_disk = request
+            .disk_size_bytes
+            .unwrap_or(stored.record.disk_size_bytes);
+        let new_memory = request.memory_bytes.unwrap_or(stored.record.memory_bytes);
+        let new_vcpus = request.vcpu_count.unwrap_or(stored.record.vcpu_count);
+
+        let minimum_memory = minimum_memory_bytes(distribution.requirements.min_memory_mb)?;
+        if new_memory < minimum_memory {
+            return Err(SdkError::InvalidRequest {
+                field: "memory_bytes".to_owned(),
+                reason: format!(
+                    "must be at least {} bytes for distribution {}",
+                    minimum_memory, distribution.id
+                ),
+            });
+        }
+        if new_vcpus < distribution.requirements.min_vcpus {
+            return Err(SdkError::InvalidRequest {
+                field: "vcpu_count".to_owned(),
+                reason: format!(
+                    "must be at least {} vCPUs for distribution {}",
+                    distribution.requirements.min_vcpus, distribution.id
+                ),
+            });
+        }
+
+        const BYTES_PER_MIB: u64 = 1024 * 1024;
+        let new_effective_mib =
+            new_memory
+                .checked_add(BYTES_PER_MIB - 1)
+                .ok_or_else(|| SdkError::InvalidRequest {
+                    field: "memory_bytes".to_owned(),
+                    reason: "value cannot be converted to MiB".to_owned(),
+                })?
+                / BYTES_PER_MIB;
+        if new_effective_mib == 0 || new_effective_mib > i64::MAX as u64 {
+            return Err(SdkError::InvalidRequest {
+                field: "memory_bytes".to_owned(),
+                reason: "value cannot be represented as a Firecracker MiB value".to_owned(),
+            });
+        }
+
+        if new_disk == stored.record.disk_size_bytes
+            && new_memory == stored.record.memory_bytes
+            && new_vcpus == stored.record.vcpu_count
+        {
+            return Ok(MicroVmUpdateResult {
+                name: stored.record.name.clone(),
+                state: MicroVmState::Stopped,
+                distribution_id: stored.record.distribution_id.clone(),
+                image_id: stored.record.image_id.clone(),
+                volume_path: stored.record.volume_path.clone(),
+                rootfs_path: stored.record.rootfs_path.clone(),
+                vcpu_count: stored.record.vcpu_count,
+                memory_bytes: stored.record.memory_bytes,
+                disk_size_bytes: stored.record.disk_size_bytes,
+                disk_resized: false,
+            });
+        }
+
+        let disk_changed = new_disk != stored.record.disk_size_bytes;
+        // An interrupted resize or crash can leave the file converged to a
+        // different size than the record. Converge the file back to the
+        // recorded size first: resize refuses when the filesystem itself no
+        // longer fits, so converging never truncates filesystem content.
+        // This also repairs damage left by versions predating the converge
+        // logic, keeping a retry after an upgrade working without manual
+        // recovery.
+        let current_len =
+            std::fs::symlink_metadata(&stored.record.rootfs_path).map_err(|error| {
+                SdkError::filesystem("inspect VM rootfs", &stored.record.rootfs_path, error)
+            })?;
+        if current_len.file_type().is_symlink() || !current_len.is_file() {
+            return Err(SdkError::GuestFilesystem {
+                operation: "inspect VM rootfs".to_owned(),
+                path: stored.record.rootfs_path.clone(),
+                reason: "the root disk is not a regular file".to_owned(),
+            });
+        }
+        if current_len.len() != stored.record.disk_size_bytes {
+            self.storage
+                .resize_rootfs(&stored.record.rootfs_path, stored.record.disk_size_bytes)?;
+        }
+        if disk_changed {
+            let used_bytes = self.storage.disk_used_bytes(&stored.record.rootfs_path)?;
+            if new_disk < used_bytes {
+                return Err(SdkError::InvalidRequest {
+                    field: "disk_size_bytes".to_owned(),
+                    reason: format!(
+                        "requested {new_disk} bytes is smaller than the used {used_bytes} bytes"
+                    ),
+                });
+            }
+            self.runtime_disk.release_mapping(
+                &self.home,
+                &stored.record.name,
+                &stored.record.rootfs_path,
+            )?;
+            if let Err(resize) = self
+                .storage
+                .resize_rootfs(&stored.record.rootfs_path, new_disk)
+            {
+                let previous = stored.record.disk_size_bytes;
+                if let Err(rollback) = self
+                    .storage
+                    .resize_rootfs(&stored.record.rootfs_path, previous)
+                {
+                    return Err(SdkError::Cleanup {
+                        primary: resize.to_string(),
+                        failures: vec![rollback.to_string()],
+                    });
+                }
+                return Err(resize);
+            }
+        }
+
+        let vm_id = stored.record.id;
+        let update_result = self
+            .run_repository(move |repository| {
+                repository.update_microvm_resources(
+                    vm_id,
+                    new_disk,
+                    new_memory,
+                    new_effective_mib,
+                    new_vcpus,
+                )
+            })
+            .await;
+        if let Err(primary) = update_result {
+            if disk_changed
+                && let Err(rollback) = self
+                    .storage
+                    .resize_rootfs(&stored.record.rootfs_path, stored.record.disk_size_bytes)
+            {
+                return Err(SdkError::Cleanup {
+                    primary: primary.to_string(),
+                    failures: vec![rollback.to_string()],
+                });
+            }
+            return Err(primary);
+        }
+
+        Ok(MicroVmUpdateResult {
+            name: stored.record.name.clone(),
+            state: MicroVmState::Stopped,
+            distribution_id: stored.record.distribution_id.clone(),
+            image_id: stored.record.image_id.clone(),
+            volume_path: stored.record.volume_path.clone(),
+            rootfs_path: stored.record.rootfs_path.clone(),
+            vcpu_count: new_vcpus,
+            memory_bytes: new_memory,
+            disk_size_bytes: new_disk,
+            disk_resized: disk_changed,
+        })
     }
 
     /// Previews the kernels and images the next prune would reclaim.
@@ -5245,7 +5552,7 @@ mod tests {
     use crate::domain::microvm::{
         CreateMicroVmRequest, CreationEventPhase, CreationOutcome, CreationProgress, CreationStage,
         NetworkConfiguration, NetworkResource, PersistedCredential, PersistedNetwork,
-        PersistedNetworkResource, PersistedRuntime, TOTAL_CREATION_STEPS,
+        PersistedNetworkResource, PersistedRuntime, TOTAL_CREATION_STEPS, UpdateMicroVmRequest,
     };
     use crate::domain::registry::{Architecture, Kernel, TaumaruRegistry};
     use crate::domain::restore::{RestoreCancellation, RestoreProgressStage, RestoreRequest};
@@ -5552,6 +5859,36 @@ mod tests {
                 SdkError::filesystem("sync test private disk copy", destination, error)
             })?;
             on_copy_progress(size_bytes, size_bytes);
+            Ok(())
+        }
+
+        fn disk_used_bytes(&self, rootfs_path: &Path) -> Result<u64, SdkError> {
+            let metadata = fs::metadata(rootfs_path).map_err(|error| {
+                SdkError::filesystem("inspect test root disk", rootfs_path, error)
+            })?;
+            if !metadata.is_file() {
+                return Err(SdkError::GuestFilesystem {
+                    operation: "inspect test root disk".to_owned(),
+                    path: rootfs_path.to_path_buf(),
+                    reason: "test rootfs is missing".to_owned(),
+                });
+            }
+            Ok(metadata.len().min(8))
+        }
+
+        fn resize_rootfs(&self, rootfs_path: &Path, new_size_bytes: u64) -> Result<(), SdkError> {
+            if new_size_bytes == 0 {
+                return Err(SdkError::InvalidRequest {
+                    field: "disk_size_bytes".to_owned(),
+                    reason: "must be greater than zero".to_owned(),
+                });
+            }
+            let file = fs::OpenOptions::new()
+                .write(true)
+                .open(rootfs_path)
+                .map_err(|error| SdkError::filesystem("resize test rootfs", rootfs_path, error))?;
+            file.set_len(new_size_bytes)
+                .map_err(|error| SdkError::filesystem("resize test rootfs", rootfs_path, error))?;
             Ok(())
         }
     }
@@ -10113,6 +10450,315 @@ mod tests {
         assert!(
             survivor.record.volume_path.join("rootfs.ext4").is_file(),
             "surviving VM keeps its files"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_applies_vcpu_and_memory_without_touching_the_disk() {
+        if std::env::consts::ARCH != "x86_64" {
+            return;
+        }
+        let (sdk, _directory, _storage, _credentials, _network, _runtime) = test_sdk(false);
+        let stored = start_fixture_vm(&sdk, "editable_vm", false, None);
+        let rootfs_before =
+            std::fs::read(&stored.record.rootfs_path).expect("rootfs should be readable");
+        let updated = sdk
+            .update_microvm(UpdateMicroVmRequest {
+                name: "editable_vm".to_owned(),
+                disk_size_bytes: None,
+                memory_bytes: Some(256 * 1024 * 1024),
+                vcpu_count: Some(2),
+            })
+            .await
+            .expect("stopped VM should update");
+        assert_eq!(updated.name, "editable_vm");
+        assert_eq!(updated.state, MicroVmState::Stopped);
+        assert_eq!(updated.vcpu_count, 2);
+        assert_eq!(updated.memory_bytes, 256 * 1024 * 1024);
+        assert_eq!(updated.disk_size_bytes, 14);
+        assert!(!updated.disk_resized);
+        assert_eq!(
+            std::fs::read(&stored.record.rootfs_path).expect("rootfs should be readable"),
+            rootfs_before,
+            "the disk file is untouched when only vCPU and memory change"
+        );
+        let stored_after = sdk
+            .run_repository(|repository| repository.find_microvm("editable_vm"))
+            .await
+            .expect("lookup should work")
+            .expect("record should exist");
+        assert_eq!(stored_after.record.vcpu_count, 2);
+        assert_eq!(stored_after.record.memory_bytes, 256 * 1024 * 1024);
+        assert_eq!(stored_after.record.memory_effective_mib, 256);
+        assert_eq!(stored_after.record.disk_size_bytes, 14);
+    }
+
+    #[tokio::test]
+    async fn update_grows_the_disk_and_persists_the_new_size() {
+        if std::env::consts::ARCH != "x86_64" {
+            return;
+        }
+        let (sdk, _directory, _storage, _credentials, _network, _runtime) = test_sdk(false);
+        start_fixture_vm(&sdk, "growable_vm", false, None);
+        let updated = sdk
+            .update_microvm(UpdateMicroVmRequest {
+                name: "growable_vm".to_owned(),
+                disk_size_bytes: Some(32),
+                memory_bytes: None,
+                vcpu_count: None,
+            })
+            .await
+            .expect("disk grow should succeed");
+        assert_eq!(updated.disk_size_bytes, 32);
+        assert!(updated.disk_resized);
+        let stored = sdk
+            .run_repository(|repository| repository.find_microvm("growable_vm"))
+            .await
+            .expect("lookup should work")
+            .expect("record should exist");
+        assert_eq!(stored.record.disk_size_bytes, 32);
+        assert_eq!(
+            std::fs::metadata(&stored.record.rootfs_path)
+                .expect("rootfs metadata")
+                .len(),
+            32
+        );
+    }
+
+    #[tokio::test]
+    async fn update_shrinks_the_disk_above_actual_usage() {
+        if std::env::consts::ARCH != "x86_64" {
+            return;
+        }
+        let (sdk, _directory, _storage, _credentials, _network, _runtime) = test_sdk(false);
+        start_fixture_vm(&sdk, "shrinkable_vm", false, None);
+        let used = sdk
+            .microvm_disk_used_bytes("shrinkable_vm")
+            .await
+            .expect("usage probe should succeed");
+        assert!(used < 14, "fixture usage below the recorded size");
+        let updated = sdk
+            .update_microvm(UpdateMicroVmRequest {
+                name: "shrinkable_vm".to_owned(),
+                disk_size_bytes: Some(used + 1),
+                memory_bytes: None,
+                vcpu_count: None,
+            })
+            .await
+            .expect("disk shrink above usage should succeed");
+        assert_eq!(updated.disk_size_bytes, used + 1);
+        assert!(updated.disk_resized);
+        let stored = sdk
+            .run_repository(|repository| repository.find_microvm("shrinkable_vm"))
+            .await
+            .expect("lookup should work")
+            .expect("record should exist");
+        assert_eq!(stored.record.disk_size_bytes, used + 1);
+    }
+
+    #[tokio::test]
+    async fn update_converges_a_diverged_disk_file_before_applying() {
+        if std::env::consts::ARCH != "x86_64" {
+            return;
+        }
+        let (sdk, _directory, _storage, _credentials, _network, _runtime) = test_sdk(false);
+        let stored = start_fixture_vm(&sdk, "diverged_vm", false, None);
+        // Simulate an interrupted grow: the file was extended while the
+        // record still holds the old size.
+        let file = OpenOptions::new()
+            .write(true)
+            .open(&stored.record.rootfs_path)
+            .expect("fixture rootfs should open");
+        file.set_len(32).expect("fixture rootfs should extend");
+        drop(file);
+        let updated = sdk
+            .update_microvm(UpdateMicroVmRequest {
+                name: "diverged_vm".to_owned(),
+                disk_size_bytes: None,
+                memory_bytes: None,
+                vcpu_count: Some(2),
+            })
+            .await
+            .expect("a repairable diverged file should converge");
+        assert_eq!(updated.vcpu_count, 2);
+        assert_eq!(updated.disk_size_bytes, 14);
+        assert!(!updated.disk_resized);
+        assert_eq!(
+            std::fs::metadata(&stored.record.rootfs_path)
+                .expect("rootfs metadata")
+                .len(),
+            14,
+            "the file converges back to the recorded size"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_returns_the_stored_values_unchanged_when_nothing_differs() {
+        if std::env::consts::ARCH != "x86_64" {
+            return;
+        }
+        let (sdk, _directory, _storage, _credentials, _network, _runtime) = test_sdk(false);
+        start_fixture_vm(&sdk, "same_vm", false, None);
+        let updated = sdk
+            .update_microvm(UpdateMicroVmRequest {
+                name: "same_vm".to_owned(),
+                disk_size_bytes: Some(14),
+                memory_bytes: Some(128 * 1024 * 1024),
+                vcpu_count: Some(1),
+            })
+            .await
+            .expect("identical values are a no-op success");
+        assert!(!updated.disk_resized);
+        assert_eq!(updated.disk_size_bytes, 14);
+    }
+
+    #[tokio::test]
+    async fn update_rejects_a_disk_below_actual_usage_without_mutation() {
+        if std::env::consts::ARCH != "x86_64" {
+            return;
+        }
+        let (sdk, _directory, _storage, _credentials, _network, _runtime) = test_sdk(false);
+        start_fixture_vm(&sdk, "full_vm", false, None);
+        let error = sdk
+            .update_microvm(UpdateMicroVmRequest {
+                name: "full_vm".to_owned(),
+                disk_size_bytes: Some(1),
+                memory_bytes: None,
+                vcpu_count: None,
+            })
+            .await
+            .expect_err("disk below usage should fail");
+        assert!(
+            matches!(error, SdkError::InvalidRequest { ref field, .. } if field == "disk_size_bytes"),
+            "disk minimum is typed, got: {error:?}"
+        );
+        let stored = sdk
+            .run_repository(|repository| repository.find_microvm("full_vm"))
+            .await
+            .expect("lookup should work")
+            .expect("record should exist");
+        assert_eq!(stored.record.disk_size_bytes, 14);
+        assert_eq!(
+            std::fs::metadata(&stored.record.rootfs_path)
+                .expect("rootfs metadata")
+                .len(),
+            14
+        );
+    }
+
+    #[tokio::test]
+    async fn update_rejects_values_below_distribution_minima() {
+        if std::env::consts::ARCH != "x86_64" {
+            return;
+        }
+        let (sdk, _directory, _storage, _credentials, _network, _runtime) = test_sdk(false);
+        start_fixture_vm(&sdk, "small_vm", false, None);
+        let error = sdk
+            .update_microvm(UpdateMicroVmRequest {
+                name: "small_vm".to_owned(),
+                disk_size_bytes: None,
+                memory_bytes: Some(1),
+                vcpu_count: None,
+            })
+            .await
+            .expect_err("memory below minimum should fail");
+        assert!(
+            matches!(error, SdkError::InvalidRequest { ref field, .. } if field == "memory_bytes"),
+            "memory minimum is typed, got: {error:?}"
+        );
+        let error = sdk
+            .update_microvm(UpdateMicroVmRequest {
+                name: "small_vm".to_owned(),
+                disk_size_bytes: None,
+                memory_bytes: None,
+                vcpu_count: Some(0),
+            })
+            .await
+            .expect_err("zero vCPUs should fail");
+        assert!(
+            matches!(error, SdkError::InvalidRequest { ref field, .. } if field == "vcpu_count"),
+            "vCPU minimum is typed, got: {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_refuses_a_running_vm_without_host_changes() {
+        if std::env::consts::ARCH != "x86_64" {
+            return;
+        }
+        let (sdk, _directory, _storage, _credentials, _network, runtime) = test_sdk(false);
+        start_fixture_vm(&sdk, "running_vm", false, Some(4242));
+        *runtime.live_socket.lock().expect("socket lock") = true;
+        let error = sdk
+            .update_microvm(UpdateMicroVmRequest {
+                name: "running_vm".to_owned(),
+                disk_size_bytes: None,
+                memory_bytes: None,
+                vcpu_count: Some(2),
+            })
+            .await
+            .expect_err("running VM should be refused");
+        assert!(
+            matches!(&error, SdkError::LifecycleConflict { name, state, operation } if name == "running_vm" && state == "running" && operation.contains("stop")),
+            "stop-first refusal, got: {error:?}"
+        );
+        let stored = sdk
+            .run_repository(|repository| repository.find_microvm("running_vm"))
+            .await
+            .expect("lookup should work")
+            .expect("record should exist");
+        assert_eq!(stored.record.vcpu_count, 1);
+    }
+
+    #[tokio::test]
+    async fn update_rejects_unknown_names_and_empty_changes() {
+        if std::env::consts::ARCH != "x86_64" {
+            return;
+        }
+        let (sdk, _directory, _storage, _credentials, _network, _runtime) = test_sdk(false);
+        let error = sdk
+            .update_microvm(UpdateMicroVmRequest {
+                name: "missing_vm".to_owned(),
+                disk_size_bytes: None,
+                memory_bytes: None,
+                vcpu_count: Some(2),
+            })
+            .await
+            .expect_err("unknown VM should fail");
+        assert!(
+            matches!(error, SdkError::NotFound { .. }),
+            "unknown name is typed, got: {error:?}"
+        );
+        let error = sdk
+            .update_microvm(UpdateMicroVmRequest {
+                name: "missing_vm".to_owned(),
+                disk_size_bytes: None,
+                memory_bytes: None,
+                vcpu_count: None,
+            })
+            .await
+            .expect_err("empty change should fail");
+        assert!(
+            matches!(error, SdkError::InvalidRequest { .. }),
+            "empty change is typed, got: {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn disk_usage_probe_refuses_a_running_vm() {
+        if std::env::consts::ARCH != "x86_64" {
+            return;
+        }
+        let (sdk, _directory, _storage, _credentials, _network, runtime) = test_sdk(false);
+        start_fixture_vm(&sdk, "probed_vm", false, Some(4242));
+        *runtime.live_socket.lock().expect("socket lock") = true;
+        let error = sdk
+            .microvm_disk_used_bytes("probed_vm")
+            .await
+            .expect_err("running VM probe should fail");
+        assert!(
+            matches!(&error, SdkError::LifecycleConflict { state, .. } if state == "running"),
+            "stop-first refusal, got: {error:?}"
         );
     }
 }

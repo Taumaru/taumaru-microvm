@@ -220,6 +220,45 @@ impl CliError {
         ))
     }
 
+    pub(crate) fn edit_not_found(name: &str) -> Self {
+        Self::Creation(format!(
+            "MicroVM {name:?} was not found\u{1f}no created machine named {name:?} exists in this home\u{1f}Run `microvm new` to create it, then try again"
+        ))
+    }
+
+    pub(crate) fn edit_empty() -> Self {
+        Self::Creation(
+            "No MicroVMs to edit\u{1f}no created machines exist in this home\u{1f}Run `microvm new` to create one, then try again"
+                .to_string(),
+        )
+    }
+
+    pub(crate) fn edit_cancelled() -> Self {
+        Self::Creation(
+            "MicroVM edit cancelled\u{1f}no machine was changed\u{1f}Run `microvm edit` again when you are ready"
+                .to_string(),
+        )
+    }
+
+    pub(crate) fn edit_no_changes(name: &str) -> Self {
+        Self::Creation(format!(
+            "No changes to apply\u{1f}machine {name:?} already uses the requested capacities\u{1f}Change --disk-gb, --memory, or --vcpus to a different value"
+        ))
+    }
+
+    pub(crate) fn edit_running(name: &str) -> Self {
+        Self::Creation(format!(
+            "MicroVM {name:?} is running\u{1f}machine {name:?} must be stopped before it can be edited\u{1f}Run `microvm stop {name}`, then run `microvm edit {name}` again"
+        ))
+    }
+
+    pub(crate) fn edit_failed(what: impl Into<String>, error: &SdkError) -> Self {
+        Self::Creation(format!(
+            "{}\u{1f}{error}\u{1f}Check the reported cause, fix it, then retry the edit",
+            what.into()
+        ))
+    }
+
     pub(crate) fn ls_failed(what: impl Into<String>, error: &SdkError) -> Self {
         Self::Creation(format!(
             "{}\u{1f}{error}\u{1f}Check the reported cause, then retry the listing",
@@ -296,6 +335,7 @@ impl CliError {
             Self::Creation(payload) if payload.starts_with("MicroVM connection cancelled") => 130,
             Self::Creation(payload) if payload.starts_with("MicroVM stop cancelled") => 130,
             Self::Creation(payload) if payload.starts_with("MicroVM delete cancelled") => 130,
+            Self::Creation(payload) if payload.starts_with("MicroVM edit cancelled") => 130,
             Self::Creation(payload) if payload.starts_with("MicroVM prune cancelled") => 130,
             Self::Creation(payload) if payload.starts_with("MicroVM snapshot cancelled") => 130,
             Self::Creation(payload) if payload.starts_with("MicroVM autostart cancelled") => 130,

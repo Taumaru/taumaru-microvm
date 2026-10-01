@@ -168,6 +168,33 @@ fn delete_result_type_is_exported_with_deleted_name() {
     let _ = std::mem::size_of::<MicroVmDeleteResult>();
 }
 
+#[test]
+fn update_types_are_exported_with_stopped_state() {
+    use std::path::PathBuf;
+    use taumaru_microvm::{MicroVmState, MicroVmUpdateResult, UpdateMicroVmRequest};
+    let request = UpdateMicroVmRequest {
+        name: "web-01".to_owned(),
+        disk_size_bytes: None,
+        memory_bytes: Some(2 * 1024 * 1024 * 1024),
+        vcpu_count: Some(2),
+    };
+    assert_eq!(request.name, "web-01");
+    let result = MicroVmUpdateResult {
+        name: "web-01".to_owned(),
+        state: MicroVmState::Stopped,
+        distribution_id: "distro-a".to_owned(),
+        image_id: "image-a".to_owned(),
+        volume_path: PathBuf::from("/tmp/volume"),
+        rootfs_path: PathBuf::from("/tmp/volume/rootfs.ext4"),
+        vcpu_count: 2,
+        memory_bytes: 2 * 1024 * 1024 * 1024,
+        disk_size_bytes: 20 * 1024 * 1024 * 1024,
+        disk_resized: false,
+    };
+    assert_eq!(result.state, MicroVmState::Stopped);
+    assert!(!result.disk_resized);
+}
+
 #[tokio::test]
 async fn delete_validates_names_and_reports_unknown_vms_as_typed_errors() {
     use taumaru_microvm::{MicroVmSdk, SdkError};

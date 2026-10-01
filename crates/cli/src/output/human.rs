@@ -1301,6 +1301,163 @@ pub(crate) fn write_delete_result(
     write!(stdout, "{}", format_delete_result(result, capabilities))
 }
 
+pub(crate) struct EditSpinner {
+    bar: ProgressBar,
+    interactive: bool,
+}
+
+impl EditSpinner {
+    pub(crate) fn new(name: &str, capabilities: TerminalCapabilities) -> Self {
+        let bar = if capabilities.interactive {
+            let bar = ProgressBar::new_spinner();
+            let template = if capabilities.color {
+                "{spinner:.dim} {msg}"
+            } else {
+                "{spinner} {msg}"
+            };
+            let style = match ProgressStyle::with_template(template) {
+                Ok(style) => {
+                    style.tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"])
+                }
+                Err(_) => ProgressStyle::default_spinner(),
+            };
+            bar.set_style(style);
+            bar.set_message(format!("Updating MicroVM {name}"));
+            bar.enable_steady_tick(Duration::from_millis(90));
+            bar
+        } else {
+            eprintln!("·  Updating MicroVM {name}");
+            ProgressBar::hidden()
+        };
+
+        Self {
+            bar,
+            interactive: capabilities.interactive,
+        }
+    }
+
+    pub(crate) fn finish(self) {
+        if self.interactive {
+            self.bar.finish_and_clear();
+        }
+    }
+}
+
+pub(crate) struct EditCapacityChange {
+    pub(crate) label: &'static str,
+    pub(crate) old_value: String,
+    pub(crate) new_value: String,
+    pub(crate) changed: bool,
+}
+
+pub(crate) fn format_edit_review(
+    name: &str,
+    changes: &[EditCapacityChange],
+    capabilities: TerminalCapabilities,
+) -> String {
+    let mut output = String::from("\n");
+    output.push_str(&format!(
+        "{} {}\n{}\n\n",
+        paint("◆", ANSI_BLUE, capabilities.color),
+        paint(
+            format!("Edit MicroVM {name}"),
+            ANSI_BOLD,
+            capabilities.color
+        ),
+        divider(capabilities),
+    ));
+    for change in changes {
+        let marker = if change.changed {
+            paint("•", ANSI_BLUE, capabilities.color)
+        } else {
+            paint("-", ANSI_DIM, capabilities.color)
+        };
+        if change.changed {
+            output.push_str(&format!(
+                "  {marker}  {}: {} → {}\n",
+                paint(change.label, ANSI_BOLD, capabilities.color),
+                change.old_value,
+                change.new_value,
+            ));
+        } else {
+            output.push_str(&format!(
+                "  {marker}  {}: {} (unchanged)\n",
+                paint(change.label, ANSI_DIM, capabilities.color),
+                change.old_value,
+            ));
+        }
+    }
+    output.push_str(&format!(
+        "\n  {}\n\n{}\n",
+        paint(
+            "Only changed capacities are applied; the machine stays stopped.",
+            ANSI_DIM,
+            capabilities.color,
+        ),
+        paint(
+            "Review the values above. The update starts after confirmation.",
+            ANSI_DIM,
+            capabilities.color,
+        ),
+    ));
+    output
+}
+
+pub(crate) fn write_edit_review(
+    name: &str,
+    changes: &[EditCapacityChange],
+    capabilities: TerminalCapabilities,
+) -> Result<(), io::Error> {
+    let mut stdout = io::stdout().lock();
+    write!(
+        stdout,
+        "{}",
+        format_edit_review(name, changes, capabilities)
+    )
+}
+
+pub(crate) fn format_edit_result(
+    result: &taumaru_microvm::MicroVmUpdateResult,
+    capabilities: TerminalCapabilities,
+) -> String {
+    let title = paint(
+        format!("MicroVM {} updated", result.name),
+        ANSI_BOLD,
+        capabilities.color,
+    );
+    let check = paint("✓", ANSI_GREEN, capabilities.color);
+    let rule = divider(capabilities);
+    let resources_label = paint("Resources:", ANSI_DIM, capabilities.color);
+    let volume_label = paint("Volume:", ANSI_DIM, capabilities.color);
+    let start_label = paint("Start:", ANSI_DIM, capabilities.color);
+    let capacity = format!(
+        "{} · {} · {} vCPUs",
+        format_gb(result.disk_size_bytes),
+        format_mb_gb(result.memory_bytes),
+        result.vcpu_count
+    );
+    let mut output = String::from("\n");
+    output.push_str(&format!("{check} {title}\n{rule}\n\n"));
+    output.push_str(&format!("  {resources_label} {capacity}\n"));
+    output.push_str(&format!(
+        "  {volume_label} {}\n",
+        result.volume_path.display()
+    ));
+    output.push_str(&format!(
+        "  {start_label}    microvm start {}\n",
+        result.name
+    ));
+    output
+}
+
+pub(crate) fn write_edit_result(
+    result: &taumaru_microvm::MicroVmUpdateResult,
+    capabilities: TerminalCapabilities,
+) -> Result<(), io::Error> {
+    let mut stdout = io::stdout().lock();
+    write!(stdout, "{}", format_edit_result(result, capabilities))
+}
+
 fn ls_network_cell(summary: &taumaru_microvm::MicroVmSummary) -> String {
     let (Some(mode), Some(guest)) = (summary.network_mode, summary.guest_address) else {
         return String::from("-");

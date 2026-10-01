@@ -99,4 +99,26 @@ pub(crate) trait GuestStorage: Send + Sync {
             reason: "storage adapter cannot copy a stable block view".to_owned(),
         })
     }
+
+    /// Reports how many bytes of the VM-local ext4 filesystem are in use.
+    ///
+    /// Used as the edit-time disk minimum: a requested disk size below this
+    /// value is rejected before any resize is attempted.
+    fn disk_used_bytes(&self, rootfs_path: &Path) -> Result<u64, SdkError> {
+        let _ = rootfs_path;
+        Err(SdkError::SnapshotCapability {
+            capability: "root-disk usage probe".to_owned(),
+            reason: "storage adapter cannot measure ext4 usage".to_owned(),
+        })
+    }
+
+    /// Resizes the VM-local ext4 filesystem file in place to exactly
+    /// `new_size_bytes`, growing or shrinking as needed.
+    fn resize_rootfs(&self, rootfs_path: &Path, new_size_bytes: u64) -> Result<(), SdkError> {
+        let _ = (rootfs_path, new_size_bytes);
+        Err(SdkError::SnapshotCapability {
+            capability: "root-disk resize".to_owned(),
+            reason: "storage adapter cannot resize the root disk".to_owned(),
+        })
+    }
 }
