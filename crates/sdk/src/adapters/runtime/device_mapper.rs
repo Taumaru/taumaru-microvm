@@ -1985,6 +1985,11 @@ fn parse_mapper_list(bytes: &[u8]) -> Result<Vec<MapperInfo>, SdkError> {
     let text = output_text(bytes);
     let mut mappers = Vec::new();
     for line in text.lines().filter(|line| !line.trim().is_empty()) {
+        // dmsetup prints this sentinel to stdout with exit status 0 when the
+        // host has no Device Mapper devices instead of an empty listing.
+        if line.trim() == "No devices found" {
+            continue;
+        }
         let columns: Vec<_> = line.split('\t').map(str::trim).collect();
         if columns.len() != 3 {
             return Err(host_command_error(
@@ -2358,7 +2363,7 @@ mod tests {
     use super::{
         DeviceMapperRuntime, DmTable, HostCommandRunner, LoopInfo, MappingIdentity, RootfsIdentity,
         SnapshotIdentity, acquire_lifecycle_lock, parse_dm_table, parse_loop_list,
-        parse_snapshot_dm_table, snapshot_cow_size,
+        parse_mapper_list, parse_snapshot_dm_table, snapshot_cow_size,
     };
     use crate::error::SdkError;
     use crate::ports::runtime_disk::RuntimeDiskController;
@@ -2691,6 +2696,57 @@ mod tests {
         assert_eq!(
             parse_dm_table(b"0 4096 snapshot-origin 7:12\n0 4 linear 8:0 0\n"),
             None
+        );
+    }
+
+    #[test]
+    fn treats_dmsetup_empty_inventory_sentinel_as_no_mappers() {
+        assert_eq!(
+            parse_mapper_list(b"No devices found\n").expect("sentinel means empty inventory"),
+            Vec::new()
+        );
+        assert_eq!(
+            parse_mapper_list(b"").expect("empty output means empty inventory"),
+            Vec::new()
+        );
+    }
+
+    #[test]
+    fn creates_mapping_when_dmsetup_reports_no_devices() {
+        let directory = tempdir().expect("test directory");
+        let rootfs = root_disk(directory.path(), "root");
+        let home = directory.path().join("home");
+        std::fs::create_dir_all(&home).expect("test home");
+        let identity = identity(&home, "vm_one");
+        let commands = Arc::new(ScriptedCommands::default());
+        commands.push("dmsetup:info", success_output("No devices found\n"));
+        commands.push(
+            "dmsetup:info",
+            success_output(&mapper_listing(&identity, 0)),
+        );
+        commands.push(
+            "dmsetup:table",
+            success_output("0 8 snapshot-origin 7:12\n"),
+        );
+        commands.push("losetup:list", success_output(r#"{"loopdevices":[]}"#));
+        commands.push("losetup:other", success_output("/dev/loop12\n"));
+        commands.push(
+            "losetup:list",
+            success_output(&loop_listing(&rootfs, "/dev/loop12", "7:12", false)),
+        );
+        commands.push(
+            "losetup:list",
+            success_output(&loop_listing(&rootfs, "/dev/loop12", "7:12", false)),
+        );
+        let adapter = runtime(Arc::clone(&commands));
+
+        let mapped = adapter
+            .ensure_mapping(&home, "vm_one", &rootfs)
+            .expect("mapping should be created when no mappers exist");
+
+        assert_eq!(
+            mapped,
+            PathBuf::from("/fake/mapper").join(identity.mapper_name)
         );
     }
 
