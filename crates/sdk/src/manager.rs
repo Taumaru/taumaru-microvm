@@ -813,7 +813,11 @@ impl MicroVmSdk {
     /// persistence write, and emits no output, logs, or global state.
     pub async fn microvm_disk_used_bytes(&self, name: &str) -> Result<u64, SdkError> {
         crate::domain::config::validate_vm_name(name)?;
+        let _runtime_lock = acquire_lifecycle_lock(&self.home, name).await?;
         let lookup_name = name.to_owned();
+        let name_lock_path = self.home.join("vms").join(name);
+        let name_lock = self.target_lock(&name_lock_path)?;
+        let _name_guard = name_lock.lock().await;
         let stored = self
             .run_repository(move |repository| repository.find_microvm(&lookup_name))
             .await?
@@ -821,6 +825,15 @@ impl MicroVmSdk {
                 kind: "MicroVM".to_owned(),
                 id: name.to_owned(),
             })?;
+        let volume_lock = if stored.record.volume_path != name_lock_path {
+            Some(self.target_lock(&stored.record.volume_path)?)
+        } else {
+            None
+        };
+        let _volume_guard = match volume_lock.as_ref() {
+            Some(lock) => Some(lock.lock().await),
+            None => None,
+        };
         stored.require_complete("inspect MicroVM disk usage")?;
         if self.socket_answers(&stored.record.socket_path)? {
             return Err(SdkError::LifecycleConflict {
@@ -2143,7 +2156,12 @@ impl MicroVmSdk {
     /// requested disk size below the actual ext4 usage is rejected before
     /// any resize. The root disk is resized in place first and the inventory
     /// row is updated second; a database failure after a successful resize
-    /// attempts to restore the previous disk size before returning.
+    /// attempts to restore the previous disk size before returning, and a
+    /// resize failure itself attempts the same restore before returning.
+    /// A crash between the resize and the row update can still leave the
+    /// file and the record diverged; the next update refuses with a root
+    /// disk mismatch error until the operator reconciles the file with the
+    /// recorded size and retries.
     pub async fn update_microvm(
         &self,
         request: UpdateMicroVmRequest,
@@ -2330,8 +2348,22 @@ impl MicroVmSdk {
                 &stored.record.name,
                 &stored.record.rootfs_path,
             )?;
-            self.storage
-                .resize_rootfs(&stored.record.rootfs_path, new_disk)?;
+            if let Err(resize) = self
+                .storage
+                .resize_rootfs(&stored.record.rootfs_path, new_disk)
+            {
+                let previous = stored.record.disk_size_bytes;
+                if let Err(rollback) = self
+                    .storage
+                    .resize_rootfs(&stored.record.rootfs_path, previous)
+                {
+                    return Err(SdkError::Cleanup {
+                        primary: resize.to_string(),
+                        failures: vec![rollback.to_string()],
+                    });
+                }
+                return Err(resize);
+            }
         }
 
         let vm_id = stored.record.id;
@@ -10487,6 +10519,37 @@ mod tests {
                 .len(),
             32
         );
+    }
+
+    #[tokio::test]
+    async fn update_shrinks_the_disk_above_actual_usage() {
+        if std::env::consts::ARCH != "x86_64" {
+            return;
+        }
+        let (sdk, _directory, _storage, _credentials, _network, _runtime) = test_sdk(false);
+        start_fixture_vm(&sdk, "shrinkable_vm", false, None);
+        let used = sdk
+            .microvm_disk_used_bytes("shrinkable_vm")
+            .await
+            .expect("usage probe should succeed");
+        assert!(used < 14, "fixture usage below the recorded size");
+        let updated = sdk
+            .update_microvm(UpdateMicroVmRequest {
+                name: "shrinkable_vm".to_owned(),
+                disk_size_bytes: Some(used + 1),
+                memory_bytes: None,
+                vcpu_count: None,
+            })
+            .await
+            .expect("disk shrink above usage should succeed");
+        assert_eq!(updated.disk_size_bytes, used + 1);
+        assert!(updated.disk_resized);
+        let stored = sdk
+            .run_repository(|repository| repository.find_microvm("shrinkable_vm"))
+            .await
+            .expect("lookup should work")
+            .expect("record should exist");
+        assert_eq!(stored.record.disk_size_bytes, used + 1);
     }
 
     #[tokio::test]

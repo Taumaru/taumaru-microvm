@@ -51,8 +51,25 @@ pub(crate) fn escalated_child_command(
     command
 }
 
-pub(crate) fn bare_escalated_command() -> Vec<OsString> {
-    vec![OsString::from("edit")]
+pub(crate) fn bare_escalated_command(
+    disk_gb: Option<&str>,
+    memory: Option<&str>,
+    vcpus: Option<&str>,
+) -> Vec<OsString> {
+    let mut command = vec![OsString::from("edit")];
+    if let Some(disk) = disk_gb {
+        command.push(OsString::from("--disk-gb"));
+        command.push(OsString::from(disk));
+    }
+    if let Some(memory) = memory {
+        command.push(OsString::from("--memory"));
+        command.push(OsString::from(memory));
+    }
+    if let Some(vcpus) = vcpus {
+        command.push(OsString::from("--vcpus"));
+        command.push(OsString::from(vcpus));
+    }
+    command
 }
 
 fn edit_prompt_error(error: inquire::InquireError) -> CliError {
@@ -98,9 +115,9 @@ pub(crate) fn check_disk_minimum_used(
             format!(
                 "requested {} is smaller than the used minimum of {}",
                 format_gb(disk_size_bytes),
-                format_gb(used_bytes)
+                format_mb_gb(used_bytes)
             ),
-            format!("choose --disk-gb of at least {}", format_gb(used_bytes)),
+            format!("choose --disk-gb of at least {}", format_mb_gb(used_bytes)),
         ));
     }
     Ok(())
@@ -119,7 +136,7 @@ async fn prompt_disk(
     let message = format!(
         "Disk size in GB (current {}, used minimum {})",
         format_gb(current_bytes),
-        format_gb(used_bytes)
+        format_mb_gb(used_bytes)
     );
     let answer = Text::new(&message)
         .with_initial_value(&format_gb_flag(current_bytes))
@@ -168,9 +185,16 @@ async fn prompt_memory(
     Ok((trimmed.to_owned(), bytes))
 }
 
-async fn prompt_vcpus(current: u32, minimum: u32, preset: Option<&str>) -> Result<u32, CliError> {
+async fn prompt_vcpus(
+    current: u32,
+    minimum: u32,
+    distribution_id: &str,
+    preset: Option<&str>,
+) -> Result<u32, CliError> {
     if let Some(value) = preset {
-        return parse_vcpus(value);
+        let vcpus = parse_vcpus(value)?;
+        check_vcpu_minimum(vcpus, minimum, distribution_id)?;
+        return Ok(vcpus);
     }
     let message = format!("vCPU count (current {current}, minimum {minimum})");
     let answer = Text::new(&message)
@@ -241,17 +265,13 @@ struct EditTargets {
     used_disk: u64,
 }
 
-async fn load_targets(
-    context: &CliContext,
-    name: &str,
-    show_registry_ready: bool,
-) -> Result<EditTargets, CliError> {
+async fn load_targets(context: &CliContext, name: &str) -> Result<EditTargets, CliError> {
     let machines = context.sdk.list_microvms().await?;
     let summary = machines
         .into_iter()
         .find(|machine| machine.name == name)
         .ok_or_else(|| CliError::edit_not_found(name))?;
-    if summary.state.to_string() != "stopped" {
+    if summary.state != taumaru_microvm::MicroVmState::Stopped {
         return Err(CliError::edit_running(name));
     }
     let client = SdkArtifactClient::new(&context.sdk);
@@ -259,16 +279,6 @@ async fn load_targets(
     let catalog_result = load_catalog(&client).await;
     catalog_spinner.finish();
     let catalog = catalog_result?;
-    if show_registry_ready {
-        let (distribution_count, kernel_count, binary_count) = catalog.counts();
-        crate::output::human::write_catalog_ready(
-            context.terminal,
-            distribution_count,
-            kernel_count,
-            binary_count,
-        )
-        .map_err(CliError::from)?;
-    }
     let distribution = catalog
         .distribution(&summary.distribution_id)
         .ok_or_else(|| {
@@ -312,7 +322,7 @@ async fn edit_resolved(
     memory_preset: Option<&str>,
     vcpu_preset: Option<&str>,
 ) -> Result<u8, CliError> {
-    let targets = load_targets(context, name, false).await?;
+    let targets = load_targets(context, name).await?;
     let current = &targets.summary;
 
     if let Some(value) = disk_preset {
@@ -328,11 +338,24 @@ async fn edit_resolved(
         check_vcpu_minimum(vcpus, targets.minimum_vcpus, &current.distribution_id)?;
     }
 
+    if !context.terminal.interactive {
+        return Err(CliError::creation(
+            "An interactive terminal is required",
+            "editing a machine prompts for capacities and confirmation",
+            "Run microvm edit <NAME> --non-interactive with root access",
+        ));
+    }
     let (disk_text, disk_bytes) =
         prompt_disk(current.disk_size_bytes, targets.used_disk, disk_preset).await?;
     let (memory_text, memory_bytes) =
         prompt_memory(current.memory_bytes, targets.minimum_memory, memory_preset).await?;
-    let vcpu_count = prompt_vcpus(current.vcpu_count, targets.minimum_vcpus, vcpu_preset).await?;
+    let vcpu_count = prompt_vcpus(
+        current.vcpu_count,
+        targets.minimum_vcpus,
+        &current.distribution_id,
+        vcpu_preset,
+    )
+    .await?;
     check_vcpu_minimum(vcpu_count, targets.minimum_vcpus, &current.distribution_id)?;
 
     let disk_changed = disk_bytes != current.disk_size_bytes;
@@ -441,7 +464,7 @@ pub(crate) async fn run(context: &CliContext, arguments: EditArgs) -> Result<u8,
         {
             return Ok(exit);
         }
-        let targets = load_targets(context, &name, false).await?;
+        let targets = load_targets(context, &name).await?;
         let current = &targets.summary;
         let disk_bytes = match arguments.disk_gb.as_deref() {
             Some(value) => {
@@ -467,9 +490,9 @@ pub(crate) async fn run(context: &CliContext, arguments: EditArgs) -> Result<u8,
             }
             None => None,
         };
-        if disk_bytes.is_some_and(|value| value == current.disk_size_bytes)
-            && memory_bytes.is_some_and(|value| value == current.memory_bytes)
-            && vcpu_count.is_some_and(|value| value == current.vcpu_count)
+        if disk_bytes.is_none_or(|value| value == current.disk_size_bytes)
+            && memory_bytes.is_none_or(|value| value == current.memory_bytes)
+            && vcpu_count.is_none_or(|value| value == current.vcpu_count)
         {
             return Err(CliError::edit_no_changes(&name));
         }
@@ -484,7 +507,11 @@ pub(crate) async fn run(context: &CliContext, arguments: EditArgs) -> Result<u8,
             false,
             home,
             &[],
-            bare_escalated_command(),
+            bare_escalated_command(
+                arguments.disk_gb.as_deref(),
+                arguments.memory.as_deref(),
+                arguments.vcpus.as_deref(),
+            ),
             "Run the same command with sudo or as root",
         )
         .await?
@@ -574,8 +601,13 @@ mod tests {
     }
 
     #[test]
-    fn bare_escalated_child_lists_privileged() {
-        let rendered: Vec<String> = bare_escalated_command()
+    fn bare_escalated_child_forwards_capacity_presets() {
+        let rendered: Vec<String> = bare_escalated_command(Some("30"), None, Some("4"))
+            .iter()
+            .map(|part| part.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(rendered, ["edit", "--disk-gb", "30", "--vcpus", "4"]);
+        let rendered: Vec<String> = bare_escalated_command(None, None, None)
             .iter()
             .map(|part| part.to_string_lossy().into_owned())
             .collect();
