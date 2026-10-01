@@ -430,7 +430,7 @@ fn regular_file_len(path: &Path, operation: &'static str) -> Result<u64, SdkErro
     Ok(metadata.len())
 }
 
-fn filesystem_block_size(rootfs_path: &Path) -> Result<u64, SdkError> {
+fn filesystem_geometry(rootfs_path: &Path) -> Result<(u64, u64), SdkError> {
     let output = Command::new("dumpe2fs")
         .args(["-h"])
         .arg(rootfs_path)
@@ -444,28 +444,53 @@ fn filesystem_block_size(rootfs_path: &Path) -> Result<u64, SdkError> {
         })?;
     if !output.status.success() {
         return Err(SdkError::GuestFilesystem {
-            operation: "inspect ext4 block size".to_owned(),
+            operation: "inspect ext4 geometry".to_owned(),
             path: rootfs_path.to_path_buf(),
             reason: format!("dumpe2fs exited with {}", output.status),
         });
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut block_count = None;
+    let mut block_size = None;
     for line in stdout.lines() {
-        let Some(value) = line.strip_prefix("Block size:") else {
-            continue;
-        };
-        let value = value.trim();
-        if let Ok(size) = value.parse::<u64>()
+        if let Some(value) = line.strip_prefix("Block count:")
+            && let Ok(count) = value.trim().parse::<u64>()
+            && count > 0
+        {
+            block_count = Some(count);
+        }
+        if let Some(value) = line.strip_prefix("Block size:")
+            && let Ok(size) = value.trim().parse::<u64>()
             && size > 0
         {
-            return Ok(size);
+            block_size = Some(size);
         }
     }
-    Err(SdkError::GuestFilesystem {
-        operation: "inspect ext4 block size".to_owned(),
-        path: rootfs_path.to_path_buf(),
-        reason: "dumpe2fs did not report a block size".to_owned(),
-    })
+    match (block_count, block_size) {
+        (Some(count), Some(size)) => Ok((count, size)),
+        _ => Err(SdkError::GuestFilesystem {
+            operation: "inspect ext4 geometry".to_owned(),
+            path: rootfs_path.to_path_buf(),
+            reason: "dumpe2fs did not report the block count and size".to_owned(),
+        }),
+    }
+}
+
+fn filesystem_block_size(rootfs_path: &Path) -> Result<u64, SdkError> {
+    filesystem_geometry(rootfs_path)
+        .map(|(_, size)| size)
+        .map_err(|error| match error {
+            SdkError::GuestFilesystem {
+                operation,
+                path,
+                reason,
+            } if operation == "inspect ext4 geometry" => SdkError::GuestFilesystem {
+                operation: "inspect ext4 block size".to_owned(),
+                path,
+                reason,
+            },
+            other => other,
+        })
 }
 
 fn filesystem_minimum_bytes(rootfs_path: &Path) -> Result<u64, SdkError> {
@@ -507,13 +532,28 @@ fn filesystem_minimum_bytes(rootfs_path: &Path) -> Result<u64, SdkError> {
         })
 }
 
+fn tool_stderr(output: &std::process::Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    if stderr.is_empty() {
+        return String::new();
+    }
+    // Keep the diagnostic short; tool output never carries secrets, only
+    // filesystem state. Newlines collapse so the reason stays one line.
+    let single_line = stderr.split_whitespace().collect::<Vec<_>>().join(" ");
+    if single_line.len() > 300 {
+        single_line[..300].to_owned()
+    } else {
+        single_line
+    }
+}
+
 fn run_e2fsck(rootfs_path: &Path) -> Result<(), SdkError> {
     let output = Command::new("e2fsck")
         .args(["-f", "-y"])
         .arg(rootfs_path)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .output()
         .map_err(|error| SdkError::HostCommand {
             program: "e2fsck".to_owned(),
@@ -523,14 +563,19 @@ fn run_e2fsck(rootfs_path: &Path) -> Result<(), SdkError> {
         return Ok(());
     }
     // e2fsck exit status 1 means errors were corrected; that is expected
-    // before a shrink. Other statuses indicate an unusable filesystem.
+    // before a resize. Other statuses indicate an unusable filesystem.
     if output.status.code() == Some(1) {
         return Ok(());
     }
+    let detail = tool_stderr(&output);
     Err(SdkError::GuestFilesystem {
-        operation: "check ext4 filesystem before shrink".to_owned(),
+        operation: "check ext4 filesystem before resize".to_owned(),
         path: rootfs_path.to_path_buf(),
-        reason: format!("e2fsck exited with {}", output.status),
+        reason: if detail.is_empty() {
+            format!("e2fsck exited with {}", output.status)
+        } else {
+            format!("e2fsck exited with {}: {detail}", output.status)
+        },
     })
 }
 
@@ -543,17 +588,22 @@ fn run_resize2fs(rootfs_path: &Path, size_argument: Option<String>) -> Result<()
     let output = command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .output()
         .map_err(|error| SdkError::HostCommand {
             program: "resize2fs".to_owned(),
             reason: error.to_string(),
         })?;
     if !output.status.success() {
+        let detail = tool_stderr(&output);
         return Err(SdkError::GuestFilesystem {
             operation: "resize ext4 filesystem".to_owned(),
             path: rootfs_path.to_path_buf(),
-            reason: format!("resize2fs exited with {}", output.status),
+            reason: if detail.is_empty() {
+                format!("resize2fs exited with {}", output.status)
+            } else {
+                format!("resize2fs exited with {}: {detail}", output.status)
+            },
         });
     }
     Ok(())
@@ -571,6 +621,10 @@ fn resize_rootfs_file(rootfs_path: &Path, new_size_bytes: u64) -> Result<(), Sdk
         return Ok(());
     }
     verify_ext4_filesystem(rootfs_path)?;
+    // A guest filesystem may carry a dirty journal or repaired-pending
+    // errors from its last shutdown; resize2fs refuses those. Checking first
+    // keeps grow and shrink on the same safe path.
+    run_e2fsck(rootfs_path)?;
     if new_size_bytes > current_len {
         let file = fs::OpenOptions::new()
             .write(true)
@@ -581,7 +635,6 @@ fn resize_rootfs_file(rootfs_path: &Path, new_size_bytes: u64) -> Result<(), Sdk
         drop(file);
         run_resize2fs(rootfs_path, None)?;
     } else {
-        run_e2fsck(rootfs_path)?;
         let sectors = new_size_bytes / 512;
         if sectors == 0 {
             return Err(SdkError::GuestFilesystem {
@@ -592,29 +645,31 @@ fn resize_rootfs_file(rootfs_path: &Path, new_size_bytes: u64) -> Result<(), Sdk
         }
         run_resize2fs(rootfs_path, Some(format!("{sectors}s")))?;
     }
-    // resize2fs rounds the file down to the filesystem block size, so restore
-    // the exact requested byte length when the filesystem fits inside it.
-    let resized_len = regular_file_len(rootfs_path, "verify VM rootfs")?;
-    if resized_len != new_size_bytes {
-        let block_size = filesystem_block_size(rootfs_path)?;
-        let filesystem_blocks =
-            resized_len
-                .checked_div(block_size)
-                .ok_or_else(|| SdkError::GuestFilesystem {
-                    operation: "verify VM rootfs size".to_owned(),
-                    path: rootfs_path.to_path_buf(),
-                    reason: "the resized filesystem size is invalid".to_owned(),
-                })?;
-        let filesystem_bytes = filesystem_blocks.saturating_mul(block_size);
-        if filesystem_bytes > new_size_bytes {
-            return Err(SdkError::GuestFilesystem {
+    // resize2fs reports success without touching the file when the
+    // filesystem already has the requested size, and it rounds the file
+    // down to the block size otherwise. Measure the real filesystem from
+    // the superblock instead of trusting the file length, then converge
+    // the file to exactly the requested size when the filesystem fits.
+    let (block_count, block_size) = filesystem_geometry(rootfs_path)?;
+    let filesystem_bytes =
+        block_count
+            .checked_mul(block_size)
+            .ok_or_else(|| SdkError::GuestFilesystem {
                 operation: "verify VM rootfs size".to_owned(),
                 path: rootfs_path.to_path_buf(),
-                reason: format!(
-                    "the resized filesystem of {filesystem_bytes} bytes does not fit in {new_size_bytes} bytes"
-                ),
-            });
-        }
+                reason: "the resized filesystem size exceeds the supported range".to_owned(),
+            })?;
+    if filesystem_bytes > new_size_bytes {
+        return Err(SdkError::GuestFilesystem {
+            operation: "verify VM rootfs size".to_owned(),
+            path: rootfs_path.to_path_buf(),
+            reason: format!(
+                "the resized filesystem of {filesystem_bytes} bytes does not fit in {new_size_bytes} bytes"
+            ),
+        });
+    }
+    let resized_len = regular_file_len(rootfs_path, "verify VM rootfs")?;
+    if resized_len != new_size_bytes {
         let file = fs::OpenOptions::new()
             .write(true)
             .open(rootfs_path)
@@ -702,6 +757,29 @@ mod tests {
             fs::read(&rootfs).expect("rootfs should be readable"),
             before
         );
+    }
+
+    #[test]
+    fn converges_a_file_larger_than_its_filesystem() {
+        let directory = tempdir().expect("temporary directory should be created");
+        let rootfs = directory.path().join("rootfs.ext4");
+        test_ext4_image(&rootfs, 64);
+        // A failed grow leaves the file extended while the filesystem keeps
+        // its old size; resize2fs then reports success without touching the
+        // file. The resize must converge the file instead of failing.
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .open(&rootfs)
+            .expect("rootfs should open");
+        file.set_len(80 * 1024 * 1024).expect("file should extend");
+        drop(file);
+        resize_rootfs_file(&rootfs, 64 * 1024 * 1024)
+            .expect("converging the file to the filesystem size should succeed");
+        assert_eq!(
+            fs::metadata(&rootfs).expect("rootfs metadata").len(),
+            64 * 1024 * 1024
+        );
+        super::verify_ext4_filesystem(&rootfs).expect("filesystem should stay valid");
     }
 
     #[test]
