@@ -227,6 +227,50 @@ pub struct MicroVmDeleteResult {
     pub name: String,
 }
 
+/// Caller-selected input for updating the resizable resources of a MicroVM.
+///
+/// Every size field is optional: `None` keeps the stored value, `Some`
+/// replaces it after validation. At least one field must be `Some`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UpdateMicroVmRequest {
+    /// Stable path-friendly VM identifier.
+    pub name: String,
+    /// New root-disk size in bytes. `None` keeps the stored size.
+    pub disk_size_bytes: Option<u64>,
+    /// New memory size in bytes. `None` keeps the stored size.
+    pub memory_bytes: Option<u64>,
+    /// New virtual CPU count. `None` keeps the stored count.
+    pub vcpu_count: Option<u32>,
+}
+
+/// Result returned by [`crate::MicroVmSdk::update_microvm`].
+///
+/// The operation only applies to stopped MicroVMs. On success the stored
+/// capacities and the VM-local root disk already reflect the new values.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MicroVmUpdateResult {
+    /// Stable VM identifier.
+    pub name: String,
+    /// Always [`MicroVmState::Stopped`] on success. The socket is silent at return.
+    pub state: MicroVmState,
+    /// Selected distribution ID, unchanged by the update.
+    pub distribution_id: String,
+    /// Selected image ID, unchanged by the update.
+    pub image_id: String,
+    /// VM-exclusive volume directory, unchanged by the update.
+    pub volume_path: PathBuf,
+    /// VM-local root filesystem, resized in place when the disk changed.
+    pub rootfs_path: PathBuf,
+    /// Effective vCPU count after the update.
+    pub vcpu_count: u32,
+    /// Effective memory in bytes after the update.
+    pub memory_bytes: u64,
+    /// Effective root-disk size in bytes after the update.
+    pub disk_size_bytes: u64,
+    /// Whether the root disk was resized during the update.
+    pub disk_resized: bool,
+}
+
 /// Read-only inventory snapshot of one persisted MicroVM.
 ///
 /// Returned by [`crate::MicroVmSdk::list_microvms`] for selectors and listing

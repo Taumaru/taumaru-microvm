@@ -735,3 +735,67 @@ fn non_root_non_interactive_autostart_requires_elevated_rights() {
     assert_eq!(output.status.code(), Some(1));
     assert!(stderr.contains("Elevated rights are required"));
 }
+
+#[test]
+fn edit_help_exposes_name_and_capacity_options_without_image_flags() {
+    let output = run_microvm(&["edit", "--help"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(output.status.success());
+    assert!(stdout.contains("Usage: microvm edit"));
+    assert!(stdout.contains("[NAME]"));
+    assert!(stdout.contains("--disk-gb"));
+    assert!(stdout.contains("--memory"));
+    assert!(stdout.contains("--vcpus"));
+    assert!(stdout.contains("--non-interactive"));
+    assert!(!stdout.contains("--image"));
+    assert!(!stdout.contains("--expose-lan"));
+}
+
+#[test]
+fn non_interactive_edit_rejects_missing_name_without_prompting() {
+    let home = tempfile::tempdir().expect("temporary home should be created");
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_microvm"))
+        .args(["edit", "--non-interactive", "--vcpus", "4"])
+        .env("TAUMARU_HOME", home.path())
+        .output()
+        .expect("failed to execute microvm");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(!output.status.success());
+    assert!(stderr.contains("Missing machine name"));
+    assert!(!stderr.contains("panicked"));
+}
+
+#[test]
+fn non_interactive_edit_rejects_missing_change_without_prompting() {
+    let home = tempfile::tempdir().expect("temporary home should be created");
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_microvm"))
+        .args(["edit", "web-01", "--non-interactive"])
+        .env("TAUMARU_HOME", home.path())
+        .output()
+        .expect("failed to execute microvm");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(!output.status.success());
+    assert!(stderr.contains("Missing edit change"));
+    assert!(!stderr.contains("panicked"));
+}
+
+#[test]
+fn non_interactive_edit_without_root_reports_privilege_error() {
+    let home = tempfile::tempdir().expect("temporary home should be created");
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_microvm"))
+        .args(["edit", "web-01", "--non-interactive", "--vcpus", "4"])
+        .env("TAUMARU_HOME", home.path())
+        .env_remove("TAUMARU_ESCALATED")
+        .output()
+        .expect("failed to execute microvm");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    if unsafe { libc_geteuid() } == 0 {
+        return;
+    }
+    assert!(!output.status.success());
+    assert!(stderr.to_ascii_lowercase().contains("elevated rights"));
+}

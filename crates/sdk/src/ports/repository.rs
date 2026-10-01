@@ -336,6 +336,15 @@ pub(crate) trait MicroVmRepository: Send + Sync {
 
     fn update_network(&self, vm_id: i64, network: &PersistedNetwork) -> Result<(), SdkError>;
 
+    fn update_microvm_resources(
+        &self,
+        vm_id: i64,
+        disk_size_bytes: u64,
+        memory_bytes: u64,
+        memory_effective_mib: u64,
+        vcpu_count: u32,
+    ) -> Result<(), SdkError>;
+
     fn bridge_has_other_references(
         &self,
         vm_id: i64,
